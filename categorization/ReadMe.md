@@ -23,9 +23,9 @@ Categories:
 Read IMPACT categorization spreadsheet and papers categorization spreadsheet into R.
 
 Produce: 
-1. talbes for different groups in **table** folder.
-2. proptables for different groups in **proptable** folder.
-3. bar plot for different groups in **bat** folder.
+1. talbes for different groups in **tables** folder.
+2. proptables for different groups in **proptables** folder.
+3. bar plot for different groups in **bar** folder.
 4. mosaic plot for different groups in **mosaic** folder. 
 
 ----
