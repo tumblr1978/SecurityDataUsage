@@ -1,4 +1,4 @@
-##Categorization
+## Categorization
 
 This portion stores data related to categorization, including r code and statistical plots.
 
@@ -18,7 +18,7 @@ Categories:
 
 
 ----
-####cat.R
+#### cat.R
 
 Read IMPACT categorization spreadsheet and papers categorization spreadsheet into R.
 
