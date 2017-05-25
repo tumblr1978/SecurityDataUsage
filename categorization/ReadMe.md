@@ -27,3 +27,10 @@ Produce:
 2. proptables for different groups in **proptable** folder.
 3. bar plot for different groups in **bat** folder.
 4. mosaic plot for different groups in **mosaic** folder. 
+
+----
+#### SpreadSheets
+
+**IMPACTcat.csv**: spreadsheet contains all datasets within IMPACT
+
+**paperscat.csv**: spreadsheet contains datasets used in research papers. 
