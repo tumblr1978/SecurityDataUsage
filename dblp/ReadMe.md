@@ -27,8 +27,7 @@ This folder provides essential libraries and java source code to query data from
 First of all, unzip the .xml.zip file.
 
     javac -cp mmdb-2016-12-09.jar Program.java   (*ex. javac -cp mmdb-2016-12-09.jar DblpPaperListParser.java*)
-    java -cp mmdb-2016-12-09.jar:. DblpExampleParser Arguments (*ex. java -cp mmdb-2016-12-09.jar:. -DentityExpansionLimit=2000000 DblpExampleParser dblp-2016-11-02.xml confList.txt 2012*)
+    java -cp mmdb-2016-12-09.jar:. DblpExampleParser Arguments (*ex. java -cp mmdb-2016-12-09.jar:. -DentityExpansionLimit=2000000 DblpPaperListParser dblp-2016-11-02.xml confList.txt 2012*)
 
-***Note: not matter what name the java program file used , use DblpExampleParser when running the java command***
 
 

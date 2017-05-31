@@ -20,7 +20,7 @@ import org.xml.sax.SAXException;
 
 
 @SuppressWarnings("javadoc")
-class DblpExampleParser {
+class DblpPaperListParser {
     //Initialize static variables;
     //HashMap outPapers -> {"conference":["PaperName","url","conf","year"]}
     static HashMap<String, ArrayList<String[]>> confs = new HashMap<String, ArrayList<String[]>> ();
@@ -66,7 +66,7 @@ class DblpExampleParser {
         System.setProperty("entityExpansionLimit", "10000000");
 
         if (args.length != 3) {
-            System.err.format("Usage: java %s <dblp-xml-file>\n", DblpExampleParser.class.getName());
+            System.err.format("Usage: java %s <dblp-xml-file>\n", DblpPaperListParser.class.getName());
             System.exit(0);
         }
         String dblpXmlFilename = args[0];
@@ -104,12 +104,18 @@ class DblpExampleParser {
             else conf = confAttr[1];
 
             if (mapKeys.contains(conf) && year.equals(reader.valueOf("year"))) {
-                String[] paper = new String[4];
-                paper[0] = "\""+reader.valueOf("title")+"\"";
-                paper[1] = reader.valueOf("ee");
-                paper[2] = conf;
-                paper[3] = year;
-                confs.get(conf).add(paper);
+                int pages = 1;
+                String[] pageRange = reader.valueOf("pages").split("-");
+                if (pageRange.length > 1)
+                    pages= Integer.parseInt(pageRange[1]) - Integer.parseInt(pageRange[0]);
+                if (pages >3){
+                    String[] paper = new String[4];
+                    paper[0] = "\""+reader.valueOf("title")+"\"";
+                    paper[1] = reader.valueOf("ee");
+                    paper[2] = conf;
+                    paper[3] = year;
+                    confs.get(conf).add(paper);
+                }
             }
         }
 
