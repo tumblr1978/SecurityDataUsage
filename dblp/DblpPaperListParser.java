@@ -31,6 +31,7 @@ class DblpPaperListParser {
         try{
             BufferedReader reader = new BufferedReader(new FileReader(file));
             String conf;
+            reader.readLine();
             while ((conf = reader.readLine()) != null){
                 conf = conf.split(",")[1];
                 confs.put(conf, new ArrayList<String[]>());
@@ -47,6 +48,7 @@ class DblpPaperListParser {
         String filename = "papers"+year+".csv";
         try{
             PrintWriter writer = new PrintWriter("./data/"+filename);
+            writer.println("Paper, URL, Conference, Year");
             for (ArrayList<String[]> conf : confs.values()){
                 for (String[] paper : conf){
                     writer.println(String.join(",",paper));
@@ -105,9 +107,12 @@ class DblpPaperListParser {
 
             if (mapKeys.contains(conf) && year.equals(reader.valueOf("year"))) {
                 int pages = 1;
-                String[] pageRange = reader.valueOf("pages").split("-");
-                if (pageRange.length > 1)
-                    pages= Integer.parseInt(pageRange[1]) - Integer.parseInt(pageRange[0]);
+                if (reader.valueOf("pages") != null){
+                    String[] pageRange = reader.valueOf("pages").split("-");
+                    if (pageRange.length >1)
+                        pages= Integer.parseInt(pageRange[1]) - Integer.parseInt(pageRange[0]);
+                }else pages = 4;
+
                 if (pages >3){
                     String[] paper = new String[4];
                     paper[0] = "\""+reader.valueOf("title")+"\"";
