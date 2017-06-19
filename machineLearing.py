@@ -1,5 +1,5 @@
 import matplotlib.pyplot as plt
-import csv
+import csv, unicodedata
 from textblob import TextBlob
 import pandas
 import sklearn
@@ -17,8 +17,12 @@ from sklearn.model_selection import learning_curve
 
 #papers = pandas.read_csv('./rawPaperLabelab.csv', delimiter=',', quotechar='|',
 #                           names=["label", "paper"])
-papers = pandas.read_csv('./rawPaperLabelabstract.csv', delimiter=',', quotechar='|',
-                           names=["label", "paper"])
+#papers = pandas.read_csv('./rawPaperLabelabstract.csv', delimiter=',', quotechar='|',
+#                           names=["label", "paper"])
+papers = pandas.read_csv('./rawSentencesLabel.csv', delimiter=',', quotechar='|',
+                           names=["paper", "label","paperID"])
+print type(papers)
+
 
 #using short discription as words base
 '''
@@ -40,6 +44,7 @@ def split_into_lemmas(message):
         message = unicode(message, 'utf8').lower()
     except:
         print message
+        return ['errror']
     words = TextBlob(message).words
     # for each word, take its "base form" = lemma 
     return [word.lemma for word in words]
