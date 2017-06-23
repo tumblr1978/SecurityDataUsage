@@ -54,3 +54,24 @@ papers_tfidf = tfidf_transformer.transform(papers_bow)
 
 sme = SMOTEENN()
 papers_res, label_res = sme.fit_sample(papers_tfidf.toarray(), papers['label'])
+
+
+X = papers_res
+y = label_res
+kf = StratifiedKFold(n_splits=5)
+cfMtx_MultiNB = np.array([[0,0],[0,0]])
+cfMtx_BNB = np.array([[0,0],[0,0]])
+
+for train_index, test_index in kf.split(X, y):
+    X_train, X_test = X[train_index], X[test_index]
+    y_train, y_test = y[train_index], y[test_index]
+
+    model1 = MultinomialNB().fit(X_train, y_train)
+    cfMtx_MultiNB += confusion_matrix(y_test, model1.predict(X_test))
+    model2 = BernoulliNB().fit(X_train, y_train)
+    cfMtx_BNB += confusion_matrix(y_test, model2.predict(X_test))
+
+print 'MultinomialNB Confusion Matrix:'
+print cfMtx_MultiNB
+print 'BernoulliNB Confusion Matrix:'
+print cfMtx_BNB

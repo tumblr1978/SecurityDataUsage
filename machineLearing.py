@@ -96,14 +96,20 @@ predicts = cross_val_predict(pipeline,
 X = papers_tfidf
 y = papers['label']
 kf = StratifiedKFold(n_splits=5)
+cfMtx_MultiNB = np.array([[0,0],[0,0]])
+cfMtx_BNB = np.array([[0,0],[0,0]])
+
 for train_index, test_index in kf.split(X, y):
     X_train, X_test = X[train_index], X[test_index]
     y_train, y_test = y[train_index], y[test_index]
 
     model1 = MultinomialNB().fit(X_train, y_train)
-    print 'MultinomialNB:'
-    print confusion_matrix(y_test, model1.predict(X_test))
+    cfMtx_MultiNB += confusion_matrix(y_test, model1.predict(X_test))
     model2 = BernoulliNB().fit(X_train, y_train)
-    print 'BernoulliNB: '
-    print confusion_matrix(y_test, model2.predict(X_test))
+    cfMtx_BNB += confusion_matrix(y_test, model2.predict(X_test))
+
+print 'MultinomialNB Confusion Matrix:'
+print cfMtx_MultiNB
+print 'BernoulliNB Confusion Matrix:'
+print cfMtx_BNB
 

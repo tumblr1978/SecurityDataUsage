@@ -14,6 +14,10 @@ papers = {}
 for i in range(len(whole)/2):
     ind = whole[i*2]
     paper = whole[i*2+1]
+    start = paper.lower().find('abstract')
+    end = paper.lower().rfind('references')
+    if start != -1 and end != -1:
+        paper = paper[start:end]
     paperU = unicode(paper, 'utf-8')
     paper = unicodedata.normalize('NFKD', paperU)
     papers[ind] = paper.encode('utf-8')
@@ -59,7 +63,9 @@ with open('sample.csv', 'rb') as cf:
                         flag = False
         else:
             nonData.append(ind)
-print 'data entry:',len(outWrite)
+print 'data entry (not copied):',len(outWrite)
+outWrite = outWrite*57
+print 'data entry (copied):', len(outWrite)
 print 'Non-data papers #:', len(nonData)
 
 for ind in nonData:
@@ -67,9 +73,9 @@ for ind in nonData:
     sentences = paper.split('.')
     for i in range(len(sentences)/4):
         outWrite.append([''.join(sentences[i*4:i*4+4]), 'Non-data', ind])
-print 'Non-data entry:',len(outWrite)
+print 'num of all entries:',len(outWrite)
 
-with open('rawSentencesLabel.csv', 'wb') as cf:
+with open('rawSentencesLabelCopy.csv', 'wb') as cf:
     wt = csv.writer(cf, delimiter = ',', quotechar = '|')
     wt.writerows(outWrite)
 
