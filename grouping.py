@@ -20,6 +20,7 @@ if not fileName.endswith('csv'):
     sys.exit()
 
 papers = []
+csv.field_size_limit(sys.maxsize) #set size limit to maximum
 with open(fileName, 'rb') as csvfile:
     reader = csv.reader(csvfile, delimiter=',', quotechar='|')
     header = reader.next() 
@@ -43,6 +44,7 @@ with open(fileName, 'rb') as csvfile:
 
 #try to normalize all strange characters like 'ff'
 paperMap = {} #to store the mapping between text and its pdf name
+out = [['pdfName','pdfText_Mod']]
 for i in range(len(papers)):
     paper = papers[i][1]
     start = paper.lower().find('abstract')
@@ -51,8 +53,17 @@ for i in range(len(papers)):
         paper = paper[start:end]
     paperU = unicode(paper, 'utf-8')
     paper = unicodedata.normalize('NFKD', paperU).encode('ascii','ignore')
+    paper = paper.replace('  ',' ')
+    paper = paper.replace('\n', ' ')
     #paperMap[papers[i][0]] = paper.encode('utf-8')
     paperMap[papers[i][0]] = paper
+    out.append([papers[i][0],paper])
+
+#save the modification version of pdf texts
+with open('pdfs_mod.csv', 'wb') as csvfile:
+    writer = csv.writer(csvfile, delimiter=',', quotechar='|')
+    writer.writerows(out)
+
 
 
 #split the data paper only around its data described sentences, and split the non-data 
@@ -75,7 +86,7 @@ for row in data_info:
             if data != '':
                 data = data.replace('  ',' ')
                 try:
-                    data = unicode(data, 'utf-8')
+                    data = unicode(data, 'ISO-8859-1')
                 except:
                     print 'paper name', paperName
                 data = unicodedata.normalize('NFKD', data).encode('ascii','ignore')
@@ -92,6 +103,7 @@ for row in data_info:
                     dataSample.append([text, 'Data', paperName])
                 else:
                     print 'data finding error', paperName,':', data
+                    print ''
     else:
         sentences = paper.split('.')
         for i in range(len(sentences)/4):
@@ -103,6 +115,17 @@ print 'data entry (not copied):',len(dataSample)
 print 'Non-data entry #:', len(nonData)
 
 
+#save sample
+out = []
+out = out + dataSample + nonData
+print 'All-sample entry #:', len(out)
+
+with open('MLpapers_sentences.csv', 'wb') as cf:
+    wr = csv.writer(cf, delimiter = ',', quotechar = '|')
+    wr.writerows(out)
+
+
+'''
 #Mix them with different ratios
 ratio = 1.0
 try:
@@ -130,5 +153,5 @@ for i in range(nonData_group-1):
             print 'Error!'
             print out
             break
-
+'''
 

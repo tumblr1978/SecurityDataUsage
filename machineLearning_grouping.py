@@ -24,16 +24,14 @@ def split_into_lemmas(message):
     try:
         message = unicode(message, 'utf8').lower()
     except:
-        #print message
         return ['errror']
     words = TextBlob(message).words
-    # for each word, take its "base form" = lemma 
     return [word.lemma for word in words]
 
 #def machine_learn(filePath,bow_transformer, dict1, dict2):
 def machine_learn(filePath, test_set, test_set_count1, test_set_count2):  #option2
     papers = pandas.read_csv(filePath, delimiter=',', quotechar='|',
-                               names=["paper", "label","paperID"])
+                               names=["paper", "label","paperName"])
 
     bow_transformer = CountVectorizer(analyzer=split_into_lemmas).fit(test_set['paper']) #option2
     #bow_transformer = CountVectorizer(analyzer=split_into_lemmas).fit(papers['paper'])
@@ -70,20 +68,20 @@ def machine_learn(filePath, test_set, test_set_count1, test_set_count2):  #optio
     for train_index, test_index in kf.split(X, y):
         X_train, X_test = X[train_index], X[test_index]
         y_train, y_test = y[train_index], y[test_index]
-        paperID_test = papers['paperID'][test_index]
+        paperName_test = papers['paperName'][test_index]
 
         model1 = MultinomialNB().fit(X_train, y_train)
         predict1 = model1.predict(X_test)
         for i in range(len(predict1)):
             if predict1[i] == 'Data':
-                dict1[int(paperID_test[test_index[i]])] += 1
+                dict1[int(paperName_test[test_index[i]])] += 1
 
         model2 = BernoulliNB().fit(X_train, y_train)
         predict2 = model2.predict(X_test)
 
         for i in range(len(predict2)):
             if predict2[i] == 'Data':
-                dict2[int(paperID_test[test_index[i]])] += 1
+                dict2[int(paperName_test[test_index[i]])] += 1
     
     return dict1, dict2
 '''
@@ -99,28 +97,23 @@ def add_list(lista, listb):
 mainPath = './grouping/'
 csvFiles = [x for x in os.listdir(mainPath) if x.endswith('.csv')]
 
-paper_cat1 = ['Non-data']*169
-paper_cat2 = ['Non-data']*169
+#create 2 lists to indicate how many papers we are going to test
+paperNum = 0   #paperNum
+paper_cat1 = ['Non-data']*paperNum   #for Mul NB 
+paper_cat2 = ['Non-data']*paperNum   #for     NB
 
-'''
-num_data1 = {}
-num_data2 = {}
-for i in range(169):
-    num_data1[i] = 0
-    num_data2[i] = 0
-'''
 #option 2
-test_set = pandas.read_csv('wholesample_sentences.csv', delimiter=',', quotechar='|', names=['paper','label','paperID'])
+test_set = pandas.read_csv('wholesample_sentences.csv', delimiter=',', quotechar='|', names=['paper','label','paperName'])
 num_data1 = {}
 num_data2 = {}
-for i in range(len(test_set['paperID'])):
+for i in range(len(test_set['paperName'])):
     num_data1[i] = 0
     num_data2[i] = 0
 
 overall_MNB = [0,0,0,0]  #true positive, true negative, false positive, false negative
 overall_BNB = [0,0,0,0]
 
-test_set = pandas.read_csv('wholesample_sentences.csv', delimiter=',', quotechar='|', names=['paper','label','paperID'])
+test_set = pandas.read_csv('wholesample_sentences.csv', delimiter=',', quotechar='|', names=['paper','label','paperName'])
 bow_transformer = CountVectorizer(analyzer=split_into_lemmas).fit(test_set['paper']) #option2
 
 for i in range(len(csvFiles)):
@@ -136,11 +129,11 @@ for i in range(len(csvFiles)):
     print 'finish', i
 
 #option 2
-for i in range(len(test_set['paperID'])):
+for i in range(len(test_set['paperName'])):
     if num_data1[i] > 5:
-        paper_cat1[int(test_set['paperID'][i])] = 'Data'
+        paper_cat1[int(test_set['paperName'][i])] = 'Data'
     if num_data2[i] > 5:
-        paper_cat2[int(test_set['paperID'][i])] = 'Data'
+        paper_cat2[int(test_set['paperName'][i])] = 'Data'
 
 #for i in range(169):
 #    if num_data1[i] >3 :

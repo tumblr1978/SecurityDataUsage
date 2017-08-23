@@ -14,11 +14,17 @@ from sklearn.model_selection import GridSearchCV
 from sklearn.model_selection import StratifiedKFold, cross_val_score, train_test_split
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.model_selection import learning_curve
+from sklearn.linear_model import SGDClassifier
+import sys,csv
 
-papers = pandas.read_csv('./rawSentencesLabelCopy.csv', delimiter=',', quotechar='|',
-                           names=["paper", "label","paperID"])
+csv.field_size_limit(sys.maxsize) #set size limit to maximum
 
-#using short discription as words base
+papers = pandas.read_csv('./MLpapers_sentences.csv', delimiter=',', quotechar='|',
+                           names=["paper", "label","paperName"])
+
+#papers_origin = pandas.read_csv('./rawSentencesLabelCopy.csv', delimiter=',', quotechar='|',
+#                           names=["paper", "label","paperName"])
+
 def split_into_tokens(message):
     message = unicode(message, 'utf8')  # convert bytes into proper unicode
     return TextBlob(message).words
@@ -44,33 +50,48 @@ tfidf_transformer = TfidfTransformer().fit(papers_bow)
 papers_tfidf = tfidf_transformer.transform(papers_bow)
 
 #to check whether the paper is 'data' or 'non-data'
-paper_cat1 = ['Non-data']*169
-paper_cat2 = ['Non-data']*169
+paper_cat1 = {}  #for MNB model
+paper_cat2 = {}  #for BNB model
+paper_cat3 = {}  #for SGD model
+
+for n in papers['paperName']:
+    paper_cat1[n] = 'Non-data'
+    paper_cat2[n] = 'Non-data'
+    paper_cat3[n] = 'Non-data'
 
 X = papers_tfidf
 y = papers['label']
-kf = StratifiedKFold(n_splits=5)
+kf = StratifiedKFold(n_splits=10)
 cfMtx_MultiNB = np.array([[0,0],[0,0]])
 cfMtx_BNB = np.array([[0,0],[0,0]])
+cfMtx_SGD = np.array([[0,0],[0,0]])
 
+print 'Start modeling...'
 for train_index, test_index in kf.split(X, y):
-    X_train, X_test = X[train_index], X[test_index]
-    y_train, y_test = y[train_index], y[test_index]
-    paperID_test = papers['paperID'][test_index]
+    X_test = X[test_index]
+    y_test = y[test_index]
+    paperName_test = papers['paperName'][test_index]
 
+    #Dealing with unbalanced sample
+    #Copying
+    copy = []
+    for i in train_index:
+        if y[i] == 'Data':
+            copy.append(i)
+    copy = np.array(copy)
+    for t in range(74):
+        train_index = np.hstack((train_index, copy))
+    X_train = X[train_index]
+    y_train = y[train_index]
+    
+    #modeling
     model1 = MultinomialNB().fit(X_train, y_train)
     predict1 = model1.predict(X_test)
     cfMtx_MultiNB += confusion_matrix(y_test, predict1)
 
     for i in range(len(predict1)):
         if predict1[i] == 'Data':
-            try:
-                if int(paperID_test[test_index[i]]) <= 168:
-                    paper_cat1[int(paperID_test[test_index[i]])] = 'Data'
-                else:
-                    print 'ID Error: ',paperID_test[i]
-            except:
-                print 'error i:', i
+            paper_cat1[paperName_test[test_index[i]]] = 'Data'
 
     model2 = BernoulliNB().fit(X_train, y_train)
     predict2 = model2.predict(X_test)
@@ -78,31 +99,65 @@ for train_index, test_index in kf.split(X, y):
 
     for i in range(len(predict2)):
         if predict2[i] == 'Data':
-            paper_cat2[int(paperID_test[test_index[i]])] = 'Data'
+            paper_cat2[paperName_test[test_index[i]]] = 'Data'
+
+    model3 = SGDClassifier().fit(X_train, y_train)
+    predict3 = model3.predict(X_test)
+    cfMtx_SGD += confusion_matrix(y_test, predict3)
+
+    for i in range(len(predict3)):
+        if predict3[i] == 'Data':
+            paper_cat3[paperName_test[test_index[i]]] = 'Data'
 
 
 print 'MultinomialNB Confusion Matrix:'
 print cfMtx_MultiNB
 print 'BernoulliNB Confusion Matrix:'
 print cfMtx_BNB
+print 'SGD Confusion Matrix:'
+print cfMtx_SGD
 
 cfMtx_paper_MNB = [0, 0, 0, 0] # true positive, true negative, false positive, false negative
 cfMtx_paper_BNB = [0, 0, 0, 0]
-with open('sample.csv','rU') as cf:
+cfMtx_paper_SGD = [0, 0, 0, 0]
+with open('MLpapers.csv','rU') as cf:
     rd = csv.reader(cf, delimiter = ',', quotechar = '"')
+    header = rd.next()
     for row in rd:
-        if row[-2] == 'Data':
-            if paper_cat1[int(row[-1])] == 'Data':
-                cfMtx_paper_MNB[0] += 1
+        try:
+            pdfname = row[-1]
+            if row[-2] == 'Data':
+                if paper_cat1[pdfname] == 'Data':
+                    cfMtx_paper_MNB[0] += 1
+                else:
+                    cfMtx_paper_MNB[3] += 1
+                    #print 'false negative paper num: ', row[-1]
+                if paper_cat2[pdfname] == 'Data':
+                    cfMtx_paper_BNB[0] += 1
+                else:
+                    cfMtx_paper_BNB[3] += 1
+                if paper_cat3[pdfname] == 'Data':
+                    cfMtx_paper_SGD[0] += 1
+                else:
+                    cfMtx_paper_SGD[3] += 1
             else:
-                cfMtx_paper_MNB[3] += 1
-                print 'false negative paper num: ', row[-1]
-        else:
-            if paper_cat1[int(row[-1])] == 'Non-data':
-                cfMtx_paper_MNB[1] += 1
-            else:
-                cfMtx_paper_MNB[2] += 1
+                if paper_cat1[pdfname] == 'Non-data':
+                    cfMtx_paper_MNB[1] += 1
+                else:
+                    cfMtx_paper_MNB[2] += 1
+                if paper_cat2[pdfname] == 'Non-data':
+                    cfMtx_paper_BNB[1] += 1
+                else:
+                    cfMtx_paper_BNB[2] += 1
+                if paper_cat3[pdfname] == 'Non-data':
+                    cfMtx_paper_SGD[1] += 1
+                else:
+                    cfMtx_paper_SGD[2] += 1
+        except:
+            print 'key Error:', pdfname
 
-print cfMtx_paper_MNB
+print 'MNB:',cfMtx_paper_MNB
+print 'BNB:',cfMtx_paper_BNB
+print 'SGD:',cfMtx_paper_SGD
             
 

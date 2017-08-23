@@ -83,60 +83,62 @@ for paper in paperInfo:
     else:
         last_conf = conf
         time.sleep(0.001*randint(10000,20000))
-    
-    if url.endswith('.pdf'):
-        driver.get(url)
-        continue
+    try:
+        if url.endswith('.pdf'):
+            driver.get(url)
+            continue
 
-    if not conf == 'fc': #for not fc conferences
-        driver.get(url)
-        if conf == 'uss' or conf == 'usscset':
-            elem = driver.find_element_by_class_name("file")
-        elif conf == 'ccs' or conf == 'ccsaisec':
-            page = driver.page_source
-            ind = page.find('citation_pdf_url')
-            start = page.find('http', ind)
-            end = page.find('"', start)
-            driver.get(page[start:end])
+        if not conf == 'fc': #for not fc conferences
+            driver.get(url)
+            if conf == 'uss' or conf == 'usscset':
+                elem = driver.find_element_by_class_name("file")
+            elif conf == 'ccs' or conf == 'ccsaisec':
+                page = driver.page_source
+                ind = page.find('citation_pdf_url')
+                start = page.find('http', ind)
+                end = page.find('"', start)
+                driver.get(page[start:end])
 
-        elif conf == 'ndss':
-            elem = driver.find_element_by_link_text("Download File")
-        elif conf == 'sp':
-            url=driver.current_url
-            routes = url.split('/')
-            paperID = routes[4]
-            time.sleep(0.001*randint(4000,6000))
-            driver.get('http://ieeexplore.ieee.org/stamp/stamp.jsp?arnumber='+str(paperID))
-        elif conf != 'fc':
-            print 'Cannot handle conference:', conf
+            elif conf == 'ndss':
+                elem = driver.find_element_by_link_text("Download File")
+            elif conf == 'sp':
+                url=driver.current_url
+                routes = url.split('/')
+                paperID = routes[4]
+                time.sleep(0.001*randint(4000,6000))
+                driver.get('http://ieeexplore.ieee.org/stamp/stamp.jsp?arnumber='+str(paperID))
+            elif conf != 'fc':
+                print 'Cannot handle conference:', conf
 
-    else:  #for fc conference
-        if year not in fc.keys():
-            print 'Need to add', year+'th', 'Financial Cryptography conference webpage url into script.'
-        else:
-            driver.get(fc[year])
-            page = driver.page_source
-            if len(name) > 10:
-                ind = page.find(name[:10])
-            if year != '2014':
-                start = page.rfind('>',0,ind)
-                end = page.find('<',ind)
-                elem = driver.find_element_by_link_text(page[start+1:end])
+        else:  #for fc conference
+            if year not in fc.keys():
+                print 'Need to add', year+'th', 'Financial Cryptography conference webpage url into script.'
             else:
-                start = page.frind('"', ind)
-                end = page.find('"', start+1)
-                driver.get('http://fc14.ifca.ai/'+page[start+1:end])
+                driver.get(fc[year])
+                page = driver.page_source
+                if len(name) > 10:
+                    ind = page.find(name[:10])
+                if year != '2014':
+                    start = page.rfind('>',0,ind)
+                    end = page.find('<',ind)
+                    elem = driver.find_element_by_link_text(page[start+1:end])
+                else:
+                    start = page.frind('"', ind)
+                    end = page.find('"', start+1)
+                    driver.get('http://fc14.ifca.ai/'+page[start+1:end])
 
-    if elem != '':
-        time.sleep(0.001*randint(4000,6000))
-        elem.click()
+        if elem != '':
+            time.sleep(0.001*randint(4000,6000))
+            elem.click()
 
-    if len(os.listdir('./'+folder)) == (paperNum+1):
-        paperNum += 1
-    elif len(os.listdir('./'+folder)) == (paperNum):
-        print 'Failed download paper:', name
-    else:
-        print 'Error!'
+        if len(os.listdir('./'+folder)) == (paperNum+1):
+            paperNum += 1
+        elif len(os.listdir('./'+folder)) == (paperNum):
+            print 'Failed download paper:', name
+        else:
+            print 'Error!'
+    except:
+        print name
 
 driver.close()
 
