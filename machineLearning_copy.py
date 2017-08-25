@@ -19,8 +19,8 @@ import sys,csv
 
 csv.field_size_limit(sys.maxsize) #set size limit to maximum
 
-papers = pandas.read_csv('./MLpapers_sentences.csv', delimiter=',', quotechar='|',
-                           names=["paper", "label","paperName"])
+papers = pandas.read_csv('./MLpapers_abstracts.csv', delimiter=',', quotechar='|',
+                           names=["paperName","paper","label"])
 
 #papers_origin = pandas.read_csv('./rawSentencesLabelCopy.csv', delimiter=',', quotechar='|',
 #                           names=["paper", "label","paperName"])
