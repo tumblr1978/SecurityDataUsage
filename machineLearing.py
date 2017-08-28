@@ -21,6 +21,13 @@ papers = pandas.read_csv('./MLpapers_whole.csv', delimiter=',', quotechar='|',
                            names=["paperName","paper","label"])
 
 
+#open the stopword list
+f = open('stopwordlist.txt','rb')
+stopwords = f.readlines()
+f.close()
+stopwords = set([x[:-1] for x in stopwords])
+
+
 #using short discription as words base
 
 def split_into_tokens(message):
@@ -35,7 +42,8 @@ def split_into_lemmas(message):
         return ['errror']
     words = TextBlob(message).words
     # for each word, take its "base form" = lemma 
-    return [word.lemma for word in words]
+    out=[word.lemma for word in words]
+    return [x for x in out if x not in stopwords]
 
 bow_transformer = CountVectorizer(analyzer=split_into_lemmas).fit(papers['paper'])
 print 'bow vocabulary:', len(bow_transformer.vocabulary_)
@@ -47,26 +55,6 @@ tfidf_transformer = TfidfTransformer().fit(papers_bow)
 
 papers_tfidf = tfidf_transformer.transform(papers_bow)
 
-#data_detector = MultinomialNB().fit(papers_tfidf, papers['label'])
-
-
-
-pipeline = Pipeline([
-    ('bow', CountVectorizer(analyzer=split_into_lemmas)),  # strings to token integer counts
-    ('tfidf', TfidfTransformer()),  # integer counts to weighted TF-IDF scores
-    ('classifier', MultinomialNB()),  # train on TF-IDF vectors w/ Naive Bayes classifier
-])
-
-#paper_train, paper_test, label_train, label_test=\
-        #train_test_split(papers['paper'],papers['label'], test_size=0.2)
-'''
-predicts = cross_val_predict(pipeline,
-                            papers['paper'],
-                            papers['label'],
-                            cv=10,
-                            n_jobs=-1
-                            )
-'''
 
 X = papers_tfidf
 y = papers['label']
@@ -84,6 +72,7 @@ paper_cat3 = {}  #for SGD model
 paper_cat4 = {}  #for SVC model
 paper_cat5 = {}  #for GNB model
 overall = {}
+
 for n in papers['paperName']:
     paper_cat1[n] = 'Non-data'
     paper_cat2[n] = 'Non-data'

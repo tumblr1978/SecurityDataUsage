@@ -63,15 +63,15 @@ for a in alpha_list:
         y_train, y_test = y[train_index], y[test_index]
         paperName_test = papers['paperName'][test_index]
 
-        model1 = MultinomialNB(alpha=a).fit(X_train, y_train)
+        model1 = MultinomialNB(alpha=0.05).fit(X_train, y_train)
         predict1 = model1.predict(X_test)
         cfMtx_MultiNB += confusion_matrix(y_test, predict1)
 
-        model2 = BernoulliNB(alpha=a).fit(X_train, y_train)
+        model2 = BernoulliNB(alpha=0.05).fit(X_train, y_train)
         predict2 = model2.predict(X_test)
         cfMtx_BNB += confusion_matrix(y_test, predict2)
 
-        model3 = SGDClassifier(alpha=a).fit(X_train, y_train)
+        model3 = SGDClassifier(alpha=0.05).fit(X_train, y_train)
         predict3 = model3.predict(X_test)
         cfMtx_SGD += confusion_matrix(y_test, predict3)
 

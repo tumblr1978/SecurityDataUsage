@@ -59,12 +59,15 @@ for sample in dataStc:
             tokens.add(word)
 #print 'numbers: ', count
 #print 'len 1 & 2:',len(wordset)
-#print 'len tokens', len(tokens)
+print 'len tokens', len(tokens)
 #print ''
 
 bow_transformer = CountVectorizer(analyzer=split_into_lemmas).fit(tokens)
 #print 'bow vocabulary:', len(bow_transformer.vocabulary_)
 #print 'type bow', type(bow_transformer)
+
+wordstfidf = ' '.join([x for x in tokens])
+
 
 paper1 = papers['paper'][1]
 bow1 = bow_transformer.transform([paper1])
@@ -94,9 +97,15 @@ for i in range(len(freq)):
 '''
 
 tfidf_transformer = TfidfTransformer().fit(papers_bow)
-papers_tfidf = tfidf_transformer.transform(papers_bow)
-papers_bow = papers_tfidf
+tftest = tfidf_transformer.transform(wordstfidf)
 
+
+
+#papers_tfidf = tfidf_transformer.transform(papers_bow)
+#papers_bow = papers_tfidf
+
+
+'''
 count = 0
 for i in range(len(papers['label'])):
     if papers['label'][i] != 'Data':
@@ -126,7 +135,7 @@ for k in key:
 with open('wordTfidf.csv','wb') as cf:
     wr = csv.writer(cf, delimiter = ',', quotechar='"')
     wr.writerows(out)
-
+'''
     
 
 
