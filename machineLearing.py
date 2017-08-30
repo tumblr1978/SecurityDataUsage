@@ -1,5 +1,5 @@
 import matplotlib.pyplot as plt
-import csv, unicodedata
+import csv, unicodedata,re
 from textblob import TextBlob
 import pandas
 import sklearn
@@ -16,34 +16,40 @@ from sklearn.tree import DecisionTreeClassifier
 from sklearn.model_selection import learning_curve
 from sklearn.linear_model import SGDClassifier
 from sklearn.svm import LinearSVC
+from nltk.corpus import stopwords
 
 papers = pandas.read_csv('./MLpapers_whole.csv', delimiter=',', quotechar='|',
                            names=["paperName","paper","label"])
 
 
-#open the stopword list
-f = open('stopwordlist.txt','rb')
-stopwords = f.readlines()
-f.close()
-stopwords = set([x[:-1] for x in stopwords])
 
-
-#using short discription as words base
-
-def split_into_tokens(message):
-    message = unicode(message, 'utf8')  # convert bytes into proper unicode
-    return TextBlob(message).words
 
 def split_into_lemmas(message):
     try:
-        message = unicode(message, 'utf8').lower()
+        message = message.encode('utf-8').lower()
     except:
-        print message
-        return ['errror']
+        print type(message)
+        sys.exit()
     words = TextBlob(message).words
-    # for each word, take its "base form" = lemma 
-    out=[word.lemma for word in words]
-    return [x for x in out if x not in stopwords]
+    # for each word, take its "base form" = lemma
+    stopWords = set(stopwords.words('english'))
+    wordsRaw = [word.lemma for word in words]
+    wordsOut = []
+    for word in wordsRaw:
+        if len(word) == 1:
+            continue
+        if word in stopWords:
+            continue
+        p = re.compile(r'\W')
+        check_digit = p.split(word)
+        digit = True
+        for i in check_digit:
+            if not i.isdigit():
+                digit = False
+        if digit:
+            continue
+        wordsOut.append(word)
+    return wordsOut
 
 bow_transformer = CountVectorizer(analyzer=split_into_lemmas).fit(papers['paper'])
 print 'bow vocabulary:', len(bow_transformer.vocabulary_)
@@ -81,6 +87,7 @@ for n in papers['paperName']:
     paper_cat5[n] = 'Non-data'
     overall[n] = 0
 
+
 for train_index, test_index in kf.split(X, y):
     X_train, X_test = X[train_index], X[test_index]
     y_train, y_test = y[train_index], y[test_index]
@@ -105,7 +112,7 @@ for train_index, test_index in kf.split(X, y):
     model5 = GaussianNB().fit(X_train.toarray(), y_train)
     predict5 = model5.predict(X_test.toarray())
     cfMtx_GNB += confusion_matrix(y_test, predict5)
-    
+
     for i in range(len(predict1)):
         if predict1[i] == 'Data':
             paper_cat1[paperName_test[test_index[i]]] = 'Data'
