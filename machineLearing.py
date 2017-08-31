@@ -21,8 +21,8 @@ from nltk.corpus import stopwords
 papers = pandas.read_csv('./MLpapers_whole.csv', delimiter=',', quotechar='|',
                            names=["paperName","paper","label"])
 
-
-
+sentences = pandas.read_csv('./MLpapers_sentences.csv', delimiter=',', quotechar='|',
+                           names=["paper", "label","paperName"])
 
 def split_into_lemmas(message):
     try:
@@ -51,13 +51,38 @@ def split_into_lemmas(message):
         wordsOut.append(word)
     return wordsOut
 
+
+#try to use boosted data words
+data = []
+for i in range(len(papers['label'])):
+    if papers['label'][i] == 'Data':
+        data.append(papers['paper'][i])
+
+whole_paper_nondata = []
+for i in range(len(papers['paper'])):
+    if papers['label'][i] == 'Non-data':
+        whole_paper_nondata.append(papers['paper'][i])
+print 'len non-data',len(whole_paper_nondata)
+
+data = ' '.join(data)
+
+test_sample = [data] + whole_paper_nondata
+
 bow_transformer = CountVectorizer(analyzer=split_into_lemmas).fit(papers['paper'])
+papers_bow = bow_transformer.transform(test_sample)
+
+tfidf_transformer = TfidfTransformer().fit(papers_bow)
+
+#----------------------
+
+
+#bow_transformer = CountVectorizer(analyzer=split_into_lemmas).fit(papers['paper'])
 print 'bow vocabulary:', len(bow_transformer.vocabulary_)
 
 papers_bow = bow_transformer.transform(papers['paper'])
 print 'sparse matrix shape:', papers_bow.shape
 
-tfidf_transformer = TfidfTransformer().fit(papers_bow)
+#tfidf_transformer = TfidfTransformer().fit(papers_bow)
 
 papers_tfidf = tfidf_transformer.transform(papers_bow)
 
