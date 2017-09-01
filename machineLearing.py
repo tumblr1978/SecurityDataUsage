@@ -75,17 +75,27 @@ tfidf_transformer = TfidfTransformer().fit(papers_bow)
 
 #----------------------
 
-
 #bow_transformer = CountVectorizer(analyzer=split_into_lemmas).fit(papers['paper'])
 print 'bow vocabulary:', len(bow_transformer.vocabulary_)
 
-papers_bow = bow_transformer.transform(papers['paper'])
+#papers_bow = bow_transformer.transform(papers['paper'])
 print 'sparse matrix shape:', papers_bow.shape
 
+
+#test the tfidf changes
+test_text = "we crawled 5000 packages from Alexa's to 10000 websites"
+test_bow = bow_transformer.transform([test_text])
 #tfidf_transformer = TfidfTransformer().fit(papers_bow)
+test_tfidf = tfidf_transformer.transform(test_bow)
+for i in range(len(test_tfidf.indices)):
+    print bow_transformer.get_feature_names()[test_tfidf.indices[i]], test_tfidf.data[i]
+
+
+
+'''
+tfidf_transformer = TfidfTransformer().fit(papers_bow)
 
 papers_tfidf = tfidf_transformer.transform(papers_bow)
-
 
 X = papers_tfidf
 y = papers['label']
@@ -197,3 +207,4 @@ with open('MLpapers.csv','rU') as cf:
 
 
 print 'overAll:',cfMtx_overall
+'''

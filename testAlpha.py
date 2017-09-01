@@ -1,5 +1,5 @@
 import matplotlib.pyplot as plt
-import csv, unicodedata
+import csv, unicodedata, sys, re
 from textblob import TextBlob
 import pandas
 import sklearn
@@ -16,42 +16,74 @@ from sklearn.tree import DecisionTreeClassifier
 from sklearn.model_selection import learning_curve
 from sklearn.linear_model import SGDClassifier
 from sklearn.svm import LinearSVC
+from nltk.corpus import stopwords
 
 papers = pandas.read_csv('./MLpapers_whole.csv', delimiter=',', quotechar='|',
                            names=["paperName","paper","label"])
 
+sentences = pandas.read_csv('./MLpapers_sentences.csv', delimiter=',', quotechar='|',
+                           names=["paper", "label","paperName"])
 
 #using short discription as words base
 
-def split_into_tokens(message):
-    message = unicode(message, 'utf8')  # convert bytes into proper unicode
-    return TextBlob(message).words
-
 def split_into_lemmas(message):
     try:
-        message = unicode(message, 'utf8').lower()
+        message = message.encode('utf-8').lower()
     except:
-        print message
-        return ['errror']
+        print type(message)
+        sys.exit()
     words = TextBlob(message).words
-    # for each word, take its "base form" = lemma 
-    return [word.lemma for word in words]
+    # for each word, take its "base form" = lemma
+    stopWords = set(stopwords.words('english'))
+    wordsRaw = [word.lemma for word in words]
+    wordsOut = []
+    for word in wordsRaw:
+        if len(word) == 1:
+            continue
+        if word in stopWords:
+            continue
+        p = re.compile(r'\W')
+        check_digit = p.split(word)
+        digit = True
+        for i in check_digit:
+            if not i.isdigit():
+                digit = False
+        if digit:
+            continue
+        wordsOut.append(word)
+    return wordsOut
+
+
+#try to use boosted data words
+data = []
+for i in range(len(papers['label'])):
+    if papers['label'][i] == 'Data':
+        data.append(papers['paper'][i])
+
+whole_paper_nondata = []
+for i in range(len(papers['paper'])):
+    if papers['label'][i] == 'Non-data':
+        whole_paper_nondata.append(papers['paper'][i])
+print 'len non-data',len(whole_paper_nondata)
+
+data = ' '.join(data)
+
+test_sample = [data] + whole_paper_nondata
 
 bow_transformer = CountVectorizer(analyzer=split_into_lemmas).fit(papers['paper'])
-print 'bow vocabulary:', len(bow_transformer.vocabulary_)
-
-papers_bow = bow_transformer.transform(papers['paper'])
-print 'sparse matrix shape:', papers_bow.shape
+papers_bow = bow_transformer.transform(test_sample)
 
 tfidf_transformer = TfidfTransformer().fit(papers_bow)
 
-papers_tfidf = tfidf_transformer.transform(papers_bow)
+#----------------------
 
+papers_bow = bow_transformer.transform(papers['paper'])
+papers_tfidf = tfidf_transformer.transform(papers_bow)
 
 X = papers_tfidf
 y = papers['label']
 
-alpha_list = [0]
+alpha_list = [0.1]*10
 
 for a in alpha_list:
     kf = StratifiedKFold(n_splits=10)
@@ -63,15 +95,15 @@ for a in alpha_list:
         y_train, y_test = y[train_index], y[test_index]
         paperName_test = papers['paperName'][test_index]
 
-        model1 = MultinomialNB(alpha=0.05).fit(X_train, y_train)
+        model1 = MultinomialNB(alpha=a).fit(X_train, y_train)
         predict1 = model1.predict(X_test)
         cfMtx_MultiNB += confusion_matrix(y_test, predict1)
 
-        model2 = BernoulliNB(alpha=0.05).fit(X_train, y_train)
+        model2 = BernoulliNB(alpha=a).fit(X_train, y_train)
         predict2 = model2.predict(X_test)
         cfMtx_BNB += confusion_matrix(y_test, predict2)
 
-        model3 = SGDClassifier(alpha=0.05).fit(X_train, y_train)
+        model3 = SGDClassifier(alpha=a).fit(X_train, y_train)
         predict3 = model3.predict(X_test)
         cfMtx_SGD += confusion_matrix(y_test, predict3)
 
