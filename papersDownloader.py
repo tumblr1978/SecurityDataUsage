@@ -1,6 +1,6 @@
 #Muwei Zheng
 #
-#This program takes a csv file as input, 
+#This program takes a csv file as input,
 #and then download all papers listed in the csv file into
 #a given output folder. The file should have a header,
 #And the header should be like 'PaperName, URL, Conference, Year'.
@@ -58,6 +58,10 @@ fc = {'2016':'http://fc16.ifca.ai/program.html',
       '2013':'http://fc13.ifca.ai/program.html',
       '2012':'http://fc12.ifca.ai/program.html'}
 
+fcw = {'2016':'http://fc16.ifca.ai/bitcoin/program.html',
+       '2015':'http://fc15.ifca.ai/bitcoin/schedule.html',
+       '2014':'http://fc14.ifca.ai/bitcoin/program.html'}
+
 
 #Start downloading papers
 
@@ -77,7 +81,7 @@ last_conf = ''
 for paper in paperInfo:
     name, url, conf, year = paper[0], paper[1], paper[2], paper[3]
     elem = ''
-    
+
     if conf == last_conf:
         time.sleep(0.001*randint(20000,40000))
     else:
@@ -88,7 +92,7 @@ for paper in paperInfo:
             driver.get(url)
             continue
 
-        if not conf == 'fc': #for not fc conferences
+        if not conf == 'fc' and not conf == 'fcw': #for not fc conferences
             driver.get(url)
             if conf == 'uss' or conf == 'usscset':
                 elem = driver.find_element_by_class_name("file")
@@ -113,19 +117,27 @@ for paper in paperInfo:
         else:  #for fc conference
             if year not in fc.keys():
                 print 'Need to add', year+'th', 'Financial Cryptography conference webpage url into script.'
-            else:
+                print name
+                continue
+            if conf == 'fc':
                 driver.get(fc[year])
-                page = driver.page_source
-                if len(name) > 10:
-                    ind = page.find(name[:10])
-                if year != '2014':
-                    start = page.rfind('>',0,ind)
-                    end = page.find('<',ind)
-                    elem = driver.find_element_by_link_text(page[start+1:end])
-                else:
-                    start = page.frind('"', ind)
-                    end = page.find('"', start+1)
-                    driver.get('http://fc14.ifca.ai/'+page[start+1:end])
+            else:
+                if year not in fcw.keys():
+                    print 'Need to add', year+ 'th','Financial Cryptography conference bitcoin and block chain workshop webpage url into script.'
+                    print name
+                    continue
+                driver.get(fcw[year])
+            page = driver.page_source
+            if len(name) > 10:
+                ind = page.find(name[:10])
+            if year != '2014':
+                start = page.rfind('>',0,ind)
+                end = page.find('<',ind)
+                elem = driver.find_element_by_link_text(page[start+1:end])
+            else:
+                start = page.frind('"', ind)
+                end = page.find('"', start+1)
+                driver.get('http://fc14.ifca.ai/'+page[start+1:end])
 
         if elem != '':
             time.sleep(0.001*randint(4000,6000))
