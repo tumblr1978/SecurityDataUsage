@@ -96,7 +96,7 @@ for paper in paperInfo:
             driver.get(url)
             if conf == 'uss' or conf == 'usscset':
                 elem = driver.find_element_by_class_name("file")
-            elif conf == 'ccs' or conf == 'ccsaisec':
+            elif conf in ['ccs', 'ccsaisec', 'imc']:
                 page = driver.page_source
                 ind = page.find('citation_pdf_url')
                 start = page.find('http', ind)
