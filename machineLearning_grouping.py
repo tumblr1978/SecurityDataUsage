@@ -16,10 +16,6 @@ from sklearn.tree import DecisionTreeClassifier
 from sklearn.model_selection import learning_curve
 
 
-def split_into_tokens(message):
-    message = unicode(message, 'utf8')  # convert bytes into proper unicode
-    return TextBlob(message).words
-
 def split_into_lemmas(message):
     try:
         message = unicode(message, 'utf8').lower()
@@ -41,11 +37,11 @@ def machine_learn(filePath, test_set, test_set_count1, test_set_count2):  #optio
     tfidf_transformer = TfidfTransformer().fit(papers_bow)
 
     papers_tfidf = tfidf_transformer.transform(papers_bow)
-   
+
     #option2
     testset_bow = bow_transformer.transform(test_set['paper'])
     testset_tfidf = tfidf_transformer.transform(testset_bow)
-    
+
     #option 2
     model = MultinomialNB().fit(papers_tfidf, papers['label'])
     predict = model.predict(testset_tfidf)
@@ -60,7 +56,7 @@ def machine_learn(filePath, test_set, test_set_count1, test_set_count2):  #optio
             test_set_count2[i] += 1
     return test_set_count1, test_set_count2
 
-''' 
+'''
     X = papers_tfidf
     y = papers['label']
     kf = StratifiedKFold(n_splits=5)
@@ -82,7 +78,7 @@ def machine_learn(filePath, test_set, test_set_count1, test_set_count2):  #optio
         for i in range(len(predict2)):
             if predict2[i] == 'Data':
                 dict2[int(paperName_test[test_index[i]])] += 1
-    
+
     return dict1, dict2
 '''
 
@@ -99,7 +95,7 @@ csvFiles = [x for x in os.listdir(mainPath) if x.endswith('.csv')]
 
 #create 2 lists to indicate how many papers we are going to test
 paperNum = 0   #paperNum
-paper_cat1 = ['Non-data']*paperNum   #for Mul NB 
+paper_cat1 = ['Non-data']*paperNum   #for Mul NB
 paper_cat2 = ['Non-data']*paperNum   #for     NB
 
 #option 2
@@ -123,7 +119,7 @@ for i in range(len(csvFiles)):
     #print 'BernoulliNB:', bnb
     #overall_MNB = add_list(overall_MNB, mnb)
     #overall_BNB = add_list(overall_BNB, bnb)
-    
+
     #option 2
     num_data1, num_data2 = machine_learn(mainPath+csvfile, test_set, num_data1, num_data2)
     print 'finish', i
@@ -171,5 +167,5 @@ print 'overall_MNB:'
 print overall_MNB
 print 'overall_BNB:'
 print overall_BNB
-    
+
 

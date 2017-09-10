@@ -5,10 +5,10 @@
 #2. The folder name that contains all pdf papers. It should under current dir.
 #3. The name of the .csv file where we want to save the output.
 #
-#The script will convert all pdfs in the given folder into plain txt and store them in 
+#The script will convert all pdfs in the given folder into plain txt and store them in
 #a new csv file. The header will be [pdf_name | txt]. It uses '|' as delimiter.
 #
-#Example: python pdfChecker.py downloadTest.csv papers papers.csv
+#Example: python pdfChecker.py MLpapers.csv papers papers.csv
 
 from pdfminer.pdfinterp import PDFResourceManager, PDFPageInterpreter
 from pdfminer.converter import TextConverter
@@ -42,10 +42,10 @@ def convert_pdf_to_txt(path):
     return text
 
 
-#open all pdf files in the 'papers' folder and also sort them into Modification time order
+#open all pdf files in the 'papers' folder and sort them into Modification time order
 try:
     pdfsPath = './'+sys.argv[2]+'/'
-    pdfs = [(os.path.join(pdfsPath, fn), fn) for fn in os.listdir(pdfsPath) if fn.endswith('.pdf')]
+    pdfs = [(os.path.join(pdfsPath, fn), fn) for fn in os.listdir(pdfsPath) if '.pdf' in fn]
     pdfs = [(os.stat(path), fn) for path, fn in pdfs]
     pdfs = [fn for stat, fn in sorted(pdfs)]
 except:
@@ -57,34 +57,47 @@ fileName = sys.argv[1]
 if not fileName.endswith('csv'):
     print 'A valid file should be in .csv format.'
     sys.exit()
-
+'''
 entries = []
 with open(fileName, 'rb') as csvfile:
     reader = csv.reader(csvfile, delimiter=',', quotechar='"')
-    header = reader.next() 
+    header = reader.next()
     for row in reader:
         entries.append(row)
 
-header.append('PDF_file_name')
+#check if the file is already exist. If it is, append new data to the old one
+exist = False
+new_add = []
+if header[-1] == 'PDF_file_name':
+    exist = True
+    new_add = [entries.index(x) for x in entries if x[-1] == '']
+    new_add.sort()
+    print 'new_add:',len(new_add)
+else:
+    header.append('PDF_file_name')
+    new_add = range(len(entries))
+
 out = [header]
 
+
 #the number of papers in the folder should equal to the number of entries in the csv file
-if len(entries) != len(pdfs):
+if len(pdfs) != len(new_add):
     print 'papers number not match. Abort program.'
-    print 'len(entries):',len(entries),'\t','len(pdfs):', len(pdfs)
+    print 'len(entries):',len(new_add),'\t','len(pdfs):', len(pdfs)
     sys.exit()
-    
+
 for i in range(len(pdfs)):
-    entries[i].append(pdfs[i])
-    out.append(entries[i])
+    entries[new_add[i]] += [pdfs[i],'new']
+    out.append(entries[new_add[i]])
+
+out = out + [x for x in entries if x[-1] != 'new']
 
 #write back to the csv file
 with open(fileName,'wb') as csvfile:
     writer = csv.writer(csvfile,delimiter=',')
     writer.writerows(out)
 
-
-
+'''
 #convert all pdfs into plain text, and then map them with their names in csv file
 out = [['pdf_name','text']]
 for pdf in pdfs:
@@ -110,6 +123,7 @@ if not fileName.endswith('csv'):
     print 'A valid file should be in .csv format.'
     sys.exit()
 
-with open(fileName,'wb') as csvfile:
+with open(fileName,'a') as csvfile:
     writer = csv.writer(csvfile,delimiter=',', quotechar = '|')
     writer.writerows(out)
+

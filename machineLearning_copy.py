@@ -1,5 +1,5 @@
 import matplotlib.pyplot as plt
-import csv, unicodedata
+import csv, unicodedata, re, sys
 from textblob import TextBlob
 import pandas
 import sklearn
@@ -15,39 +15,77 @@ from sklearn.model_selection import StratifiedKFold, cross_val_score, train_test
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.model_selection import learning_curve
 from sklearn.linear_model import SGDClassifier
-import sys,csv
+from nltk.corpus import stopwords
 
 csv.field_size_limit(sys.maxsize) #set size limit to maximum
-
-papers = pandas.read_csv('./MLpapers_abstracts.csv', delimiter=',', quotechar='|',
+papers = pandas.read_csv('./MLpapers_whole.csv', delimiter=',', quotechar='|',
                            names=["paperName","paper","label"])
+
+sentences = pandas.read_csv('./MLpapers_sentences.csv', delimiter=',', quotechar='|',
+                           names=["paper", "label","paperName"])
 
 #papers_origin = pandas.read_csv('./rawSentencesLabelCopy.csv', delimiter=',', quotechar='|',
 #                           names=["paper", "label","paperName"])
 
-def split_into_tokens(message):
-    message = unicode(message, 'utf8')  # convert bytes into proper unicode
-    return TextBlob(message).words
-
 def split_into_lemmas(message):
     try:
-        message = unicode(message, 'utf8').lower()
+        message = message.encode('utf-8').lower()
     except:
-        print message
-        return ['errror']
+        print type(message)
+        sys.exit()
     words = TextBlob(message).words
-    # for each word, take its "base form" = lemma 
-    return [word.lemma for word in words]
+    # for each word, take its "base form" = lemma
+    stopWords = set(stopwords.words('english'))
+    wordsRaw = [word.lemma for word in words]
+    wordsOut = []
+    for word in wordsRaw:
+        if len(word) == 1:
+            continue
+        if word in stopWords:
+            continue
+        p = re.compile(r'\W')
+        check_digit = p.split(word)
+        digit = True
+        for i in check_digit:
+            if not i.isdigit():
+                digit = False
+        if digit:
+            continue
+        wordsOut.append(word)
+    return wordsOut
+
+#try to use boosted data words
+data = []
+for i in range(len(papers['label'])):
+    if papers['label'][i] == 'Data':
+        data.append(papers['paper'][i])
+
+whole_paper_nondata = []
+for i in range(len(papers['paper'])):
+    if papers['label'][i] == 'Non-data':
+        whole_paper_nondata.append(papers['paper'][i])
+print 'len non-data',len(whole_paper_nondata)
+
+data = ' '.join(data)
+
+test_sample = [data] + whole_paper_nondata
 
 bow_transformer = CountVectorizer(analyzer=split_into_lemmas).fit(papers['paper'])
-print 'bow vocabulary:', len(bow_transformer.vocabulary_)
-
-papers_bow = bow_transformer.transform(papers['paper'])
-print 'sparse matrix shape:', papers_bow.shape
+papers_bow = bow_transformer.transform(test_sample)
 
 tfidf_transformer = TfidfTransformer().fit(papers_bow)
+#----------------------
+
+
+print 'bow vocabulary:', len(bow_transformer.vocabulary_)
+
+papers_bow = bow_transformer.transform(sentences['paper'])
+print 'sparse matrix shape:', papers_bow.shape
+
+#tfidf_transformer = TfidfTransformer().fit(papers_bow)
 
 papers_tfidf = tfidf_transformer.transform(papers_bow)
+print 'papers_tfidf shape', papers_tfidf.shape
 
 #to check whether the paper is 'data' or 'non-data'
 paper_cat1 = {}  #for MNB model
@@ -60,7 +98,7 @@ for n in papers['paperName']:
     paper_cat3[n] = 'Non-data'
 
 X = papers_tfidf
-y = papers['label']
+y = sentences['label']
 kf = StratifiedKFold(n_splits=10)
 cfMtx_MultiNB = np.array([[0,0],[0,0]])
 cfMtx_BNB = np.array([[0,0],[0,0]])
@@ -83,7 +121,7 @@ for train_index, test_index in kf.split(X, y):
         train_index = np.hstack((train_index, copy))
     X_train = X[train_index]
     y_train = y[train_index]
-    
+
     #modeling
     model1 = MultinomialNB().fit(X_train, y_train)
     predict1 = model1.predict(X_test)
@@ -159,5 +197,5 @@ with open('MLpapers.csv','rU') as cf:
 print 'MNB:',cfMtx_paper_MNB
 print 'BNB:',cfMtx_paper_BNB
 print 'SGD:',cfMtx_paper_SGD
-            
+
 

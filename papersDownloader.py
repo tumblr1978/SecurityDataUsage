@@ -79,7 +79,13 @@ paperNum = len(os.listdir('./'+folder))
 print 'start downloading papers...'
 last_conf = ''
 for paper in paperInfo:
-    name, url, conf, year = paper[0], paper[1], paper[2], paper[3]
+    name, url, conf, year, pdfName = paper[0], paper[1], paper[2], paper[3], paper[9]
+    #check if the paper is already processed:
+    if pdfName.endswith('.pdf'):
+        continue
+    elif pdfName != '':
+        print 'strange pdf name:', name, ':', pdfName
+
     elem = ''
 
     if conf == last_conf:
