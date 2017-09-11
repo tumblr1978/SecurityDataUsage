@@ -17,6 +17,8 @@ from pdfminer.pdfpage import PDFPage
 from cStringIO import StringIO
 import csv, os, sys
 
+csv.field_size_limit(sys.maxsize)
+
 #helper method to extract content from pdf
 def convert_pdf_to_txt(path):
     rsrcmgr = PDFResourceManager()
@@ -108,12 +110,14 @@ for pdf in pdfs:
         page = page.replace('|', ' ') #replace all '|' character in paper, therefore we can use '|' as delimiter.
         check = page.lower().find('references')
         #check if the converter convert pdf files completely
-        if check == -1:
-            if t == 2:
-                print 'Error! '+ pdf+' :' +str(len(page))
-        else:
-            out.append([pdf, page])
-            break
+        out.append([pdf, page])
+        break
+        #if check == -1:
+        #    if t == 2:
+        #        print 'Error! '+ pdf+' :' +str(len(page))
+        #else:
+        #    out.append([pdf, page])
+        #    break
     print pdf, 'done'
 
 

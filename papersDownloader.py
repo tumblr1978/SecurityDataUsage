@@ -25,6 +25,9 @@ from selenium import webdriver
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.by import By
 
+#allow maximum size of memory usage
+csv.field_size_limit(sys.maxsize)
+
 #open the file given by the command line argument
 fileName = sys.argv[1]
 if not fileName.endswith('csv'):
