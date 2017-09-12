@@ -18,11 +18,11 @@ from sklearn.linear_model import SGDClassifier
 from sklearn.svm import LinearSVC
 from nltk.corpus import stopwords
 
-papers = pandas.read_csv('./MLpapers_whole.csv', delimiter=',', quotechar='|',
+papers = pandas.read_csv('./papers400_whole.csv', delimiter=',', quotechar='|',
                            names=["paperName","paper","label"])
 
-sentences = pandas.read_csv('./MLpapers_sentences.csv', delimiter=',', quotechar='|',
-                           names=["paper", "label","paperName"])
+#sentences = pandas.read_csv('./MLpapers_sentences.csv', delimiter=',', quotechar='|',
+#                           names=["paper", "label","paperName"])
 
 #using short discription as words base
 
@@ -53,7 +53,7 @@ def split_into_lemmas(message):
         wordsOut.append(word)
     return wordsOut
 
-
+'''
 #try to use boosted data words
 data = []
 for i in range(len(papers['label'])):
@@ -76,14 +76,18 @@ papers_bow = bow_transformer.transform(test_sample)
 tfidf_transformer = TfidfTransformer().fit(papers_bow)
 
 #----------------------
+'''
 
+
+bow_transformer = CountVectorizer(analyzer=split_into_lemmas).fit(papers['paper'])
 papers_bow = bow_transformer.transform(papers['paper'])
+tfidf_transformer = TfidfTransformer().fit(papers_bow)
 papers_tfidf = tfidf_transformer.transform(papers_bow)
 
 X = papers_tfidf
 y = papers['label']
 
-alpha_list = [0.1]*10
+alpha_list = [0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.55, 0.6]
 
 for a in alpha_list:
     kf = StratifiedKFold(n_splits=10)

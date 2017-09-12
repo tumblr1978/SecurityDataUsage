@@ -54,12 +54,13 @@ except:
     print "Can't not locate folder", sys.argv[2]
     sys.exit()
 
+'''
 #Match the pdf file names back to the entries in csv file
 fileName = sys.argv[1]
 if not fileName.endswith('csv'):
     print 'A valid file should be in .csv format.'
     sys.exit()
-'''
+
 entries = []
 with open(fileName, 'rb') as csvfile:
     reader = csv.reader(csvfile, delimiter=',', quotechar='"')
@@ -98,13 +99,14 @@ out = out + [x for x in entries if x[-1] != 'new']
 with open(fileName,'wb') as csvfile:
     writer = csv.writer(csvfile,delimiter=',')
     writer.writerows(out)
-
 '''
+
 #convert all pdfs into plain text, and then map them with their names in csv file
-out = [['pdf_name','text']]
+out = []
 for pdf in pdfs:
     #do it three times in case it is not converted completely
     for t in range(3):
+        print pdf
         content = convert_pdf_to_txt(pdfsPath+pdf)
         page = ''.join([x if ord(x) > 0 else ' ' for x in content])#replace all the null characters
         page = page.replace('|', ' ') #replace all '|' character in paper, therefore we can use '|' as delimiter.

@@ -5,7 +5,7 @@
 #It takes three inputs:
 #1. csv file which contains raw txt files
 #2. csv file which contains data information for each paper
-#3. The ratio we want in our machine-learning test sample, should 
+#3. The ratio we want in our machine-learning test sample, should
 #   be float point if it is not integer, and should be non-data/data
 #
 #Example: python groupingAbstract.py MLpapers_pdf.csv MLpapers.csv
@@ -23,7 +23,7 @@ papers = []
 csv.field_size_limit(sys.maxsize) #set size limit to maximum
 with open(fileName, 'rb') as csvfile:
     reader = csv.reader(csvfile, delimiter=',', quotechar='|')
-    header = reader.next() 
+    header = reader.next()
     for row in reader:
         papers.append(row)
 
@@ -37,7 +37,7 @@ if not fileName.endswith('csv'):
 data_info = []
 with open(fileName, 'rb') as csvfile:
     reader = csv.reader(csvfile, delimiter=',', quotechar='"')
-    header = reader.next() 
+    header = reader.next()
     for row in reader:
         data_info.append(row)
 
@@ -71,7 +71,7 @@ print '-------'
 print '-------'
 
 
-with open('MLpapers_abstracts.csv', 'wb') as cf:
+with open('papers400_abstracts.csv', 'wb') as cf:
     wr = csv.writer(cf, delimiter = ',', quotechar = '|')
     wr.writerows(out)
 

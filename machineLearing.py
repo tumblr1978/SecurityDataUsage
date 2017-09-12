@@ -1,5 +1,5 @@
 import matplotlib.pyplot as plt
-import csv, unicodedata,re
+import csv, unicodedata,re, sys
 from textblob import TextBlob
 import pandas
 import sklearn
@@ -18,11 +18,12 @@ from sklearn.linear_model import SGDClassifier
 from sklearn.svm import LinearSVC
 from nltk.corpus import stopwords
 
-papers = pandas.read_csv('./MLpapers_whole.csv', delimiter=',', quotechar='|',
+
+papers = pandas.read_csv('./papers400_whole.csv', delimiter=',', quotechar='|',
                            names=["paperName","paper","label"])
 
-sentences = pandas.read_csv('./MLpapers_sentences.csv', delimiter=',', quotechar='|',
-                           names=["paper", "label","paperName"])
+#sentences = pandas.read_csv('./MLpapers_sentences.csv', delimiter=',', quotechar='|',
+#                           names=["paper", "label","paperName"])
 
 def split_into_lemmas(message):
     try:
@@ -52,6 +53,8 @@ def split_into_lemmas(message):
     return wordsOut
 
 
+
+'''
 #try to use boosted data words
 data = []
 for i in range(len(papers['label'])):
@@ -72,16 +75,17 @@ bow_transformer = CountVectorizer(analyzer=split_into_lemmas).fit(papers['paper'
 papers_bow = bow_transformer.transform(test_sample)
 
 tfidf_transformer = TfidfTransformer().fit(papers_bow)
-
 #----------------------
+'''
 
-#bow_transformer = CountVectorizer(analyzer=split_into_lemmas).fit(papers['paper'])
+
+bow_transformer = CountVectorizer(analyzer=split_into_lemmas).fit(papers['paper'])
 print 'bow vocabulary:', len(bow_transformer.vocabulary_)
 
-#papers_bow = bow_transformer.transform(papers['paper'])
+papers_bow = bow_transformer.transform(papers['paper'])
 print 'sparse matrix shape:', papers_bow.shape
 
-
+'''
 #test the tfidf changes
 test_text = "we crawled 5000 packages from Alexa's to 10000 websites"
 test_bow = bow_transformer.transform([test_text])
@@ -89,10 +93,9 @@ test_bow = bow_transformer.transform([test_text])
 test_tfidf = tfidf_transformer.transform(test_bow)
 for i in range(len(test_tfidf.indices)):
     print bow_transformer.get_feature_names()[test_tfidf.indices[i]], test_tfidf.data[i]
-
-
-
 '''
+
+
 tfidf_transformer = TfidfTransformer().fit(papers_bow)
 
 papers_tfidf = tfidf_transformer.transform(papers_bow)
@@ -128,7 +131,7 @@ for train_index, test_index in kf.split(X, y):
     y_train, y_test = y[train_index], y[test_index]
     paperName_test = papers['paperName'][test_index]
 
-    model1 = MultinomialNB().fit(X_train, y_train)
+    model1 = MultinomialNB(alpha=0.4).fit(X_train, y_train)
     predict1 = model1.predict(X_test)
     cfMtx_MultiNB += confusion_matrix(y_test, predict1)
 
@@ -186,19 +189,20 @@ for pdf in overall.keys():
 
 
 cfMtx_overall = [0, 0, 0, 0] # true positive, true negative, false positive, false negative
-with open('MLpapers.csv','rU') as cf:
+with open('MLpapers400.csv','rU') as cf:
     rd = csv.reader(cf, delimiter = ',', quotechar = '"')
     header = rd.next()
     for row in rd:
         try:
             pdfname = row[-1]
             if row[-2] == 'Data':
-                if overall[pdfname] >0:
+                if overall[pdfname] > 1:
                     cfMtx_overall[0] += 1
                 else:
                     cfMtx_overall[3] += 1
+                    #print pdfname
             else:
-                if overall[pdfname] == 0:
+                if overall[pdfname] <= 1 :
                     cfMtx_overall[1] += 1
                 else:
                     cfMtx_overall[2] += 1
@@ -207,4 +211,3 @@ with open('MLpapers.csv','rU') as cf:
 
 
 print 'overAll:',cfMtx_overall
-'''
