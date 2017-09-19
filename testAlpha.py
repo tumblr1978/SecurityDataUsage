@@ -87,7 +87,7 @@ papers_tfidf = tfidf_transformer.transform(papers_bow)
 X = papers_tfidf
 y = papers['label']
 
-alpha_list = [0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.55, 0.6]
+alpha_list = [0.1,0.2]
 
 for a in alpha_list:
     kf = StratifiedKFold(n_splits=10)
@@ -120,4 +120,5 @@ for a in alpha_list:
     print 'SGD Confusion Matrix:'
     print cfMtx_SGD
     print '----------'
+
 

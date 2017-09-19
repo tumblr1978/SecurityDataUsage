@@ -42,7 +42,7 @@ checkWords2 = set(fh.readline().split(' '))
 fh.close()
 print '# of checkWords1',len(checkWords1)
 '''
-fh = open('checkWords.txt','rb')
+fh = open('checkWords1s.txt','rb')
 checkWords = set(fh.readline().split(' '))
 fh.close()
 print '# of checkWords',len(checkWords)
@@ -51,7 +51,22 @@ print '# of checkWords',len(checkWords)
 falls_p = []
 falls_n = []
 
+for paper in papers.keys():
+    predict3 = 'Non-data'
+    word_set = papers[paper][0]
+    label = papers[paper][1]
+    count = 0
+    for word in checkWords:
+        if word in word_set:
+            count += 1
+    if count > 1:
+        if label != 'Data':
+            falls_p.append((paper,label))
+    else:
+        if label == 'Data':
+            falls_n.append((paper,label))
 phrase = []
+'''
 for paper in papers.keys():
     predict1 = 'Non-data'
     word_set = papers[paper][0]
@@ -71,7 +86,7 @@ for paper in papers.keys():
             falls_p.append((paper,label))
 
 
-
+'''
 
 
 print 'falls_n',len(falls_n)

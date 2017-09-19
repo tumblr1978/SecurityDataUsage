@@ -108,7 +108,7 @@ print 'Start modeling...'
 for train_index, test_index in kf.split(X, y):
     X_test = X[test_index]
     y_test = y[test_index]
-    paperName_test = papers['paperName'][test_index]
+    paperName_test = sentences['paperName'][test_index]
 
     #Dealing with unbalanced sample
     #Copying
