@@ -1,0 +1,1552 @@
+Beyond Pattern Matching: A Concurrency Model
+
+for Stateful Deep Packet Inspection
+
+Lorenzo De Carli
+
+Dept. of Computer Sciences
+Univ. of Wisconsin, Madison
+lorenzo@cs.wisc.edu
+
+Robin Sommer
+
+ICSI / LBNL
+
+Berkeley, CA, USA
+robin@icir.org
+
+Somesh Jha
+
+Dept. of Computer Sciences
+Univ. of Wisconsin, Madison
+
+jha@cs.wisc.edu
+
+ABSTRACT
+The ever-increasing sophistication in network attacks, combined
+with larger and larger volumes of trafﬁc, presents a dual challenge
+to network intrusion detection systems (IDSs). On one hand, to take
+advantage of modern multi-core processing platforms IDSs need to
+support scalability, by distributing trafﬁc analysis across a large
+number of processing units. On the other hand, such scalability
+must not come at the cost of decreased effectiveness in attack detec-
+tion. In this paper, we present a novel domain-speciﬁc concurrency
+model that addresses this challenge by introducing the notion of
+detection scope: a unit for partitioning network trafﬁc such that the
+trafﬁc contained in each resulting "slice" is independent for detec-
+tion purposes. The notion of scope enables IDSs to automatically
+distribute trafﬁc processing, while ensuring that information neces-
+sary to detect intrusions remains available to detector instances.We
+show that for a large class of detection algorithms, scope can be au-
+tomatically inferred via program analysis; and we present schedul-
+ing algorithms that ensure safe, scope-aware processing of network
+events. We evaluate our technique on a set of IDS analyses, show-
+ing that our approach can indeed exploit the concurrency inherent
+in network trafﬁc to provide signiﬁcant throughput improvements.
+
+Categories and Subject Descriptors
+C.2.3 [Computer-Communication Networks]: Network Opera-
+tions—Network monitoring; D.1.3 [Programming Techniques]:
+Concurrent Programming—Parallel programming
+
+Keywords
+NIDS, Flexible intrusion detection, Scalable trafﬁc analysis
+
+1.
+
+INTRODUCTION
+
+Effective network intrusion detection is becoming increasingly
+difﬁcult. With the proliferation of connected devices and web-
+based services, network bandwidths keep soaring, putting strin-
+gent performance requirements on detectors that must sift in real-
+time through large data volumes. Moreover, the nature of network
+intrusion itself is evolving, driven by an emerging underground
+
+Permission to make digital or hard copies of all or part of this work for personal or
+classroom use is granted without fee provided that copies are not made or distributed
+for proﬁt or commercial advantage and that copies bear this notice and the full cita-
+tion on the ﬁrst page. Copyrights for components of this work owned by others than
+ACM must be honored. Abstracting with credit is permitted. To copy otherwise, or re-
+publish, to post on servers or to redistribute to lists, requires prior speciﬁc permission
+and/or a fee. Request permissions from permissions@acm.org.
+CCS’14, November 3–7, 2014, Scottsdale, Arizona, USA.
+Copyright 2014 ACM 978-1-4503-2957-6/14/11 ...$15.00.
+http://dx.doi.org/10.1145/2660267.2660361.
+
+economy and the rise of resourceful, nation-level adversaries (“Ad-
+vanced Persistent Threats” [18]). As attack strategies are shifting
+from conceptually simple byte-level exploits to sophisticated, tai-
+lored attacks operating deep inside the application layer, intrusion
+detection systems (IDSs) need to adapt to remain effective and rele-
+vant. In order to scale to larger volumes of trafﬁc, they must support
+concurrency to take advantage of modern multi-core architectures.
+Yet, at the same time, the increased complexity of attack strategies
+requires ﬂexibility, as no one-size-ﬁts-all approach to detection will
+prove effective against the modern arsenal of attack tools.
+
+Unfortunately, there exists a fundamental tension between these
+two objectives. Simple, static detection strategies bring predictable
+data ﬂows and inter-thread communication, which allow to “hard-
+code” efﬁcient parallelism into the IDS design. An example is sig-
+nature matching: As signatures are commonly expressed on a per-
+ﬂow basis, an IDS performing this operation can simply process
+each connection independently. Yet, signature-based detection re-
+mains limited in expressiveness, and can often be thwarted with
+minor changes in the attack strategy—consider the fragility of the
+early signatures for the Heartbleed bug [8], or the use of binary ob-
+fuscation to make malware undetectable [7]. Avoiding such limita-
+tions requires more complex strategies, including stateful protocol
+analysis and correlation of events across multiple ﬂows. That com-
+plexity, however, turns parallelization into a much harder problem.
+The current state of mainstream IDSs reﬂects this tension. Suri-
+cata [11] and Snort [10] support multi-threaded processing (the lat-
+ter through a variety of different proposals, e.g., [43, 45, 48]), but
+they remain limited to classic per-ﬂow signature matching. Other
+related efforts in the literature [28, 44] rely on specialized hardware
+and/or similarly hardcoded detection algorithms. To our knowl-
+edge, Bro [6] represents the only IDS that offers complete ﬂexibil-
+ity by design; it expresses detectors in a Turing-complete scripting
+language. However, Bro remains single-threaded to this day.
+
+Our work presents a step towards making intrusion detection
+both parallel and ﬂexible. We propose a general concurrency model
+for network trafﬁc analysis that can guide IDS architectures to-
+wards parallel performance, independent from the underlying de-
+tection strategy. To detach our model from the speciﬁcs of a de-
+tector, we focus on generic data-level parallelism, as opposed to
+process-level parallelism (e.g., pipelining) as that remains heav-
+ily implementation-dependent. We observe that network trafﬁc is
+in fact inherently parallel: typical 10 GE upstream links routinely
+carry 100,000s of active ﬂows that reﬂect the communication of
+mostly unrelated endpoints.
+In other words, analyzing network
+trafﬁc constitutes an almost “embarrassingly parallel” task [37].
+However, while ﬂows generally proceed independently, most of
+them also share a close semantic relationship with some of the other
+ones—which an IDS must account for. Consider the activity that
+
+1378Figure 1: Simple portscan detector
+
+is part of the same user’s browsing session, or trafﬁc generated by
+an attacker slowly scanning a target network for reconnaissance.
+The latter may resemble a series of innocent requests, without any
+recognizable ﬁngerprint, and the attack would manifest itself only
+to a detector that maintains connection statistics for each possible
+source over a long period of time. An IDS, hence, needs to sift
+through a large number of ﬂows, mostly unrelated, while correlat-
+ing the minuscule fraction that reveals the malicious activity.
+
+We structure the remainder of the paper as follows: §2 develops
+our concurrency model and the notion of scope; §3 discusses how
+to generalize this notion to complex detection strategies. §4 dis-
+cusses how to infer scope from IDS programs via static analysis,
+and §5 formally deﬁnes a scope-aware event scheduler. §6 presents
+experimental results, §7 discusses limitations of our approach, §8
+presents related work, and §9 concludes the paper.
+
+2.
+
+IDS CONCURRENCY MODEL
+
+Modern hardware architectures offer plenty of parallelism to ad-
+dress scalability concerns [5, 9]. Unfortunately, current mainstream
+IDSs either do not take advantage of these parallel platforms, or in
+doing so restrict their capability to simple, hard-coded detection
+strategies, thus limiting ﬂexibility.
+
+Part of the problem is the lack of a clear deﬁnition of which
+detection strategies a parallel IDS should support, and what should
+be its concurrency model.
+In our work, we approach this issue
+by (i) inferring a domain-speciﬁc but ﬂexible model of how IDSs
+process trafﬁc, and (ii) leveraging this model to deﬁne a practical
+IDS concurrency model.
+2.1 Reference IDS
+
+Before discussing a concurrency model, it is important to deﬁne
+the structure and capabilities of our IDS. For the purpose of our
+work we use an abstract IDS model based on Bro, whose ﬂexible
+structure ﬁts our goal of constraining analyses as little as possible.
+The ﬁrst idea we mutuate from Bro is a clear architectural separa-
+
+tion between ﬁxed, low-level packet processing tasks (“mechanism”)—
+such as checksum veriﬁcation, stream reconstruction, protocol pars-
+ing etc.—and the detection task proper (“policy”). Speciﬁcally, the
+lower layer generates a stream of pre-digested events for the higher
+layer to analyze.1
+In order to achieve a fully parallel IDS, both
+layers—low-level trafﬁc processing and high-level analysis—must
+be parallelized. There is a signiﬁcant body of work showing that
+low-level trafﬁc processing can be efﬁciently parallelized at con-
+nection granularity. Relevant approaches include the NIDS clus-
+ter [40], novel IDS proposals such as Kargus [40] and Midea [44],
+and various efforts to parallelize Snort [43, 45, 48]. Taken to-
+gether, these results enable us to conclude that low-level trafﬁc
+processing—as well as intra-connection detection—can be efﬁciently
+parallelized at connection granularity, scales well in practice, and
+
+1Events can represent occurrences at all layers of the protocol
+stack, thus not limiting detectors to a speciﬁc level of abstraction.
+
+For devising a general concurrency model, we start from the ob-
+servation that packet processing is by nature event-driven, with
+events representing semantic units of protocol activity (e.g., the
+establishment of a new session, or, at higher-level, an HTTP re-
+quest). Events typically trigger a simple computation that often
+accesses, and potentially modiﬁes, persistent data structures track-
+ing the analysis’ current state. We ﬁnd this abstraction sufﬁciently
+generic to encompass the semantics of all popular IDS applica-
+tions. We then formalize the concepts of processing scope and
+state: scope represents a unit for partitioning network trafﬁc such
+that processing of each slice remains independent from the others,
+and hence may proceed in parallel with them; and state refers to the
+aggregate information that associates with computations operating
+at a scope’s granularity. Consider a simple scan detector, counting
+connection attempts by source: it operates with a scope of “source
+IP address”, and its state comprises the table that maps addresses to
+counter values. As each counter depends solely on the activity of
+the associated source address, we can “slice” both computation and
+state at the scope-level (i.e., IP addresses) to parallelize the detector
+without further inter-thread communication.
+
+From the perspective of this model, signature-based IDSs tend
+to have a single program-wide scope (e.g., ﬂows in Suricata) and
+hence enable deploying a speciﬁc hard-coded slicing strategy (e.g.,
+per-ﬂow load-balancing). Once we allow for more complex anal-
+ysis paradigms, on the other hand, it becomes impossible to iden-
+tify just a single scope and thus optimize the implementation ac-
+cordingly. For example, in Bro every analysis script may structure
+its processing differently, and hence require a separate scope. Our
+work identiﬁes all relevant scopes statically at compile-time by us-
+ing a novel application of program slicing (§4). We then use the
+information to drive a dynamic thread scheduler at run-time.
+
+To demonstrate our approach we implement it inside a generic
+IDS middle-layer platform that provides a set of domain-speciﬁc
+programming constructs for expressing arbitrary network analysis
+tasks. We ﬁnd this approach effective in achieving scalability (§6).
+
+(b) void run_IDS() {   while ( p = read_packet() ) {     if ( p.SYN )       count_connections(p);   } } void count_connections(packet p) {   if (++counts[p.src] > THRESH)     report_host(p.src); } handler count_connections(connectionEvent c) {   lock_element(counts[c.src])   v = ++counts[c.src];   unlock_element(counts[c.src])   if ( v > THRESH )     report_host(c.src); } (a) handler count_connections(connectionEvent c) {   if (++counts[c.src] > THRESH)     report_host(c.src); } (c) void run_IDS() {   i = 0;   while ( p = read_packet() ) {     if ( p.SYN ) {       event c = new connectionEvent(p);       send_event(threads[i], c);       i = (i+1) % N; }}} void run_IDS() {   while ( p = read_packet() ) {     if ( p.SYN ) {       event c = new connectionEvent(p);       send_event(threads[c.src % N], c);     }   } } IDS LOGIC DETECTOR SINGLE-THREADED IDS CONCURRENT IDS (LOCK-BASED) CONCURRENT IDS (SCOPE-BASED) 1379Figure 2: High-level IDS architecture
+
+does not represent the main challenge for a distributed IDS. There-
+fore we focus on parallelization of high-level, inter-connection events.
+
+In this context, our IDS allows users to deﬁne detection strategies
+as event handlers expressed in a Turing-complete domain-speciﬁc
+language. This approach encompasses the semantics of virtually all
+popular IDS platforms, enabling our concurrency model to retain
+generality. For the purpose of this paper, we express analyses using
+a C-like syntax with a few IDS-speciﬁc primitives and data types
+(see Figures 1, 8).
+
+2.2 Event-based Concurrency
+
+A natural approach to parallelization is to distribute events to an
+array of IDS threads. The difﬁculty here is that high-level intrusion
+attempts (and related behaviors) are typically ﬁngerprinted by mul-
+tiple correlated events. For example, consider the simple portscan
+detector in Figure 1(a). The upper half of the ﬁgure describes the
+event-generating logic (“IDS logic”), while the lower half describes
+the detection algorithm. Albeit admittedly contrived, this program
+adheres to our IDS model and works by correlating multiple con-
+secutive events (connection attempts from a given host).
+
+A strawman parallel version may look like the program in Fig-
+ure 1(b). This implementation works by generating one event for
+each new connection; events are fed to a pool of N identical threads
+in round-robin for processing. This example illustrates a funda-
+mental issue: most detectors—even very simple ones—maintain
+a certain amount of state that is progressively updated as events
+are processed. The main problem of our strawman implementation
+is that events assigned to different threads are not independent—
+different threads may end up processing events related to the same
+source. Therefore, access to the state of the detector must be medi-
+ated by locks (“lock_element()” in the example) to avoid data races.
+Similar to conventional approaches for general-purpose programs,
+the parallel behavior is hardcoded in the script, and data races are
+avoided by using costly synchronization primitives. Moreover, the
+program in Figure 1(b) will in general route multiple events from
+the same source to different threads. This causes each thread to
+perform a sequence of accesses with little or no memory locality; if
+the amount of state kept by the detector is signiﬁcant, continuously
+retrieving and updating unrelated pieces of state can severely ham-
+per performance. Finally, this approach does not preserve ordering
+of events. While this is irrelevant for our example, many real-world
+IDS analyses (e.g., ones that correlate a sequence of malicious ac-
+tions) are in fact sensitive to re-ordering.
+
+A key insight about IDS analyses [30, 37] is that, even when no
+particular constraints are imposed, they tend to naturally structure
+themselves around independent units of processing—such as ﬂows,
+hosts, subnets etc.—and to access little or no state outside their
+unit of processing. For example, code that examines the content of
+a particular ﬂow rarely requires access to information about other
+ﬂows; and our example scan detector has no need for correlating
+counters between sources. In other words, partitioning events by
+
+unit of processing also partitions the detector state in independent
+subsets. In the rest of this paper we refer to a unit of processing
+and its related state as the scope of the detector. Also, we refer to
+a concrete instantiation of a scope as a context (e.g., if the scope is
+“connection”, a context is a concrete instantiation of the 5-tuple).
+
+Our concurrency model requires a scope to be associated with
+each analysis. Said scope deﬁnes a contract between an analysis
+and the underlying IDS runtime, where the analysis “promises” to
+only access state within its scope. In exchange the runtime provides
+the following guarantee: all network events within the same context
+are processed sequentially by the same thread, in the order they
+are received. For our simple scan detector, the scope is the source
+address (c.src). Figure 1(c) depicts its implementation within this
+paradigm: each connection is statically mapped (by simple hash-
+ing, c.src%N) to one of the available threads, guaranteeing that (i)
+no two threads access the same state at the same time, and (ii) all
+events from the same source are processed sequentially. It should
+be noted that scope can be non-trivial to deﬁne, especially for anal-
+yses aggregating multiple connections at the application layer. §3
+presents one such analysis (a worm detector), and discusses an ap-
+proach to generalize the notion of scope to those cases.
+2.3 A Parallel IDS Architecture
+
+We now outline a concrete IDS architecture based on the concur-
+rency model discussed above. We have implemented and evaluated
+this architecture; results are discussed in §6.
+
+Our proposed architecture, depicted in Figure 2, assumes a pre-
+processing step (1) to efﬁciently parse raw packets and generate
+events (in the case of our example portscan detector, new connec-
+tion notiﬁcations). A scheduler (2) then determines the appropri-
+ate context for each event (the address of the connection origina-
+tor), and maps all related processing to the corresponding thread.
+The resulting stream of scheduled events is analyzed using multi-
+ple analysis threads (3), each in charge of a set of contexts. Each
+thread maintains and updates its own private, local detection state.
+The scalability of this model depends crucially on ﬁnding sufﬁ-
+cient diversity in the analyzed trafﬁc (in terms of number of con-
+texts) to distribute load and state evenly across threads. Previous
+work has shown that partitioning trafﬁc at ﬂow level [40] and sim-
+ilar units [37] balances well and provides good thread-scalability.
+Our evaluation, presented in §6, supports these conclusions.
+
+Our model relies on (i) the availability of a well-deﬁned scope
+for each detection strategy, and (ii) the correctness of the event
+scheduler. In §3 we discuss how scope can be generalized using
+the concept of scheduling functions, and in §4 we propose an ap-
+proach to automatically infer scope via program analysis. §5 then
+gives a scheduling algorithm suited for our architecture.
+
+3. GENERALIZING DETECTOR SCOPE
+
+For simple analyses, the processing context of an event handler
+is directly characterized by its input data. For example, in the
+
+Low-level traffic parsing (per-connection)   Scheduler       (   ) Event context determination Event stream . . . detector_logic() Detector state . . . Network traffic Scheduled events 1 1 2 2 3 3 Detector threads Event ev1 Event ev2 1380portscan detector of Figure 1 the context is given by the address
+of the connection originator. Similarly, for a detector performing
+per-ﬂow signature matching each event’s context is determined by
+its connection 5-tuple. Therefore, it is tempting to specify scope
+as a subset of input parameters (such as c.src for the detector of
+Figure 1(c)).
+
+This assumption however does not hold for more complex anal-
+yses, that may correlate multiple ﬂows and different classes of net-
+work events. In this section we demonstrate the issue using a sim-
+ple worm detector, and we show how to achieve a more general
+deﬁnition of scope via the concept of scheduling functions.
+3.1 Multistep: a Trojan Detector
+
+Malicious network activity by an infected host tends to consist
+of various operations that appear normal if considered individually
+but become signiﬁcant once considered together. Our sample anal-
+ysis implements a simple multi-step trojan detector (multistep in the
+following), inspired by publicly available Bro didactic material [1].
+Albeit referring to a ﬁctional malware, it is inspired by threats seen
+in practice, making it a realistic case study.
+
+The target of the detector is a backdoor application that is asso-
+ciated with the following sequence of operations: (i) the infected
+host receives an SSH connection on port 2222; (ii) the host initiates
+three distinct downloads: an HTML ﬁle from a web server, and a
+ZIP and an EXE ﬁle from a FTP server; (iii) the host generates IRC
+activity. Note that order is relevant; the same events in a different
+order do not constitute a ﬁngerprint.
+
+We assume the availability of an underlying IDS layer that can
+distill raw packet trafﬁc into high-level events, as described in §2.1.
+These events are fed to the detection logic, which consists of three
+event handlers:
+
+• ProtocolConﬁrmation: Triggered by the IDS when an application-
+
+level protocol is being used within a connection. Used to de-
+tect both the initial inbound SSH connection, and the ﬁnal
+outbound IRC connection.
+
+• HttpRequest: Triggered when a host generates an HTTP re-
+
+quest. Used to detect the HTTP download.
+
+• FTPRequest: Used to detect both FTP downloads.
+
+To maintain state the detector uses a persistent table, consisting
+of an associative container indexed by IP addresses of potentially
+infected hosts. The value associated with each IP is the current
+detection state i.e., how many actions, from the sequence that ﬁn-
+gerprints the trojan, the host has already performed. An entry is
+created in the table for each host that receives an SSH connection
+on port 2222, and updated every time the same host performs one
+of the activities described earlier. If a host completes all the actions
+in the described order, the detector raises an alert.
+3.2 Parallelizing Multistep
+
+To determine the appropriate scope for multistep, we begin by
+considering how data ﬂows within an individual event handler, sum-
+marized in Figure 3(a). Events from the input stream (1) are fed to
+event handlers (2) as they arrive. Each handler derives a key from
+input data (3), per the labels on the edges; and then uses that key
+as an index to retrieve relevant detection state (4). First, just by
+considering the inputs to each handler, it is evident that a per-ﬂow
+approach to parallelism is infeasible, since the various event han-
+dlers operate on different connections. If we look for another, more
+general scope to partition the trafﬁc (connection originator? con-
+nection responder?), a problem quickly becomes apparent: Each
+
+Figure 3: Dataﬂows (a) and scheduling functions (b) for multistep
+
+handler independently derives the index used to retrieve the detec-
+tion state. As can be seen, there is no unique way to deﬁne a scope
+that applies to all the components of the application, since the in-
+formation of interest can be either the originator of a connection,
+or the responder. It is not even possible to assign a well-deﬁned
+scope to individual handlers: in the case of the ProtocolConﬁrma-
+tion handler, the index can be either the connection originator or
+responder depending on which protocol is being detected.
+
+These considerations suggest that attempting to deﬁne scope from
+a network perspective, i.e., statically and in terms of protocol-related
+concepts (ﬂow, connection originator, etc.), is not suitable for cross-
+layer, complex analyses. Instead, we propose considering the issue
+from an “analysis-centric” point of view: all the possible inputs
+that cause the same detection state to be accessed belong to the
+same context. In other words, we make the deﬁnition of scope de-
+pendent on the computation performed by the program itself.
+
+3.3 A Flexible Approach to Scheduling
+
+We observe that most analyses are structured around a set of ta-
+bles, and their persistent state is fully deﬁned by the values of the
+indices used to access said tables. Consider the ProtocolConﬁrma-
+tion handler in Figure 3(a). The handler is executed each time a new
+connection is observed, and receives an identiﬁer p for the protocol
+being used. If p == IRC, the handler accesses the table based on
+the source of the connection (c.src). If p == SSH, it does the same
+using the destination of the connection (c.dst). The key point is that
+once the table is accessed, the scope gets fully disambiguated.
+
+This suggests a way to conceptually partition a set of events into
+contexts: two events are within the same context if they cause the
+detector to access the same index (indices) in its table(s). For ex-
+ample, an IRC connection from address 192.168.1.12 and a SSH
+connection to the same address will both cause multistep to update
+the same table entry. At the same time, events generated by a an-
+other infected host/IP will affect a different entry.
+
+This rule can be directly used for scheduling, by mapping all
+events resulting in the same table access(es) to the same context,
+and therefore to the same thread. But there is a caveat: the value of
+table indices can only be determined when the event handler exe-
+cutes, i.e., after the scheduling decision has been done. However, a
+large number of event-driven analyses, regardless of their complex-
+ity, statelessly compute table indices from the values of their input
+parameters (event data).
+
+Host address Detection state  HTTP Request  FTP Request       Per-host detection state c.dst if p == SSH c.src if p == IRC c.src c.src Inputs: connection c string method string URI Inputs: connection c protocol p Inputs: connection c string command string argument 1 1 2 2 3 3 4 4 Protocol Confirmation (a) ProtocolConfirmation(c): if (p == SSH) return c.dst else return c.src HTTPRequest(c): return c.src FTPRequest(c): return c.src (b) Scheduling functions: 1381Our approach then consists in annotating each event handler with
+its index computation, which we call the scheduling function A.
+Figure 3(b) outlines the simplest possible scheduling functions for
+the handlers in the multistep example. The role of A is to guide
+scheduling by deriving the scope from input values for each new
+event, before processing it. Once scheduling functions are avail-
+able, parallelization can proceed by executing the appropriate schedul-
+ing function on each input, and using the result to map events
+within the same context (i.e., accessing the same data) to the same
+thread. As Figure 3(b) illustrates, expressing scope in terms of
+scheduling functions does not introduce additional overhead: a min-
+imal scheduling function expresses precisely the operations that the
+IDS logic must perform to derive the appropriate context for an
+event.
+In §4 we give algorithms to automatically construct an efﬁcient
+scheduling function A for a given program P via static program
+analysis. An advantage of this technique is that the parallelization
+strategy is derived ofﬂine, i.e., scheduling functions can be fully
+constructed before running the program.
+
+INFERRING SCOPE
+
+4.
+The approach outlined in §3 requires, for each analysis, a schedul-
+ing function A. The simplest approach for generating A is to re-
+quire the developer to annotate each program with an appropri-
+ate scheduling function. This is however impractical, as it further
+complicates the user’s already difﬁcult task of implementing effec-
+tive trafﬁc analyses. Developing an analysis and the corresponding
+scheduling function is cumbersome, and the duplication of code
+with similar purpose makes programming errors more likely.
+If
+a program and its scheduling function become inconsistent, the
+analysis risks incurring false negatives. Moreover, reasoning about
+scheduling functions requires the user to focus on a technical as-
+pect of the system—parallelization—unrelated to the main goal of
+intrusion detection. Instead, our goal is to provide an IDS system
+with transparent scalability, leaving the user free to concentrate on
+developing effective analyses.
+We therefore consider the problem of automatically generating
+the scheduling function A for a given IDS program P . If Ind(i) is
+the set of indices accessed by P , A is deﬁned so that Ind (i) ⊆
+A(i) for all i ∈ I (where I is the set of all possible program
+inputs). We begin by observing that the most obvious deﬁnition
+of A is P itself. Making A equal to P results in a scheduling
+function that is fully precise, since for every input i it always returns
+exactly the set of indices Ind(i) that P will access. However, such
+A is also terribly inefﬁcient, as it causes P to run twice on each
+input: ﬁrst to perform scheduling and then to process the event. The
+problem then becomes to construct A an as an over-approximation
+of P , such that Ind (i) ⊆ A(i) and A executes faster than P .
+
+To construct such an approximation, we observe that for many
+IDS heuristics only a small part of the program is dedicated to com-
+puting the indices in Ind(i), while the rest implements the detec-
+tion logic. Therefore, a compact (with respect to the size of P )
+scheduling function A can be obtained by pruning all the state-
+ments, in P , that are irrelevant for the computation of Ind(i). In
+the rest of this section, we describe static analysis algorithms that
+constructs the scheduling function A by pruning P . As both the al-
+gorithms are based on program slicing, we provide a brief primer.
+4.1 Program Slicing Primer
+
+Program slicing [27, 35, 47] is a program analysis technique that
+provides two primitives: (i) determine which statements in a pro-
+gram inﬂuence the value of a variable at a given point (backward
+slicing), and (ii) determine which statements are inﬂuenced by the
+
+value of a variable at a given point (forward slicing). It does so by
+leveraging the program dependency graph (PDG), a graph repre-
+sentation of a program where nodes are statements and edges rep-
+resent data and control dependencies between statements. Thus for
+example backward slices can be constructed by computing back-
+ward reachability from the statements of interest. Figure 4(a-b)
+presents an example of a simple program and its PDG. (We discuss
+the ﬁgure in more detail below.)
+
+In this paper, we use program slicing to isolate the portion of
+analysis programs that generates table indices. Speciﬁcally, given
+an input program P we want to extract the statements relevant to
+the scheduling function A, i.e., those that transform an input i into a
+set of table indices Ind(i). To do so, we generate a backward slice
+including statements that affect the value of indices in Ind(i). The
+resulting slice S will contain a superset of the statements of interest.
+We then leverage the domain-speciﬁc nature of such programs to
+reﬁne the output of slicing and generate scheduling functions in a
+fully automated way. To the best of our knowledge this application
+of program slicing to the domain of IDS parallelization is novel,
+and an important contribution of our work.
+We have developed two algorithms to generate the scheduling
+function A via program slicing. The ﬁrst algorithm, presented in
+§4.2, is optimized for the common case where the scheduling func-
+tion A can be expressed as straight-line code. The second algo-
+rithm, presented in §4.3, reﬁnes the ﬁrst to produce better results
+when S includes conditional instructions.
+4.2 Flow-insensitive Algorithm
+
+In §3 we introduced the idea that IDS analyses can be divided in
+two broad classes: simple analyses whose scope can be expressed
+in terms of protocol-level units (e.g., analyses aggregating trafﬁc by
+source address, connection, etc.) and more complex ones with non-
+trivial scope (e.g., our multistep example). We begin by describing
+an algorithm targeted at the former, simpler class.
+
+Our algorithm is based on the insight that, for many simple anal-
+yses, the index used to access analysis state is either an input pa-
+rameter, or is obtained by a simple, straight-line computation from
+the input parameters (e.g., extracting a struct ﬁeld, such as in Fig-
+ure 1(c)). In these cases the value of the index does not depend on
+conditional instructions. Therefore, scheduling function generation
+can be greatly simpliﬁed by only considering data dependencies.
+
+Algorithm 1: Flow-insensitive A generation
+1
+2
+3
+4
+5
+
+Compute DDG G from program P
+Find the set of table accesses C in G
+Compute the backward slice S from C
+Remove redundant table accesses from S
+Emit code for S
+
+Algorithm 1 lists the high-level steps through which scheduling
+functions are generated. We describe each step through an exam-
+ple from the multistep application introduced in §3.1. The example
+consists of one of the application’s event handlers, HttpRequest.
+Pseudocode for the event handler is given in Figure 4(a).
+Input
+parameters are 1) the identiﬁer of the connection generating the re-
+quest, 2) the request method (e.g., “GET” or “POST”), and 3) the
+URI being requested. The handler ﬁrst checks whether the request
+matches some preconditions, then veriﬁes if an entry for the con-
+nection originator exists in its state table. If so, and the detection
+state associated with the originator is in the WAIT_HTTP state, the
+handler advances the detection state to WAIT_FTP.
+
+1382Figure 4: Flow-insensitive algorithm. Dashed arrows represent control dependencies; shaded nodes represent table accesses.
+
+Step 1 in Algorithm 1 computes the PDG. The algorithm only
+considers data dependencies, so the result is really a data depen-
+dency graph (DDG). Figure 4(b) shows the full PDG for the pro-
+gram; dashed lines represent conditional dependencies (ignored in
+this phase). Note that the original program has been converted
+to the intermediate assembly-like representation of HILTI ([38];
+see §6.2), where each node corresponds to an atomic instruction
+(conditional statements correspond to if.else branch instructions).
+Step 2 computes the set C of table accesses (shaded nodes in the
+graph). Step 3 performs backward slicing as described in §4.1, re-
+turning the slice S which contains all program statements relevant
+for the scheduling function A. Figure 4(c) describes the output of
+this step for our example. Step 4 (Figure 4(d)) ﬁlters redundant
+table accesses, i.e., accesses that use the same index variable such
+as v3, (which corresponds to the high-level variable c.src in Fig-
+ure 4(a)). These are easily identiﬁable since as part of the PDG
+construction we transform the code into SSA form [20]. Finally,
+during code generation (Step 5) the slice is translated to a straight-
+line code sequence, and each table access is replaced by an instruc-
+tion returning the corresponding index. The scheduling function A
+for our example is reported in Figure 4(e).
+
+Due to the simplicity of the example, the description above does
+not account for the situation where some index value depends on
+control ﬂow, or where the application accesses multiple indices.
+The algorithm transparently deals with these occurrences by return-
+ing all possible indices that the execution may generate.
+
+Discussion: We ﬁnd that the algorithm described in this section
+works well in a variety of use cases (see §6.4). Its main limitations
+are that (i) being ﬂow-insensitive, it cannot soundly analyze pro-
+grams that have loops in the index computation; and (ii) when table
+indices depend on conditional instructions, the resulting schedul-
+ing function is imprecise. In the next section we present a slicing
+algorithm that overcomes these limitations.
+4.3 Flow-sensitive Algorithm
+
+Certain analyses contain conditional constructs, such as branches
+and loops, in their index computation. These are typically the anal-
+yses for which the scope cannot be deﬁned simply in terms of pro-
+tocol units. One such example is the ProtocolConﬁrmation han-
+dler in our multistep example, described in §3.1. To be effective, a
+scheduling function A for such a program P should keep as much
+
+as possible of the original control ﬂow. To do so, the backward
+slice S on P must include both control and data edges.
+
+We note, however, that even with this approach it is not possible
+to preserve all control ﬂow. In fact, the slice S may retain branch
+instructions whose outcome depends on the content of the table,
+such as for example <if elem1 in table then v = table[elem2]>.
+Such an expression cannot be executed in a scheduling function,
+which “lives” in the scheduler and does not have access to the table.
+We deal with this situation by pruning such branch instructions (<if
+elem1 in table>), thus causing the instructions that depend on them
+(<v = table[elem2]>) to be executed unconditionally.
+
+Algorithm 2: Flow-sensitive A generation
+Compute PDG G from program P
+1
+Find the set of table accesses C in G
+2
+Compute the backward slice S from C
+3
+Remove from S branch conditions that are
+4
+data-dependent on statements in C
+Remove superﬂuous branch conditions from S
+Remove redundant table accesses from S
+Recompute the slice S
+Emit code for S
+
+5
+6
+7
+8
+
+Algorithm 2 describes the high-level steps through which ﬂow-
+sensitive scheduling function generation is performed. We discuss
+each step using a simpliﬁed version of the ProtocolConﬁrmation
+event handler from multistep (§3.1). Pseudocode is given in Fig-
+ure 5(a). The program receives as inputs a connection ID and a
+protocol ID. If the protocol is SSH and the destination port is 2222,
+the handler creates a new entry for the connection responder in its
+state table. If the protocol is IRC, the handler checks if the table
+has an entry for the connection originator; if yes, it emits an alert.
+Steps 1-3 of Algorithm 2 correspond to the same steps in Algo-
+rithm 1, with the difference that in Algorithm 2 the analysis builds
+the full program dependency graph. Therefore, the slice S returned
+by Step 3 contains both control and data dependencies (Figure 5(b),
+with control edges represented as dashed arrows). Steps 4-7 further
+prune the subgraph. In Figure 5(a) and (b), nodes removed dur-
+ing each step (and the corresponding lines in the high-level pseu-
+docode) are marked with the step number. Step 4 removes branch
+
+map<addr, hostState> hosts;  void HttpRequest(connection c,                  string method,                  string uri) {   if ( method == "GET" &&        "dl.html" in uri)   {     if ( c.src in hosts) {       if ( hosts[c.src] == WAIT_HTTP )             hosts[c.src] == WAIT_FTP;       }     } }       (a) Program text (pseudocode)  addr SF_HTTPRequest(connection c) {   addr v3 = struct.get c (cid:361)src(cid:362)   return.result v3 }      (e) Scheduling function (assembly)   method uri v0 = equal method “GET” v1 = string.find uri “dl.html” if.else v2 v2 = bool.and v0 v1 c v3 = struct.get c “src” v4 = map.exists hosts v3 if.else v4 v5 = map.get hosts v3 v6 = equal v5 WAIT_HTTP if.else v6 map.put hosts v3 WAIT_FTP (b) Original PDG (assembly) c v3 = struct.get c src v4 = map.exists hosts v3 v5 = map.get hosts v3 map.put hosts v3 WAIT_FTP (c) Slicing output c v3 = struct.get c src v4 = map.exists host v3 (d) Output after filtering 1383Figure 5: Flow-sensitive algorithm (multistep example)
+
+instructions that cannot be decided at run-time, as discussed above.
+In Step 5, we also heuristically remove two classes of superﬂuous
+branches: redundant ones, i.e., branches that would lead to the same
+set of indices Ind(i) regardless of whether they are taken or not,
+and branches for which one side would not lead to any table access.
+Step 6 removes redundant table accesses, similar to Step 4 in Al-
+gorithm 1. Finally, since the pruning performed in Steps 4-6 may
+have disconnected further nodes from the rest of the graph, in Step
+7 the program slice S is recomputed to ﬁlter them out. The result-
+ing graph, and the scheduling function emitted by code generation
+(Step 8) are reported respectively in Figure 5(c) and 5(d).
+
+Discussion: By preserving part of the original control ﬂow Algo-
+rithm 2 supports loops within scheduling functions, and can gener-
+ate more precise results than Algorithm 1.
+4.4 Soundness of Scheduling Functions
+We deﬁne a scheduling function A to be sound if Ind(i) ⊆
+A(i), i.e., if A returns, for every input i, a superset of the in-
+dices the program P will access on that input. A relevant issue
+is whether the algorithms described in this section generate sound
+scheduling functions, because this guarantees that each detector in-
+stance receives all the inputs relevant for its task. A program P is
+transformed into a scheduling function A through two operations:
+a slicing procedure, that extracts a slice S from P , and the pruning
+step, that further removes various statements from S and restruc-
+tures control ﬂow. Intuitively, both transformations must preserve
+soundness.
+
+We ﬁrst observe that, as our slicing procedure is correct, it pre-
+serves all statements in P relevant to compute Ind(i). There-
+fore executing S on any input i generates a set of indices S(i) s.t.
+Ind(i) ⊆ S(i). We then need to show that S(i) ⊆ A(i).
+
+For a slice S, we deﬁne πS(i) as the program path on input i,
+i.e., the sequence of instructions executed by S when run on input
+i. We then deﬁne the set of all possible paths executed by S as ΠS.
+Both Algorithms 1 and 2 create an overapproximation A of S by
+removing some (or all) branches and executing the dependent in-
+struction unconditionally. Therefore, for each input i, A will gen-
+erate a ﬁnite set of paths ΠA(i) ⊆ ΠS. The set ΠA(i) has the
+following property. For every input i, let πS(i) be the path gener-
+
+ated by the slice S. Then there exists a path πA(i) ∈ ΠA(i), that
+executes the data-ﬂow instructions in πS(i). Note that if πA(i) ex-
+ecutes the same data-ﬂow instructions as πS(i), it will generate the
+same table indices. Informally, the property implies that for each
+possible input i, A generates a superset of the indices returned by
+S on the same input. Therefore Ind(i) ⊆ S(i) ⊆ A(i), and A is
+sound.
+4.5 Running Multiple Scheduling Functions
+
+A full-ﬂedged IDS is expected to run several different analyses
+on the same trafﬁc. In general, each analysis can have a different
+scope, and a different scheduling function. When an event is gen-
+erated, the IDS must therefore run the scheduling functions for all
+analyses registered for that event. However, the number of possible
+scopes will be substantially smaller than the number of analyses in
+the system. Indeed, a 2009 analysis of Bro’s script corpus showed
+that the majority of event handlers could be mapped to one of only
+four scopes [37]. If two scheduling functions have equal scope only
+one needs to be executed, reducing the amount of computation re-
+quired. Furthermore, it may be possible to merge two schedul-
+ing functions with different scopes, as long as one subsumes the
+other. For example, the scope <src IP, dst IP> subsumes the scope
+<src IP, dst IP, src port, dst port, protocol>. Scheduling according
+to the former scope is safe even if the application uses the latter,
+more speciﬁc scope.
+
+5. SCHEDULING ALGORITHMS
+
+Scheduling functions can infer scope for each program execu-
+tion, but they do not imply any concrete scheduling algorithm. An
+issue is therefore how to perform scheduling efﬁciently. This sec-
+tion formalizes the scheduling problem as an invariant, and dis-
+cusses how scheduling algorithms can maintain this invariant.
+
+An IDS analysis within our model can be formalized as a pro-
+gram P that executes in an event-driven fashion, updating its state
+every time a new input is received. Given such a program, let I be
+the space of inputs and S be the state space of the program. The
+type of P is I → (S → S), i.e, given an input i ∈ I and a state
+s ∈ S the new state of the program is given by P (i)(s). Without
+loss of generality, assume that the state space of the program is a
+
+set<addr> hosts;  void ProtocolConfirmation(connection c,                           int proto) {     if (proto == SSH &&          c.port == 2222) {         if ( c.dst !in hosts )             add(hosts, c.dst);     } else if ( proto == IRC ) {         if ( c.src in hosts )             report_host(c.src);     }}           (a) Program text (pseudocode) c v1 = struct.get c port v2 = equal v1 2222/tcp v0 = equal proto SSH proto v3 = bool.and v0 v2 if.else v3 v4 = struct.get c dst v6 = equal proto IRC v5 = set.exists hosts, v4 if.else v6 if.else v5 v7 = struct.get c src v8 = set.exists hosts v7 set.insert host v4 c v1 = struct.get c port v2 = equal v1 2222/tcp proto v0 = equal proto SSH v3 = bool.and v0 v2 if.else v3 v4 = struct.get c dst v7 = struct.get c src v5 = set.exists hosts v4 v8 = set.exists hosts v7 (c) Output after filtering (assembly) addr SF_ProtocolConfirmation(connection c,                              int proto {        v0 = equal proto SSH        v1 = struct.get c port        v2 = equal v1 2222/tcp        v3 = bool.and v0 v2        if.else v3 @L0 @L1 L0: v4 = struct.get c dst        return.result v4 L1: v7 = struct.get c src         return.result v7 }            (d) Scheduling function (assembly) (b) Slicing output (assembly) 4 4 6 6 5 5 7 7 5/7 5/7 4 4 6 6 1384possibly unbounded array or table T [0··· k] of bytes. Given the
+program P , let Ind (i) be the set of indices of the table T that are
+read by or written to when executing the program P with input i.
+Furthermore, we stipulate that P runs within a multi-threaded sys-
+tem, where each execution of P is in general scheduled to a differ-
+ent thread. Each thread maintains its own private copy of the table
+T holding program P ’s state. Throughout the rest of the discus-
+sion assume that the program P is ﬁxed (i.e., everything implicitly
+corresponds to the program P ).
+A scheduler (denoted by Sch) takes a stream of inputs from
+I and maps them to threads. Let mSch (i) be a positive integer
+that denotes the ID of the thread to which Sch maps the input i.
+Assume that the scheduler Sch, having already scheduled inputs
+i1,··· , ik, receives a new input ik+1, and assigns it to the thread
+ID mSch (ik+1). For a program P we want the scheduler Sch to
+maintain the following invariant Inv:
+
+mSch (ix) (cid:54)= mSch (iy) ⇒ Ind (ix) ∩ Ind (iy) = ∅
+
+thus enforcing that inputs are mapped to different threads only if
+the corresponding executions of P do not share state.
+5.1 A General Scheduler
+
+To maintain the invariant, a scheduler has to evaluate Ind (i1) ∩
+Ind (i2) for every two inputs i1 and i2. In our approach we do not
+compute Ind (i) directly; rather we assume to have a scheduling
+function A such that for all i ∈ I, Ind (i) ⊆ A(i).
+We will now consider a scheduler SchA which makes use of
+the scheduling function A. Assume that the scheduler SchA has
+already scheduled the inputs i1,··· , ik. Let mA(ij) be the thread
+ID corresponding to the input ij (for 1 ≤ j ≤ k). We assume
+that the schedule so far satisﬁes the invariant Inv. Suppose the
+scheduler receives a new input ik+1. There are three cases:
+Case 1: ik+1 is equal to ij for some j ∈ [1,··· , k].
+In this case, schedule ik+1 on the same thread as ij.
+Case 2: A(ik+1) ∩ Ind (ij) = ∅ for all j ∈ [1,··· , k].
+In this case, ik+1 is scheduled on an arbitrary thread and mA(ik+1)
+is assigned the ID of this thread.
+Case 3: A(ik+1) ∩ Ind (ij) (cid:54)= ∅ for one or more j ∈ [1,··· , k].
+In this case, the set A(ik+1) may overlap with multiple past Ind (ij),
+where each ij was scheduled to a different thread. Therefore, it
+is in general not possible to pick a thread ID mA(ik+1) that di-
+rectly maintains the invariant. It is however still possible to ensure
+that computation remains consistent, by transferring state across
+threads. For each index x ∈ A(ik+1), we locate the thread holding
+the respective table entry T [x]. We then consolidate all said table
+entries on the private state of a single thread. Finally, we schedule
+ik+1 on the same thread, and mA is updated accordingly.
+5.2 Practical Event Scheduling
+
+The scheduler outlined above has two main drawbacks. First, it
+needs to keep track of past decisions, to ensure consistent schedul-
+ing of future events. Also, it may pause computation and move data
+across threads, in order to ensure that each program run has access
+to all necessary state. Both issues generate overhead.
+We note however that, for many relevant analyses, Ind (i) is a
+singleton set for all i ∈ I. In other words, for every input i the
+program P only reads or writes from a single index in the table T
+(i.e., |Ind (i)| = 1). In particular, this applies to all analyses that
+do not correlate information across contexts.
+
+As singleton sets cannot partially overlap, case (3) from §5.1
+cannot happen, and data movements are never necessary. More-
+
+Application
+Flowbytes
+
+Httpvol
+
+Scandetect
+
+Multistep [1]
+
+Dnstunnel [19]
+
+Sidejack [19]
+
+Approach/Key data structures
+Counts the amount of per-ﬂow trafﬁc and generates
+an event for each ﬂow crossing a given threshold.
+Tracks the amount of trafﬁc generated by external
+HTTP hosts, returns aggregate data sorted by host.
+Detects horizontal and vertical port scans,
+inte-
+grating information from connection attempts and
+HTTP requests.
+Proof-of concept worm detector, inspired by a di-
+dactic policy script for the Bro IDS. Detects worm
+activity by tracking hosts that generate a speciﬁc se-
+quence of events.
+Simple DNS tunnel detector, tracking hosts that gen-
+erate a large number of DNS requests without con-
+tacting the resolved addresses.
+HTTP sidejacking detector. Locates reuses of the
+same authentication cookie by unrelated users.
+
+Table 1: Summary of applications used in the evaluation.
+
+over, scheduling can be performed statelessly, i.e., without keeping
+track of past decisions. Let H be a hash function from table indices
+to positive integers. The scheduler can then simply schedule an in-
+put i on the thread with ID H(Ind (i)). Since H is a function, the
+scheduler clearly satisﬁes the invariant Inv.
+In practice, for most relevant detection analyses it is possible to
+derive a scheduling function A that returns a singleton set, enabling
+the use of this simple hash-based scheduler. If a system includes
+limited number of analyses that do not satisfy this condition (i.e.,
+each run of the analysis may access multiple indices), a possible
+solution is to run them on a dedicated thread/core.
+
+6. EVALUATION
+Experimental highlights. The goal of this section is to evaluate the
+effectiveness of scope-based scheduling in light of the following
+questions:
+
+1. Is our concurrency model effective in exploiting the paral-
+
+lelism present in network trafﬁc?
+§6.3 shows that our approach is effective in distributing load
+across multiple CPU cores. Throughput improvements are
+signiﬁcant and only limited by the amount of parallelism
+present in the trafﬁc.
+
+2. Can scheduling functions be automatically determined via
+
+static analysis?
+The characterization presented in §6.4 shows that our anal-
+ysis returns scheduling functions that are correct, perform
+only simple stateless operations, and are close to minimal.
+
+3. Does our approach bring improvements over traditional mul-
+
+tiprogramming techniques?
+Qualitative analysis in §6.5 suggests that our concurrency
+model simpliﬁes writing and running efﬁcient IDS analyses,
+as it transparently provides data isolation.
+
+6.1 Benchmarks and Traces
+
+To perform the evaluation we selected six “intrusion detection
+kernels”, inspired either by existing literature or by discussions
+with domain experts. Table 1 summarizes them.
+
+These programs represent various classes of operations that IDSs
+commonly perform; our goal is to evaluate how our technique works
+on detectors of varying complexity and heterogeneous scopes. In
+particular, Flowbytes and Httpvol model measurement scripts that
+
+1385(a) Full trace
+
+(b) Filtered trace
+
+Figure 6: Thread load for full and ﬁltered trace
+
+compute common trafﬁc statistics. Scandetect is an example of
+cross-layer analysis. Multistep and Dnstunnel implement analy-
+ses that correlate multiple events/ﬂows to detect suspicious activ-
+ity. Finally, Sidejack is an example of a complex detection heuristic
+whose scope is deﬁned inside the application layer (HTTP cookie).
+We base our evaluation on a packet trace captured at the border
+In order to obtain a real-
+gateway of the UC Berkeley campus.
+istic, diverse workload we recorded and merged the trafﬁc ﬂow-
+ing through the campus IDS cluster—26 backend systems behind a
+front-end load-balancer that splits up the total trafﬁc on a per-ﬂow
+basis [40]—limiting it to the protocols of interest for our applica-
+tions (HTTP, FTP, SSH, DNS, IRC). The resulting trace comprises
+326GB in total volume, includes 349M packets, and covers a times-
+pan of 15 min.
+6.2 Analysis/Simulation Framework
+
+One of the design goals of our approach is to be as architecture-
+and platform-independent as possible. We therefore chose to im-
+plement our benchmark in HILTI [38], an assembly-like language
+designed to be a domain-speciﬁc yet abstract representation of traf-
+ﬁc analysis tasks. HILTI provides a mix of basic instructions and
+common high-level primitives (regexp matching, associative con-
+tainers, etc.), and supports multithreading via lightweight virtual
+threads. Code generation and execution are achieved using a LLVM-
+based compiler and a dedicated runtime. In order to carry out our
+slicing algorithms (§4), we augmented the HILTI toolchain with a
+simple program analysis infrastructure.
+
+The IDS pipeline outlined in Figure 2 consists of three stages:
+low-level trafﬁc parsing, event scheduling, and high-level event
+processing. Currently the HILTI runtime implements all the lan-
+guage features (including multithreading), but lacks trafﬁc parsing
+and event scheduling functionality. To sidestep this limitation, we
+emulate the IDS pipeline by implementing the stages separately.
+Each stage generates intermediate output on disk, which is then fed
+to the next stage.
+
+In more detail, we ﬁrst manually generate high-level events by
+pre-processing the raw network trace with Bro. This distills our
+network trace into an event trace which includes 298M high-level
+events. Second, we generate scheduling functions by running our
+algorithm on the HILTI implementation of our benchmarks. This
+enables us to verify the correctness and quality of autogenerated
+scheduling functions (results are discussed in §6.4). Furthermore,
+we use the scheduling functions to partition the high-level event
+trace from Stage 1 into sub-traces.
+
+In the third stage, we instantiate a pool of HILTI analysis threads,
+and we use a trace loader to feed each event sub-trace to a different
+thread. Each thread performs all the analyses described in Table 1.
+This setup faithfully reproduces how events would be distributed
+among threads in a full system, and allows us to evaluate the perfor-
+mance of multiple threads running within our concurrency model.
+Results are discussed in §6.3. We run all of our experiments on a
+64-bit Linux system with two quad-core Intel Xeon 5570 CPUs and
+24GB of RAM.
+
+6.3 Parallelism in Network Trafﬁc
+
+This part of our evaluation addresses the issue of whether our
+approach effectively exploits parallelism present in network trafﬁc.
+In this experiment, we analyzed load balancing and throughput of
+the system when running with 1 to 8 hardware threads. We used the
+approach outlined above, partitioning the Bro event trace across the
+analysis threads.
+
+i = T N
+i
+T 1
+1
+
+Load balancing: For each run, we compute the load of each thread,
+deﬁned as follows. Let N be the number of threads and T N
+the pro-
+i
+cessing time for the i-th thread in the N-thread setting. The load
+. In other words,
+for the same thread is deﬁned as LN
+“load” describes the processing time for a given thread in N-thread
+setting, normalized to the processing time in the single-threaded
+setting.
+In an ideal situation where work is perfectly distributed
+i = 1/N. In
+among threads, the load for each thread i would be LN
+practice, load deviates from the ideal, for two reasons. The ﬁrst is
+that work is never perfectly distributed, resulting in threads whose
+load is above or below the ideal (i.e., they perform either less or
+more than their “fair share” of work). The second is that adding
+more threads increases resource contention, imposing a certain ar-
+chitectural overhead. Architectural overhead results in the average
+thread load being greater than 1/N; the gap is expected to increase
+as N increases (i.e., the overhead becomes more signiﬁcant as more
+threads are added).
+
+Figure 6(a) shows the maximum, minimum and average load
+(relative to the single-threaded case) among all threads for each run.
+We veriﬁed that all threads remain CPU-bound throughout the test.
+First, we observe that the average load remains close to the ideal for
+all the measurements. This shows that the architectural overhead
+imposed by running multiple threads in parallel is limited (average
+thread load is within 3% of the ideal). The ﬁgure however also
+shows some imbalance in the distribution of load among threads.
+
+12345678#Threads0.00.20.40.60.81.0Load (normalized to 1-thread case)Max loadAvg loadMin loadIdeal load12345678#Threads0.00.20.40.60.81.0Load (normalized to 1-thread case)Max loadAvg loadMin loadIdeal load1386Effectiveness: Figure 8 presents simpliﬁed, high-level versions of
+event handlers and respective scheduling functions from three of
+our benchmarks for illustration. For most applications, scheduling
+functions are minimal and perform simple struct ﬁeld extractions/-
+concatenations. A few cases present opportunities for further op-
+timization apparent to a human expert. For example, the function
+returned for multistep’s ProtocolConﬁrmation (Figure 8b) performs
+several checks that are not relevant, since the return value can be
+determined purely by observing the protocol detected (proto).
+
+Overall, results in this section suggest that our approach is effec-
+
+tive in producing correct and compact scheduling functions.
+
+Figure 7: Throughput increase as a function of #CPU cores
+
+Such imbalance can limit the overall throughput, with some threads
+being overloaded while other ones are not running at full capacity.
+To explain this result, we investigated the composition of trafﬁc
+in our trace. Similarly to previous studies [16], we found that the
+distribution of data among hosts is asymmetric in nature, with the
+25 busiest host pairs (of approximately 1M) accounting for 20%
+of the data. Note that in a system with 8 cores each should carry
+approximately 12.5% of the trafﬁc processing load to achieve per-
+fect balancing. In our context, even a minor asymmetry in the load
+distribution can have a signiﬁcant impact. In order to quantify this
+impact, we repeated the experiment for the 1-, 2-, 4- and 8-thread
+cases after ﬁltering out the top 25 host pairs. Results are reported
+in Figure 6(b). As can be seen, variations in per-thread load are
+signiﬁcantly more conﬁned around the average, leading to a more
+evenly balanced workload. This supports our hypothesis that load
+asymmetry is chieﬂy caused by a limited number of “fat ﬂows”.
+We further discuss the issue in §7.
+
+1
+
+max(LN
+i )
+
+Throughput: For each experiment, we also computed the through-
+put increase, deﬁned as I N =
+. I N quantiﬁes the de-
+crease in load (compared to the single-threaded case) for the busiest
+thread in the N-thread setting. This deﬁnition, albeit simple, has
+the advantage of allowing to estimate throughput without making
+assumptions on how the system is implemented. In fact, in absence
+of buffering and other optimizations, the busiest thread determines
+the overall throughput. Results, depicted in Figure 7, reﬂect the
+conclusion discussed in the context of load balancing. Through-
+put improvement is signiﬁcant, although sensitive to asymmetries
+in load distribution.
+6.4 Characterization of Scheduling Functions
+We implemented both the ﬂow-insensitive and ﬂow-sensitive al-
+gorithms described in §4. They generate the same scheduling func-
+tions for all benchmarks, except for multistep and sidejack, whose
+slices contain conditional constructs—in this case, the ﬂow-sensitive
+algorithm produces more precise results. Therefore, in this section
+we only present results for the ﬂow-sensitive algorithm.
+
+Correctness: To ensure correctness of our benchmark implementa-
+tions, we initially run them sequentially on sample synthetic traces
+and manually veriﬁed their output. The next step was to ensure that
+the benchmarks keep working correctly when parallelized using the
+scheduling functions generated by our algorithm. To do so we com-
+pared the output of the parallelized and the sequential version on a
+variety of test traces, verifying their equivalence.
+
+6.5 Characterization of Concurrency Model
+
+A relevant question is how our concurrency model fares—in terms
+of ease of use and efﬁciency—compared to traditional multipro-
+gramming techniques that make use of inter-thread synchroniza-
+tion. In order to perform a qualitative comparison, we created an
+alternative implementation of our benchmarks that relies on locks
+to provide data isolation between threads. In this version, a sched-
+uler distributes events randomly among threads, and analyses use
+global locks to guard accesses to shared data structures.
+
+When developing the benchmarks for our lock-free concurrency
+model we were able to develop code in a single-threaded setting,
+and directly reuse it in a parallel scenario. Conversely, implement-
+ing the lock-based version required some modiﬁcations to ensure
+critical sections were properly guarded. In terms of performance, as
+expected the intensive use of locks led to little observable through-
+put improvement as more threads were added (limited to 6% on
+our traces). While switching to lock-free data structures is certainly
+possible, this would add further complexity to the application and
+runtime design. Moreover, each handler must at the very least hold
+logical locks on the individual table element(s) while they are being
+updated. Conversely, our approach guarantees ordering and mini-
+mizes inter-thread synchronization by design, which proves to be a
+natural ﬁt for programming IDS analyses.
+
+7. DISCUSSION
+
+Scheduler throughput: Scheduling functions are stateless and con-
+sist mainly of short, straight-line code sequences, enabling high
+scheduling throughput. Still, on a large system the scheduler could
+potentially become a bottleneck, as it executes scheduling functions
+on all incoming events. We note that many analyses tend to slice
+trafﬁc using simple scopes, such as per-host or per-connection. The
+IDS runtime can therefore provide highly optimized, “hardcoded”
+versions of such scheduling functions. Another solutions to scale
+further would be to parallelize the scheduler itself [30]. This can
+however introduce ordering issues, which we discuss in the follow-
+ing. We also note that not all events require scheduling decisions.
+In particular, timed events—such as state expirations—are implic-
+itly associated with the thread that generated the timer.
+
+Event ordering: If low-level trafﬁc parsing and/or event schedul-
+ing are parallelized at the connection level, events generated by dif-
+ferent ﬂows may not reach the analyzer in order, as low-level pro-
+cessing of different ﬂows may be performed by different threads.
+This could affect high-level heuristics whose scope includes multi-
+ple connections. A possible solution is to associate each event with
+a timestamp, and to then use the timestamps to sort the threads’
+input queues, as in [49]. Another approach is to make the detec-
+tor agnostic to order, i.e., events are correlated as long as they are
+received within a certain time interval.
+
+12345678#Threads12345678Throughput increaseFull traceTrace w/o top-25 flowsIdeal speedup1387Figure 8: Examples of scheduling functions
+
+Sharing data structures between applications: in our discussion
+of the scheduling problem, we assumed that each application main-
+tains its private data structures. In practice, separate trafﬁc analyses
+may collaborate by sharing state. If their scopes are compatible, the
+analyses can be treated as a single entity for scheduling purposes.
+If this is not possible, the functionality of one of the analyses could
+be replicated within the other. The resulting overhead may be ac-
+ceptable if it allows the analyses to be independent.
+
+Load-balancing: in §6.3 we showed that imperfect load-balancing
+can limit throughput. We pinpointed the issue to a few high-bandwidth
+ﬂows accounting for a signiﬁcant percentage of the total packet
+stream. We note that this is an intrinsic limitation of hash-based ap-
+proaches, determined by the amount of parallelism available in the
+trace. Such trafﬁc would cause load imbalance even for IDSs that
+perform per-ﬂow pattern matching, since each high-bandwidth ﬂow
+would still be processed by a single thread. This limitation may be
+acceptable; indeed hash-based approaches are currently used in de-
+ployed systems, such as the NIDS cluster [40]. It should also be
+noted that often a detector only needs to parse the ﬁrst few packets
+of a ﬂow [29]. Therefore, processing of large ﬂows could be halted
+after a certain byte threshold, preventing imbalance. An alternative
+solution is to allow ﬂows to be remapped across cores, as in [36].
+
+Customization: The goal of our work is to provide automatic and
+transparent parallelization of IDS workloads. However, in certain
+cases the user could want to further optimize the behavior of the
+system by deﬁning the scheduling functions herself. Enabling this
+is a matter of the API. In this scenario, our scheduling function
+generator could be used as a programming aid, providing an initial
+version of the function that the user could further reﬁne.
+8. RELATED WORK
+
+The challenge of IDS parallelization has been examined previ-
+ously in the literature, with initial efforts focusing on multi-system
+setups for sharing the load.
+
+[36, 49] focus on efﬁciently partitioning trafﬁc by ﬂow, and there-
+fore lack the notion of analysis-speciﬁc scope. [30] has the notion
+of a scheduler that separates the trafﬁc into independent subsets
+based on event spaces, manually deﬁned by the IDS operator. The
+
+semantics of event spaces are limited in expressiveness, and ori-
+ented to statically deﬁning speciﬁc contexts (e.g., a speciﬁc subnet)
+more than scopes. Moreover, the authors only consider signature-
+based detection. [31] discusses an IDS load-balancer that dynam-
+ically groups ﬂows based on the similarity of header ﬁelds (e.g.,
+source address, port). While this approach is simple, such heuristic
+correlation is not guaranteed to match the actual detector’s scope.
+Other cluster-based approaches are [23, 40], which are built on a
+more traditional concurrency model (intra-node synchronization)
+and, as [30, 31], do not tackle parallelism within multi-core nodes.
+There is another body of work (e.g., [28, 41, 43, 44]) on ac-
+celerating packet matching on parallel hardware, including GPUs.
+These approaches are restricted to byte-level pattern matching; while
+this makes parallelization straightforward—as there is just a single,
+static scope—it severely limits detection capabilities. In contrast,
+our work aims to parallelize arbitrary stateful analyses.
+
+The work closest to our discussion is [37], which presents a par-
+allel IDS design for multi-core architectures. The system incorpo-
+rates the notion of per-handler scope; however, scopes need to be
+manually deﬁned for each analysis, and they are still limited to sets
+of protocol header ﬁelds. Our work can be seen as an extension of
+those, presenting a concurrency model which is independent from
+the speciﬁcs of the analysis and automatically derives the paral-
+lelization strategy.
+
+Variations of scope-based parallelization have been deﬁned out-
+side the realm of intrusion detection. Our approach is inspired by
+serialization sets [14], a generic parallel programming paradigm.
+In serialization sets, each shared object is associated with a seri-
+alizer method, which returns an object-speciﬁc key. The runtime
+uses the key to serialize computations that access the same shared
+object. Our work adapts this approach to the event-driven paradigm
+typical of packet processing and contributes efﬁcient scheduling al-
+gorithms. Moreover, since our approach is domain-speciﬁc to IDSs
+we can leverage the common structure of IDS programs to compute
+scheduling functions automatically, without developer interaction.
+The networking community has also contributed models aimed
+at parallel packet processing. [25] describes a parallel stateful packet
+processing system, where a set of processing blocks are composed
+in a data ﬂow graph. The system supports a context-ordered mode
+
+Scandetect program text void SignatureMatch (Signature s) {   if (cid:383)s(cid:348)id (cid:688)(cid:688) (cid:361)http-req(cid:362) (cid:374)(cid:374) s(cid:348)id (cid:688)(cid:688) (cid:361)non-http-req(cid:362)(cid:384)(cid:391)     if (s.c.id.orig_h in alarmTable) return;     if (s.c.id.orig_h in hostTable) {       State t = hostTable[s.c.id.orig_h];       if (s.c.id.resp_h in t.dests) {         t.dests[s.c.id.resp_h] += 1;         if (t.dests[s.c.id.resp_h] > v_threshold) {           report_v_scan(s.c.id.orig_h);           alarmTable.add(s.c.id.orig_h);         }       } else {         t.dests[s.c.id.res_h] = 1;         if (len(t.dests) > h_threshold) {           report_h_scan(s.c.id.orig_h);           alarmTable.add(s.c.id.orig_h);         }       }     } else hostTable[s.c.id.resp_h]=CreateEntry();   } }  Scandetect scheduling function void SF(Signature s)      return s.c.id.orig_h; Flowbytes program text void NewPacket(connection c,                packetHeader p) {   int len = c.ip.len;    if (c.ip.p != TCP && c.ip.p != UDP)     return;    if (c.uid in flowTable)     len += flowTable[c.uid];   flowTable[c.uid] = len;    if (len > threshold)       report_flow(c.uid); }   Flowbytes scheduling function void SF (connection c)      return c.uid;  Multistep program text void ProtocolConfirmation(connection c, int proto){   if (proto == SSH && c.id.resp_p == 2222/tcp            && c.id.resp_h == local_subnet) {     if (c.id.resp_h !in hostTable)       hostTable[c.id.resp_h] = CreateEntry(c);   }   else if (proto == IRC &&            c.id.orig_h == local_subnet) {     if (c.id.orig_h in hostTable) {       if (hostTable[c.id.orig_h].state == WAIT_IRC)         report_host(c.id.orig_h);     }   } }  Multistep scheduling function void SF(connection c, int proto) {   if (proto == SSH && c.id.resp_p == 2222/tcp       && c.id.resp_h == local_subnet) {       return c.id.resp_h;   }  else return c.id.orig_h; } (a) (b) (c) 1388where logical blocks can be parallelized by applying serializers
+(termed context-designator) to the input stream. The rigid orga-
+nization of processing in a pipeline makes the system more suited
+to trafﬁc processing/shaping than intrusion detection; moreover, the
+developer is still required to manually specify serializers. [24] out-
+lines an approach to state manipulation, with the goal of simplify-
+ing dynamic provision/consolidation of network appliances. State
+is divided in independent units using keys, i.e., combinations of pro-
+tocol header ﬁelds. Our deﬁnition of scheduling functions can be
+seen as a generalization of this approach to state partitioning. [26]
+focuses on mapping IDS workloads to a set of distributed network
+nodes. Trafﬁc partitioning is static, similarly to [30], and based on
+ofﬂine workload estimates. [22] presents a parallel software router
+that optimizes the whole system stack for its speciﬁc application,
+yet does not easily generalize to other types of processing. [21]
+performs analysis of a pipelined software router using symbolic
+execution to derive the semantics of each component, while we use
+static analysis to generate precise executable slices.
+
+The literature also presents a number of general-purpose pro-
+gramming APIs that take different approaches to parallelization
+(e.g., [3, 4, 17]). Our approach does not strive to be a general
+layer; instead, limiting the scope to event-driven packet processing
+enables us to keep the programming model simple and hide con-
+currency issues from the programmer. Architecture-speciﬁc paral-
+lel APIs such as CUDA [2] require signiﬁcant application-speciﬁc
+effort because of their restricted computational paradigm.
+
+Historically, the HPC community has also investigated the prob-
+lem of compiler-based automatic parallelization. This line of work
+targets scientiﬁc and numerical computations (see for example [13,
+15, 32, 33] and Chapter 11 of [12]). Target workloads typically in-
+volve repetitive operations over large arrays; therefore, approaches
+focus on loop vectorization and parallelization. More recently, sim-
+ilar techniques have been proposed for batch processing workloads
+such as compression, machine learning, and text processing [42,
+50]. Our work is similar in spirit, as it strives to exploit domain-
+speciﬁc program features to extract parallelization. However, IDS
+programs present different requirements (real-time stream process-
+ing), for which we leverage different program features (state and
+computation structured around scopes).
+
+Furthermore, [46] proposes the use of program slicing to parti-
+tion a sequential program into parallel slices. This approach uses
+slicing to determine instruction- and task-level parallelism. Con-
+versely, we use it to infer high-level properties of the program (its
+scope), which enable extensive data-level parallelism.
+
+Finally, Parcae [34] and Varuna [39] optimize parallel execution
+of multi-threaded programs according to various metrics (time, re-
+source consumption). We see these works as orthogonal, as they
+could be used to ﬁne-tune the degree of parallelism in our approach.
+
+9. CONCLUSION
+
+Trafﬁc processing presents numerous opportunities for parallelism,
+
+but making IDS scalable and ﬂexible remains notoriously difﬁcult.
+In this paper, we propose a domain-speciﬁc concurrency model that
+can support a large class of IDS analyses without being tied to a
+speciﬁc detection strategy. Our technique partitions the stream of
+network events into subsets that the IDS can process independently
+and in parallel, while ensuring that each subset contains all events
+relevant to a detection scenario. Our partitioning scheme is based
+on the concept of detection scope, i.e., the minimum “slice” of traf-
+ﬁc that a detector needs to observe in order to perform its func-
+tion. As this concept has general applicability, our model can sup-
+port both simple, per-ﬂow detection schemes (e.g., pattern/signa-
+ture matching) and more complex, high-level detectors. Moreover,
+
+we show that it is possible to use program analysis to determine the
+appropriate trafﬁc partitioning automatically and at compile-time,
+and enforce it at run-time with a specialized scheduler.
+
+Initial results are promising, and show that indeed our approach
+correctly partitions existing sequential IDS analyses without loss
+of accuracy, while exploiting the network trafﬁc’s inherent concur-
+rency potential for throughput improvements.
+
+Acknowledgments
+We thank Drew Davidson, Mohan Dhawan, Aaron Gember-Jacobson,
+Bill Harris, and Matthias Vallentin for their suggestions, which
+greatly contributed to the paper. Likewise we thank the anonymous
+reviewers and our shepherd Michalis Polychronakis.
+
+This work was supported by the US National Science Foundation
+under grants CNS-0915667, CNS-1228782 and CNS-1228792, and
+by a grant from the Cisco Research Center. Any opinions, ﬁndings,
+and conclusions or recommendations expressed in this material are
+those of the authors or originators, and do not necessarily reﬂect
+the views of the sponsors.
+
+10. REFERENCES
+[1] Bro hands-on workshop 2009.
+
+http://www-old.bro-ids.org/bro-workshop-2009-2/, Feb.
+2013.
+
+[2] NVIDIA CUDA.
+
+http://www.nvidia.com/object/cuda_home_new.html, Jan.
+2013.
+
+[3] OpenMP. http://openmp.org, Jan. 2013.
+[4] Threading Building Blocks.
+
+http://threadingbuildingblocks.org/, Jan. 2013.
+
+[5] AMD Opteron 6300 series processors.
+
+http://www.amd.com/en-us/products/server/6000/6300#,
+May 2014.
+
+[6] Bro IDS. http://www.bro-ids.org/, May 2014.
+[7] Checkpoint security - tales from the crypter.
+
+http://www.checkpoint.com/threatcloud-
+central/articles/2014-01-20-Thwarting-Malware-
+Obfuscation.html, May 2014.
+
+[8] Errata security: Fun with IDS funtime #3: heartbleed.
+
+http://blog.erratasec.com/2014/04/fun-with-ids-funtime-3-
+heartbleed.html, May 2014.
+
+[9] Intel Xeon processor e5-4657l v2.
+
+http://ark.intel.com/products/75290/Intel-Xeon-Processor-
+E5-4657L-v2-30M-Cache-2_40-GHz, May 2014.
+
+[10] Snort IDS. http://www.snort.org/, May 2014.
+[11] Suricata IDS. http://suricata-ids.org/, May 2014.
+[12] A. V. Aho, M. S. Lam, R. Sethi, and J. D. Ullman.
+
+Compilers: Principles, Techniques, and Tools.
+Addison-Wesley Longman Publishing Co., Inc., Boston,
+MA, USA, 2006.
+
+[13] F. Allen, M. Burke, P. Charles, R. Cytron, and J. Ferrante. An
+overview of the PTRAN analysis system for multiprocessing.
+In ICS, 1987.
+
+[14] M. D. Allen, S. Sridharan, and G. S. Sohi. Serialization sets:
+
+a dynamic dependence-based parallel execution model. In
+PPoPP, 2009.
+
+[15] R. Allen and K. Kennedy. Automatic translation of
+FORTRAN programs to vector form. ACM Toplas,
+9(4):491–542, 1987.
+
+[16] T. Benson, A. Akella, and D. A. Maltz. Network trafﬁc
+characteristics of data centers in the wild. In IMC, 2010.
+
+1389[17] R. D. Blumofe, C. F. Joerg, B. C. Kuszmaul, C. E. Leiserson,
+K. H. Randall, and Y. Zhou. Cilk: an efﬁcient multithreaded
+runtime system. In PPoPP, 1995.
+
+[18] S. Bodmer, D. M. Kilger, G. Carpenter, and J. Jones. Reverse
+
+Deception: Organized Cyber Threat Counter-Exploitation.
+McGraw-Hill Osborne Media, 1st edition, July 2012.
+[19] K. Borders, J. Springer, and M. Burnside. Chimera: a
+
+declarative language for streaming network trafﬁc analysis.
+In USENIX, 2012.
+
+[20] R. Cytron, J. Ferrante, B. K. Rosen, M. N. Wegman, and
+
+F. K. Zadeck. Efﬁciently computing static single assignment
+form and the control dependence graph. ACM Toplas,
+13(4):451–490, 1991.
+
+[21] M. Dobrescu and K. Argyraki. Software dataplane
+
+veriﬁcation. In NSDI, 2014.
+
+[22] K. Fall, G. Iannaccone, M. Manesh, S. Ratnasamy,
+
+K. Argyraki, M. Dobrescu, and N. Egi. RouteBricks:
+enabling general purpose network infrastructure. ACM
+SIGOPS Operating Systems Review, 45(1):112–125, 2011.
+[23] L. Foschini, A. V. Thapliyal, L. Cavallaro, C. Kruegel, and
+
+G. Vigna. A parallel architecture for stateful, high-speed
+intrusion detection. In ICISS, 2008.
+
+[24] A. Gember, P. Prabhu, Z. Ghadiyali, and A. Akella. Toward
+software-deﬁned middlebox networking. In HotNets, 2012.
+
+[25] H. Gill, D. Lin, T. Kothari, and B. T. Loo. Declarative
+
+multicore programming of software-based stateful packet
+processing. In DAMP, 2012.
+
+[26] V. Heorhiadi, M. K. Reiter, and V. Sekar. New opportunities
+
+for load balancing in network-wide intrusion detection
+systems. In CoNEXT, 2012.
+
+[27] S. Horwitz, T. Reps, and D. Binkley. Interprocedural slicing
+using dependence graphs. ACM TOPLAS, 12(1):26–60, 1990.
+
+[28] M. A. Jamshed, J. Lee, S. Moon, I. Yun, D. Kim, S. Lee,
+
+Y. Yi, and K. Park. Kargus: a highly-scalable software-based
+intrusion detection system. In CCS, 2012.
+
+[29] S. Kornexl, V. Paxson, H. Dreger, A. Feldmann, and
+
+R. Sommer. Building a time machine for efﬁcient recording
+and retrieval of high-volume network trafﬁc. In IMC, 2005.
+[30] C. Kruegel, F. Valeur, G. Vigna, and R. Kemmerer. Stateful
+intrusion detection for high-speed networks. In IEEE S&P,
+2002.
+
+[31] A. Le, R. Boutaba, and E. Al-Shaer. Correlation-based load
+
+balancing for network intrusion detection and prevention
+systems. In SECURECOMM, 2008.
+
+[32] K. McKinley. Automatic and Interactive Parallelization. PhD
+
+thesis, Rice University, Apr. 1992.
+
+[33] D. A. Padua and M. J. Wolfe. Advanced compiler
+optimizations for supercomputers. Commun. ACM,
+29(12):1184–1201, Dec. 1986.
+
+[34] A. Raman, A. Zaks, J. W. Lee, and D. I. August. Parcae: a
+
+system for ﬂexible parallel execution. In PLDI, 2012.
+
+[35] T. Reps and G. Rosay. Precise interprocedural chopping. In
+
+SIGSOFT, 1995.
+
+[36] L. Schaelicke, K. Wheeler, and C. Freeland. SPANIDS: a
+
+scalable network intrusion detection loadbalancer. In
+Computing Frontiers, 2005.
+
+[37] R. Sommer, V. Paxson, and N. Weaver. An architecture for
+
+exploiting multi-core processors to parallelize network
+intrusion prevention. Concurr. Comput. : Pract. Exper.,
+21(10):1255–1279, July 2009.
+
+[38] R. Sommer, M. Vallentin, L. De Carli, and V. Paxson. HILTI:
+An abstract execution environment for deep, stateful network
+trafﬁc analysis. In IMC, 2014.
+
+[39] S. Sridharan, G. Gupta, and G. S. Sohi. Adaptive, efﬁcient,
+
+parallel execution of parallel programs. In PLDI, 2014.
+
+[40] M. Vallentin, R. Sommer, J. Lee, C. Leres, V. Paxson, and
+
+B. Tierney. The NIDS cluster: scalable, stateful network
+intrusion detection on commodity hardware. In RAID, 2007.
+
+[41] J. van Lunteren and A. Guanella. Hardware-accelerated
+regular expression matching at multiple tens of gb/s. In
+INFOCOM, 2012.
+
+[42] H. Vandierendonck, S. Rul, and K. De Bosschere. The
+paralax infrastructure: automatic parallelization with a
+helping hand. In PACT, 2010.
+
+[43] G. Vasiliadis, S. Antonatos, M. Polychronakis, E. P.
+
+Markatos, and S. Ioannidis. Gnort: High performance
+network intrusion detection using graphics processors. In
+RAID, 2008.
+
+[44] G. Vasiliadis, M. Polychronakis, and S. Ioannidis. MIDeA: a
+multi-parallel intrusion detection architecture. In CCS, 2011.
+
+[45] J. Verdu, M. Nemirovsky, and M. Valero. MultiLayer
+
+processing - an execution model for parallel stateful packet
+processing. In ANCS, 2008.
+
+[46] C. Wang, Y. Wu, E. Borin, S. Hu, W. Liu, D. Sager, T.-f.
+
+Ngai, and J. Fang. Dynamic parallelization of single-threaded
+binary programs using speculative slicing. In ICS, 2009.
+
+[47] M. Weiser. Program slicing. In ICSE, 1981.
+[48] B. Wun, P. Crowley, and A. Raghunth. Parallelization of
+
+snort on a multi-core platform. In ANCS, 2009.
+
+[49] K. Xinidis, I. Charitakis, S. Antonatos, K. G. Anagnostakis,
+
+and E. P. Markatos. An active splitter architecture for
+intrusion detection and prevention. IEEE Trans. Dependable
+Secur. Comput., 3(1):31–44, Jan. 2006.
+
+[50] H. Zhong, M. Mehrara, S. Lieberman, and S. Mahlke.
+Uncovering hidden loop level parallelism in sequential
+applications. In HPCA, 2008.
+
+1390

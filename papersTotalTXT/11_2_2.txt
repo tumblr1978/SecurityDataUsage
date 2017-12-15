@@ -1,0 +1,1693 @@
+vfGuard: Strict Protection for Virtual Function
+
+Calls in COTS C++ Binaries
+
+Aravind Prakash
+Department of EECS
+Syracuse University
+arprakas@syr.edu
+
+Xunchao Hu
+
+Department of EECS
+Syracuse University
+
+xhu31@syr.edu
+
+Heng Yin
+
+Department of EECS
+Syracuse University
+
+heyin@syr.edu
+
+Abstract—Control-Flow Integrity (CFI) is an important se-
+curity property that needs to be enforced to prevent control-
+ﬂow hijacking attacks. Recent attacks have demonstrated that
+existing CFI protections for COTS binaries are too permissive,
+and vulnerable to sophisticated code reusing attacks. Accounting
+for control ﬂow restrictions imposed at higher levels of semantics
+is key to increasing CFI precision. In this paper, we aim to provide
+more stringent protection for virtual function calls in COTS
+C++ binaries by recovering C++ level semantics. To achieve this
+goal, we recover C++ semantics, including VTables and virtual
+callsites. With the extracted C++ semantics, we construct a sound
+CFI policy and further improve the policy precision by devising
+two ﬁlters, namely “Nested Call Filter” and “Calling Convention
+Filter”. We implement a prototype system called vfGuard,
+and evaluate its accuracy, precision, effectiveness, coverage and
+performance overhead against a test set including complex C++
+binary modules used by Internet Explorer. Our experiments show
+a runtime overhead of 18.3% per module. On SpiderMonkey,
+an open-source JavaScript engine used by Firefox, vfGuard
+generated 199 call targets per virtual callsite – within the same
+order of magnitude as those generated from a source code based
+solution. The policies constructed by vfGuard are sound and of
+higher precision when compared to state-of-the-art binary-only
+CFI solutions.
+
+I.
+
+INTRODUCTION
+
+Control-Flow Integrity (CFI [1]) is an important program
+security property that needs to be ensured to prevent control-
+ﬂow hijacking attacks. Because of its importance, several
+recent research efforts (e.g., [2]–[6]) have focused on CFI. CFI
+solutions roughly fall into two categories: some derive strict
+CFI policies from program source code (e.g., SafeDispatch [7],
+VTV [8]), and others such as CCFIR [2] and BinCFI [3]
+enforce coarse-grained CFI policy to directly protect COTS
+binaries. Binary-only CFI solutions are attractive, because in
+reality the source code for many commercial software, third-
+party libraries, and kernel modules are not available. However,
+since high-level program constructs are not necessarily pre-
+served into the binaries during compilation, the CFI policies for
+
+these binary-only solutions are unfortunately coarse-grained
+and permissive.
+
+While coarse-grained CFI solutions have signiﬁcantly re-
+duced the attack surface, recent efforts by G¨oktas¸ et al. [9]
+and Carlini [10] have demonstrated that coarse-grained CFI
+solutions are too permissive, and can be bypassed by reusing
+large gadgets whose starting addresses are allowed by these
+solutions. The primary reason for such permissiveness is the
+lack of higher level program semantics that introduce certain
+mandates on the control ﬂow. For example, given a class
+inheritance, target of a virtual function dispatch in C++ must
+be a virtual function that the dispatching object is allowed to
+invoke. Similarly, target of an exception dispatch must be one
+of the legitimate exception handlers. Accounting for control
+ﬂow restrictions imposed at higher levels of semantics is key
+to increasing CFI precision.
+
+it
+
+In this paper, we take a ﬁrst step towards semantic-
+recovery-based CFI. We recover C++-level semantics to pro-
+vide strict CFI protection for dynamic dispatches in C++
+binaries. With protections targeting stack sanity (e.g., Stack
+Shield [11]), recent attacks (ab)use indirect call instructions
+to target valid function entry points, which act as large gadgets.
+It is essential to restrict such call targets to “legitimate” targets
+to prevent abuse. We set our focus on C++ binaries because,
+due to its object-oriented programming paradigm and high
+efﬁciency as compared to other object-oriented languages like
+Java,
+in many complex software programs.
+To support polymorphism, C++ employs a dynamic dispatch
+mechanism. Dynamic dispatches are predominant
+in C++
+binaries and are executed using an indirect call instruction.
+For instance, in a large C++ binary like libmozjs.so (Firefox’s
+Spidermonkey Javascript engine), 84.6% indirect function calls
+are dynamic dispatches. For a given C++ binary, we aim to
+construct sound and precise CFI policy for dynamic dispatches
+in order to reduce the space for code-reuse attacks. Our goals
+are similar to SafeDispatch [7] – a recent source code-based
+solution to protect virtual dispatches in C++ programs, but we
+hope to achieve the same directly on stripped binaries.
+
+is prevalent
+
+Permission to freely reproduce all or part of this paper for noncommercial
+purposes is granted provided that copies bear this notice and the full citation
+on the ﬁrst page. Reproduction for commercial purposes is strictly prohibited
+without the prior written consent of the Internet Society, the ﬁrst-named author
+(for reproduction of an entire paper only), and the author’s employer if the
+paper was prepared within the scope of employment.
+NDSS ’15, 8-11 February 2015, San Diego, CA, USA
+Copyright 2015 Internet Society, ISBN 1-891562-38-X
+http://dx.doi.org/10.14722/ndss.2015.23297
+
+Constructing a strict CFI policy directly from C++ binaries
+is a challenging task. A strict CFI policy should not miss
+any legitimate virtual call targets to ensure zero false alarms,
+and should exclude as many impossible virtual call targets as
+possible to reduce the attack space. In order to protect real-
+world binaries, all these need to be accomplished under the
+assumption that only the binary code – without any symbol
+or debug information – is available. In order to construct
+
+a strict CFI policy for virtual calls, we need to reliably
+rebuild certain C++-level semantics that persist in the stripped
+C++ binaries, particularly VTables and virtual callsites. Based
+on the extracted VTables and callsites, we can construct a
+basic CFI policy and further reﬁne it. As a key contribution,
+we demonstrate that CFI policies with increased precision
+can be constructed by recovering C++-level semantics. While
+the reﬁned policies may not completely eliminate code-reuse
+attacks, by reducing the number of available gadgets, it makes
+attacks harder to execute.
+
+To evaluate our technique, we have developed a prototype
+called vfGuard. vfGuard is based on an open source
+decompilation framework [12] with over 3.4K lines of Python
+code. vfGuard successfully recovered all the legitimate VTa-
+bles in complex binaries. Moreover, it recovered most of the
+legitimate callsites in the binary without false positives. We
+generated a CFI policy for each of the callsites and tested
+a set of C++ Windows system libraries and show under 250
+call targets per binary. In comparison with BinCFI, speciﬁcally
+for the virtual call instructions, our policy is over 95% more
+precise. We show that vfGuard can successfully mitigate
+real-world exploits and report an overhead of under 20% for
+runtime policy enforcement.
+
+The remainder of the paper is organized as follows. Sec-
+tion II provides an overview of virtual methods in C++ and
+lessons we learned from it. Sections III provides an overview
+of our solution, vfGuard. Sections IV and V present the
+details of policy generation and enforcement respectively. We
+evaluate our solution in Section VI and present a discussion
+in Section VII. We present related work in Section VIII and
+conclude in Section IX.
+
+II. DYNAMIC DISPATCH IN C++
+
+In this section, using a simple running example in Figure 1
+and 2, we present some background on dynamic dispatch and
+polymorphism in C++ from a binary perspective. Speciﬁcally,
+we consider two popular Application Binary Interfaces (ABIs)
+– Itanium [13] and MSVC [14] – that modern compilers adhere
+to. Figure 1(a) is the source code for a C++ program that was
+compiled using the g++ compiler, which adheres to Itanium
+ABI. Class C inherits from classes A and B. Figures 1(b),
+(c) and (e) present the layout of all the class objects, and
+Figure 1(d) is the layout of different VTables. A fraction of
+the binary code from the program is presented in Figure 2.
+
+In C++, functions declared with keyword “virtual” are
+termed “virtual functions” [15] and their invocation is termed
+“virtual call” (or vcall). Virtual functions are in the heart
+of polymorphism, which allows a derived class to override
+methods in its base class. When a virtual function that is
+overridden in a derived class is invoked on an object, the
+invoked function depends on the object’s type at runtime.
+Modern compilers – e.g., Microsoft Visual C++ (MSVC) and
+GNU g++ – achieve this resolution using a “Virtual Function
+Table” or VTable1, a table that contains an array of “virtual
+function pointers” (vfptr) – pointers to virtual functions. Ita-
+nium [13] and MSVC [14] are two of the most popular C++
+ABIs that dictate the implementation of various C++ language
+semantics.
+
+1It is also called “Virtual Dispatch Table” or “Virtual Method Table”.
+
+(a) Assembly code for A::Afoo.
+
+(b) Thunk code for C::vBfoo.
+
+Fig. 2: Steps GetVT, GetVF, SetThis and CallVF are the
+various steps during virtual function call in A::Afoo. Since
+virtual call target A::vAduh does not accept any parameters,
+SetArg is skipped. thunk to C::vBfoo adjusts the this pointer
+before invocation.
+
+During compilation, all the VTables used by a module are
+placed in a read-only section of the executable. Furthermore,
+a hidden ﬁeld called “virtual table pointer” (vptr) – a pointer
+to the VTable – is inserted into objects of classes that either
+directly deﬁne virtual functions or inherit from classes that
+deﬁne virtual functions. Under normal circumstances, the vptr
+is typically initialized during construction of the object.
+
+A. Virtual Call Dispatch
+
+Figure 2(a) is marked with steps corresponding to invoca-
+tion of a vcall within A::Afoo in Class A in Figure 1(a). A
+virtual call dispatch comprises of the following 5 steps:
+
+GetVT Dereference the vptr of the object (this pointer)
+
+to obtain the VTable.
+
+GetVF Dereference (VTable + offset) to retrieve the vfptr
+
+to the method being invoked.
+
+SetArg Set the arguments to the function on the stack or in
+the registers depending on the calling convention.
+SetThis Set the implicit this pointer either on stack or in
+ecx register depending on the calling convention.
+CallVF Invoke the vfptr using an indirect call instruc-
+
+tion.
+
+GetVT, GetVF, SetThis and CallVF are required steps in
+all vcalls, whereas depending on if the callee function accepts
+arguments or not, SetArg is optional. In Figure 2(a), because
+A::vAduh does not accept any arguments, SetArg is omitted.
+Though there is no restriction with respect to relative ordering
+of the steps followed, some steps are implicitly dependent on
+others (e.g., GetVF must occur after GetVT).
+
+While it is usual that events GetVT through CallVF (SetArg
+being optional) not only occur in order, but also occur within
+the same basic block, it is possible – depending on the compiler
+
+2
+
+virtual function is invoked in the derived class, the compiler
+introduces a thunk that adjusts the this pointer to point to the
+derived class object before invoking the actual function. For
+example, in Figure 2(b), the thunk subtracts 0xc from the B
+subobject to point to C object before invoking C::vBfoo.
+We refer the reader to the ABIs for more details on thunks
+and inheritance.
+
+D. Calling Conventions
+
+During invocation of a virtual call, the caller must pass the
+this pointer to the callee function. Two calling conventions –
+stdcall and thiscall [16] – are used to pass the this
+pointer to the callee. However, thiscall is exclusive to
+the MSVC compiler. In stdcall, the this pointer is passed
+as an implicit argument on the top of the stack, whereas, in
+the thiscall calling convention, the this pointer is passed
+through the ecx register. While MSVC prefers thiscall
+over stdcall, it defaults to stdcall for some functons
+(e.g., if it callee accepts variable arguments).
+
+E. RunTime Type Information (RTTI)
+
+C++ language allows runtime object type resolution. To
+make such resolution possible, for each class, an ABI-deﬁned
+type information structure called “RunTime Type Information”
+is created and a pointer to the structure is stored in the VTable
+for the class. If a class has multiple VTables, each of the
+VTables contains a pointer to the same RTTI5 structure. For
+example, in Figure 1(d), both VTables for class C contain
+RTTI type for C at offset 0x4. While such information can be
+very useful in reverse engineering and type reconstruction, it
+is an optional feature that is only required if dynamic_cast
+and/or type_info operators are used in the program, and is
+often absent in commercial software.
+
+Based on the above description, we can make several key
+observations:
+
+Ob1: VTables are present in the read-only sections of the
+
+binary.
+
+Ob2: Offset of vfptr within a VTable is a constant and is
+
+statically determinable at the invocation callsite.
+
+Ob3: Since the caller must pass the this pointer, any two
+polymorphic functions must adhere to the same calling
+convention (e.g., C::vATest and A::vATest).
+
+III. SOLUTION OVERVIEW
+
+A. Problem Statement
+
+Given a C++ binary, we aim to construct a CFI policy
+to protect its virtual function calls (or dynamic dispatches).
+Speciﬁcally, for each virtual callsite in the binary, we need
+to collect a whitelist of legitimate call targets. If a call target
+beyond the whitelist is observed during the execution of the
+C++ binary, we treat it as a violation against our CFI policy
+and stop the program execution.
+
+5If the program is compiled with -fno-rtti ﬂag, the RTTI ﬁeld is present
+
+but contains 0.
+
+4
+
+More formally, this CFI policy can be considered as a
+
+function:
+
+P = C → 2F ,
+
+where C denotes all virtual function call sites and F all
+legitimate call targets inside the given C++ binary. Therefore,
+as a power set of F, 2F denotes a space of all subsets of F.
+Furthermore, we deﬁne callsite c ∈ C to be a 2-tuple, c =
+(displacement, offset) with displacement from the base of the
+binary to the callsite and the VTable offset at the callsite.
+
+A good CFI policy must be sound and as precise as
+possible. The existing binary-only CFI solutions (e.g., BinCFI,
+CCFIR, etc.) ensure soundness, but are imprecise, and there-
+fore expose considerable attack space to sophisticated code-
+reuse attacks [9]. Therefore, to provide strong protection for
+virtual function calls in C++ binaries, our CFI policy must be
+sound, and at the same time, be more precise than the existing
+binary-only CFI protections.
+
+To measure the precision, we can use source-code based
+solutions as reference systems. With source code, these solu-
+tions can precisely identify the virtual dispatch callsites and
+the class inheritance hierarchy within the program. Then, at
+each callsite, they insert checks to ensure that (1) the VTable
+used to make the call is compatible with the type of the object
+making the call [8] or (2) the call target belongs to a set of
+polymorphic functions extracted from the inheritance tree for
+the type of object making the call [7].
+
+Assumptions and Scope. Since we target COTS C++ bina-
+ries, we must assume that none of source code, full symbol
+information, debugging information, RTTI, etc. is available.
+We must also deal with challenges arising due to compiler
+optimizations that blur and remove C++ semantic information
+during compilation. In other words, we must rely on strong
+C++ semantics that are dictated by C++ ABIs and persist
+during the process of code compilation and optimization. Due
+to the reliance on standard ABIs, we only target C++ binaries
+that are compiled using standard C++ compilers (e.g., MSVC
+and GNU g++). Custom compilers that do not adhere to
+Itanium and MSVC ABIs are out of scope. Moreover, since
+our goal is to protect benign C++ binaries, code obfuscation
+techniques that deliberately attempt to evade and confuse our
+defense are also out of our scope.
+
+Furthermore, our goal is to protect virtual function calls
+and their manifestations through indirect call instructions
+in the binary. We do not aim to protect indirect jmp or ret
+instructions. However, we aim to provide a solution orthogonal
+to existing solutions (e.g., shadow call stack [11], coarse-
+grained CFI [2], [3]) so as to provide a more complete and
+accurate CFI.
+
+B. Our Solution
+
+In order to tackle the problem stated in Section III-A, we
+must leverage the C++ ABIs to recover strong C++ semantics
+that persist in a given C++ binary. First of all, we need to
+accurately discover virtual callsites C in the binary. Then, we
+need to identify all the virtual function entry points, which
+form the legitimate call targets F. Because all functions in F
+are polymorphic (virtual), and must exist in VTables, we must
+
+D. VTable Identiﬁcation
+
+Reconstructing precise inheritance tree from the binary is
+ideal but hard. For instance, Dewey et al. [17] locate the
+constructors in the program by tracking the VTable initializa-
+tions. In commercial software, constructors are often inlined,
+therefore such an approach would not yield a complete set of
+VTables that we seek. Other approaches use heuristics that are
+not only dependent on debug information, but also tailored for
+speciﬁc compilers like MSVC (e.g., IDA VTBL plugin [18]).
+We propose an ABI-centric algorithm that can effectively
+recover all the VTables in a binary in both MSVC and Itanium
+ABIs. Based on Ob1 in Section II, we scan the read-only
+sections in the binary to identify the VTables. The VTables that
+adhere to Itanium ABI contain mandatory ﬁelds along with the
+array of vfpts. The mandatory ﬁelds make locating of VTables
+in the binary relatively easier when compared to MSVC ABI.
+However, VTables generated by the Microsoft Visual Studio
+compiler (MSVC ABI) are often grouped together with no
+apparent “gap” between them. This poses a challenge to
+accurately identify VTable boundaries.
+
+Furthermore, according to Ob2, we ﬁrst scan the code and
+data sections and identify all the “immediate” values. Then,
+we check each value for a valid VTable address point. A valid
+VTable contains an array of one or more vfptrs starting from
+the address point. It is possible that our algorithm identiﬁes
+non-VTables – e.g., function tables that resemble VTables
+– as genuine VTables. We err on the safe side, because
+including a few false VTables does not compromise the policy
+soundness and only reduces precision to a certain degree. A
+detailed algorithm for VTable identiﬁcation is presented in
+Section IV-B.
+
+E. Target Accumulation and Filtering
+
+All the vfptrs and thunks within all the VTables together
+form a universal set for virtual call targets. A naive policy
+will include all vfptrs as valid targets for each callsite. For
+large binaries, such a policy would contain 1000s of targets
+per callsite. While still more precise than existing defenses, it
+would still expose a large attack space. We leverage the offset
+information at the callsite to obtain a more precise policy.
+
+Given an offset at a callsite, during “Target Accumulation”,
+we obtain a basic policy for each callsite that encompasses all
+the vfptrs (and thunks) at the given offset in all the VTables in
+which the offset is valid. Additionally, we apply two ﬁlters to
+further improve the policy precision. First, we note that target
+vfptrs for a callsite that is invoked on the same object pointer as
+the host function must belong to the same VTables as the host
+function. With this, we apply our ﬁrst ﬁlter, called “Nested Call
+Filter”. Furthermore, from Ob 3, the calling convention that
+is presumed at the callsite and the calling convention adhered
+to by the target function must be compatible. Accordingly, we
+apply the second ﬁlter called “Calling Convention Filter”.
+
+We considered several other ﬁlters, but did not adopt them
+for various reasons. To name a few, we could infer the number
+of arguments accepted by each function and require it to match
+the number of arguments passed at the callsite; we could
+perform inter-procedural data ﬂow analysis to keep track of
+this pointers; and we could perform type inference on func-
+tion parameters and bind type compatible functions together.
+
+f unction
+stmt
+
+exp
+♦b
+♦u
+var
+τreg
+τval
+
+::= (stmt)∗
+::= var ::= exp | exp ::= exp | goto exp
+
+| call exp | return
+| if var then stmt
+
+::= exp ♦b exp | ♦uexp | var
+::= =, +,−,∗, /, ...
+::= deref,−,∼
+::= τreg | τval
+::= reg1_t|reg8_t|reg16_t|reg32_t
+::= {Integer}
+
+TABLE I: Intermediate Language used by vfGuard. deref
+corresponds to the dereference operation.
+
+However, at binary level, such analyses are imprecise and
+incomplete. A function may not always use all the arguments
+declared in source code, and thus we may not reliably obtain
+the argument information in the binary. Inter-procedural data
+ﬂow analysis and type inference are computational expensive,
+and by far not practical for large binaries. We will investigate
+more advanced ﬁlters as future work.
+
+F. Policy Enforcement
+
+To enforce the generated policy, we need to perform
+binary instrumentation, which can be either static or dynamic.
+Several dynamic binary instrumentation tools (e.g., Pin [19]
+and DynamoRIO [20]) are publicly available and are fairly
+mature. Therefore, we build our policy enforcement based on
+Pin. We did experiment with several static instrumentation
+tools such as IDA Pro [21] and Pebil [22]. However, these
+tools have not been robust enough to deal with complex large
+C++ binaries. Nevertheless, since our main contribution lies in
+policy generation, we do not believe that our contribution will
+be diminished without static binary instrumentation.
+
+Although the policy enforcement is straightforward, we
+still need to deal with several practical issues. It is possible
+for modules to inherit from classes that are deﬁned in other
+modules. However,
+the policy generated by vfGuard is
+applicable within a module, so when a virtual dispatch invokes
+a function in another module, the invocation violates the policy.
+To tackle this problem, we maintain a list of modules that a
+program depends on, then at runtime, the policies pertaining to
+a module are updated based on the load address of the module
+and the policies are accordingly merged. More details about
+enforcement is presented in Section V.
+
+IV. POLICY GENERATION
+
+Policy generation comprises of ﬁrst identifying the legit-
+imate callsites and the VTables in the binary, then based on
+the offset at the callsite and the VTables, a basic policy is
+generated for each callsite. Two ﬁlters are applied to further
+reﬁne the targets.
+
+A. Callsite Identiﬁcation
+
+Due to the complex nature of x86 binaries and the
+complexities involved in recovering the callsites, a simple
+
+6
+
+scanning-based approach for callsite identiﬁcation is insufﬁ-
+cient. vfGuard ﬁrst identiﬁes all the candidate functions that
+could host callsites by identifying functions in the binary that
+contain at least 1 indirect call instruction. Each identiﬁed func-
+tion is subjected to static intra-procedural analysis to identify
+legitimate virtual callsites and VTable offsets at such callsites.
+In order to perform the data ﬂow analysis, we modiﬁed an open
+source C decompiler [12]. Below, we present the different steps
+in our analysis.
+
+IR Transformation and SSA Form. x86 instruction set is
+large, and instructions often have complex semantics. To aid
+in analysis and focus on the data ﬂow, we make use of a
+simple, yet intuitive intermediate language as shown in Table I.
+The IR is simple enough to precisely capture the ﬂow of data
+within a function without introducing unnecessary overhead.
+Each function is ﬁrst broken down into basic blocks and a
+control-ﬂow graph (CFG) is generated. Then, starting from
+the function entry point, the basic blocks are traversed in a
+depth-ﬁrst fashion and each assembly instruction is converted
+into one or more IR statements. A statement comprises of
+expressions, which at any point is a symbolic representation
+of data within a variable. A special unary operator called
+deref represents the dereference operation. goto, call
+and return instructions are retained with similar semantic
+interpretations as their x86 counterparts. Edges between basic
+blocks in the CFG is captured using goto.
+
+In its current form, vfGuard supports registers up to 32
+bits in size, however, the technique itself is ﬂexible and can
+be easily extended to support 64-bit registers. Moreover, note
+that the ABIs are not restricted to any particular hardware
+architecture. Performing analysis on the IR facilitates our
+solution to be readily ported to protect C++ binaries on other
+architectures (e.g., ARM) by simply translating the instructions
+to IR.
+
+Furthermore, we convert each IR statement into Single
+Static Assignment (SSA) [23], [24] form, which has some
+unique advantages. IR in SSA form readily provides the def-
+use and the use-def chains for various variables and expres-
+sions in the IR.
+
+Def-Use Propagation. The deﬁnition of each SSA variable
+and list of statements that use them constitutes the Def-Use
+chains [23]. vfGuard recursively propagates the deﬁnitions
+into uses until all the statements are comprised of entry point
+deﬁnitions (i.e., function arguments, input registers and glob-
+als). Due to ﬂow-sensitive nature of our analysis, it is possible
+that upon propagation, we end up with multiple expressions for
+each SSA variable, and each expression represents a particular
+code path. For example, for the class hierarchy in Figure 1(a),
+consider the code snippet:
+
+1.
+2.
+3.
+4.
+5.
+6.
+
+...
+A *pa; A a; C c;
+if (x == 0)
+
+pa = &a
+
+else
+
+pa = &c
+
+pa->vAtest(0);
+...
+
+At line 6, depending on the value of x, the vfptr corre-
+sponding to vAtest could either be &(&(&c)+0x146) or
+&(&(&a)+0x14). Assuming stdcall convention, per step
+SetThis, the implicit object pointer could either be &c or &a.
+Precise data ﬂow analysis should capture both possibilities,
+and for each case ensure the existence of a corresponding this
+pointer assignment on the stack. For such cases, vfGuard
+creates multiple copies of the statement – one for each prop-
+agated expression.
+
+Subsequently, each deﬁnition is recursively propagated to
+the uses until a ﬁxed point is reached. At each instance of
+propagation,
+the resulting expression is simpliﬁed through
+constant propagation. For example, deref ((ecx0 + c1) + c2)
+becomes deref (ecx0 + c3) where c3 = c1 + c2.
+
+Callsite Identiﬁcation. As per the steps involved in dynamic
+dispatch described in Section II-A, we need to capture GetVT
+through CallVF using static data ﬂow analysis. More specif-
+ically, for each indirect call, we compute expressions for the
+call target and expressions for this pointer passed to the target
+function. Note that due to ﬂow-sensitive data ﬂow analysis, we
+may end up having multiple expressions for each statement or
+variable.
+
+For a virtual callsite, after def-use propagation, its call
+
+instruction must be in one of the two forms:
+
+or
+
+call deref (deref (exp) + τval)
+
+call deref (deref (exp))
+
+(1)
+
+(2)
+
+In the ﬁrst form, exp as an expression refers to the vptr
+within an C++ object and τval as a constant integer holds the
+VTable offset. When a virtual callsite invokes a virtual function
+at offset 0 within the VTable, the call instruction will appear in
+the second form, which is a double dereference of vptr. Here,
+τval is the byte offset within the VTable and must be divisible
+by the pointer size. Therefore, if τval is not divisible by 4, the
+callsite is discarded.
+
+Next, we need to compute an expression for this pointer
+at the callsite. this pointer can be either passed through ecx
+in thiscall or pushed onto the stack as the ﬁrst argument
+in stdcall conventions. Expression for this pointer must be
+identical to the exp within the form (1) or (2).
+
+Table II presents a concrete example. At 0x7ae, after
+propagation and simpliﬁcation, the call instruction matches
+with form (1) and we determine the expression for this pointer
+to be deref (esp0 + 4) and VTable offset as 8. Then at 0x7ab,
+we determine that the ﬁrst argument pushed on the stack is also
+deref (esp0+4). Now, we are certain that this callsite is indeed
+a virtual callsite, and it uses stdcall calling convention.
+
+It is worth noting that our technique is independent of the
+inheritance structure and works not only for single inheritance,
+but also multiple and virtual inheritances. This is because
+the compiler adjusts this pointer at the callsite to point to
+appropriate base object before the virtual function call
+is
+invoked. Therefore, while the expression for this pointer may
+vary, it must be of the form (1) or (2) above. Our method aims
+
+6Note that the offset for vAtest from Figure 1(d) is 0x14.
+
+7
+
+Address
+0x798
+
+Instruction
+push ebp
+
+0x799
+0x79b
+0x79e
+0x7a1
+0x7a3
+0x7a6
+0x7a8
+0x7ab
+0x7ae
+
+mov ebp, esp
+sub esp, 0x18h
+mov eax, [ebp + 8]
+mov eax, [eax]
+add eax, 8
+mov eax, [eax]
+mov edx, [ebp + 8]
+mov [esp], edx
+call eax
+
+IR-SSA form
+deref (esp0) = ebp0
+esp1 = esp0 − 4
+esp2 = esp1 − 0x18
+
+ebp1 = esp1
+
+eax0 = deref (ebp1 + 8)
+
+eax1 = deref (eax0)
+
+eax2 = eax1 + 8
+
+After Propagation and Constant Folding
+
+deref (esp0) = ebp0
+esp1 = esp0 − 4
+ebp1 = esp0 − 4
+esp2 = esp0 − 0x1C
+eax0 = deref (esp0 + 4)
+
+eax1 = deref (deref (esp0 + 4))
+
+eax2 = deref (deref (esp0 + 4)) + 8
+
+eax3 = deref (eax2)
+
+eax3 = deref (deref (deref (esp0 + 4)) + 8)
+
+edx0 = deref (ebp1 + 8)
+
+deref (esp2) = edx0
+
+edx0 = deref (esp0 + 4)
+
+deref (esp2) = deref (esp0 + 4)
+
+call eax3
+
+call deref (deref (deref (esp0 + 4)) + 8)
+
+TABLE II: Callsite identiﬁcation for A::Afoo() in the sample example in Figure 2(a). After propagation at 0x7ae, deref (esp0 +4)
+is the this pointer and 8 is the VTable offset.
+
+to resolve this pointer directly for each callsite, and thus can
+deal with all these cases.
+
+B. VTable Identiﬁcation
+
+vfGuard scans read-only sections in the C++ binary for
+VTables, using a signature template derived from the Itanium
+and MSVC ABI speciﬁcations. Moreover, since the VTable
+locations are known during compile-time, using mov or an
+equivalent instruction, compilers move the “immediate” value
+of a VTable’s address point
+into the object base address
+during object initialization. Therefore, VTable base addresses
+are a subset of all the “immediate” values that occur in the
+binary. vfGuard ﬁrst scans for all the “immediate” values
+that occur in the binary. Then, the value is identiﬁed as a
+VTable if it belongs to a read-only section and matches with
+the signature template. A VTable is considered valid if it
+contains an array of one or more vfptrs at the address point.
+Figures 1(d) and 4 present the VTables for Itanium and MSVC
+ABIs. Under Itanium ABI, the RTTI information and Offset-
+to-top – offset from the subobject (B in C) to base object
+(C) are contained as mandatory ﬁelds within the VTable and
+therefore provide a stronger signature template. They also act
+as a natural boundary between VTables. MSVC imposes no
+such requirement. In binaries compiled by MSVC, groups of
+VTables are often contiguously allocated, thereby presenting
+the challenge of identifying the boundaries.
+
+The algorithm used to identify VTables is presented in
+Algorithm 1. It comprises of two functions. “ScanVTables”
+takes a binary as input and returns a list of all the VTables
+V in the binary. Each instruction in the code sections and
+each address in the data sections of the binary are scanned
+for immediate values. If an immediate value that belongs to a
+read-only section of the binary is encountered, it is checked
+for validity using “getVTable” and V is updated accordingly.
+“getVTable” checks and returns the VTable at a given address.
+Starting from the address, it accumulates entries as valid vfptrs
+as long as they point to a valid instruction boundary within
+the code region. Note that not all valid vfptrs may point to
+a function entry point. For instance, in case of “pure virtual”
+functions, the vfptr points to a compiler generated stub that
+jumps to a predeﬁned location. In fact the MSVC compiler
+introduces stubs consisting of a single return instruction to
+implement empty functions. To be conservative, vfGuard
+
+allows a vfptr to point to any valid instruction in the code
+segments. Upon failure, it returns the accumulated list of
+vfptrs as the VTable entries. If no valid vfptrs are found,
+an empty set – signifying invalid VTable address point – is
+returned.
+
+Furthermore, the following restriction is imposed on Ita-
+nium ABI: A valid VTable in the Itanium ABI must have
+valid RTTI and “OffsetToTop” ﬁelds at negative offsets from
+the address point. The RTTI ﬁeld is either 0 or points to a
+valid RTTI structure. Similarly, “OffsetToTop” must also have
+a sane value. A value -0xffffff ≤ offset ≤ 0xffffff, which cor-
+responds to an offset of 10M within an object, was empirically
+found to be sufﬁcient. Depending on the speciﬁc classes and
+inheritance, ﬁelds like “vbaseOffset” and “vcallOffset” may
+be present in the VTable. To be conservative, we do not rely
+on such optional ﬁelds. However with stronger analysis and
+object layout recovery, these restrictions can be leveraged for
+more precise VTable discovery.
+
+While vfGuard may identify some false VTables as
+legitimate, its conservative approach does not miss a legitimate
+VTable, which is a core requirement to avoid false positives
+during enforcement. Moreover, Algorithm 1 is not very effec-
+tive at detecting end points of the VTables in the binary (e.g.,
+in Figure 4, end points of all VTables would be captured as
+0x74). Pruning the VTables based on neighboring VTable start
+addresses (e.g., since B starts from 0x50, setting A’s end to be
+0x4c) may lead to unsound policies if the neighboring VTables
+are not legitimate. While our approach reduces precision, it
+keeps the policy sound. Our algorithm terminates a VTable
+when the vfptr is an invalid code pointer.
+
+While Itanium ABI provides strong signatures for VTables
+due to mandatory offsets, MSVC ABI does not. In theory, any
+pointer to code can be classiﬁed as a VTable under MSVC
+ABI. In practice however, we found that legitimate VTables
+contain at least 2 or more entries. Therefore, under MSVC
+ABI, we consider VTables only if they contain at least 2
+entries.
+
+C. Target Filtering
+
+Basic Policy. Based on the identiﬁed callsites and the VTables
+V , vfGuard generates a basic policy. For a given callsite c
+with byte offset o, we deﬁne index k to be the index within
+
+8
+
+Algorithm 1 Algorithm to scan for VTables.
+1: procedure getVTable(Addr)
+2:
+3:
+
+Vmethods ← ∅
+if (ABIItanium and isM andatoryF ieldsV alid(Addr))
+
+end while
+
+end if
+return Vmethods
+
+or ABIM SV C then
+M ← [Addr]
+while isV alidAddrInCode(M ) do
+
+Vmethods ← Vmethods ∪ M
+Addr ← Addr + size(P T R)
+M ← [Addr]
+
+4:
+5:
+6:
+7:
+8:
+9:
+10:
+11:
+12: end procedure
+13:
+14: procedure ScanVTables(Bin)
+V ← ∅
+15:
+for each Insn ∈ Bin.code do
+16:
+17:
+C ← immV alAt(Insn)
+18:
+if C ∈ SectionRO and getV T able(C) (cid:54)= ∅ then
+19:
+20:
+end if
+21:
+22:
+23:
+24:
+25:
+
+end for
+for each Addr ∈ Bin.data do
+
+if Insn contains ImmediateV al then
+
+if [Addr] ∈ SectionRO and getV T able([Addr]) (cid:54)= ∅
+
+V ← V ∪ C
+
+end if
+
+V ← V ∪ [Addr]
+
+then
+
+26:
+27:
+28:
+29:
+30: end procedure
+
+end if
+end for
+return V
+
+Fig. 4: VTables with mandatory ﬁelds for running examples
+as generated by Visual Studio (MSVC) compiler (no RTTI).
+A::Afoo and B::Bfoo are non-virtual member functions
+and therefore are not present in the VTables. VTables for A, B
+and C are aligned one after the other. It is important to identify
+them as separate VTables and not a single large VTable.
+
+the VTable that the byte offset corresponds to (i.e., k = o/4 for
+4-bytes wide pointers). The legitimate call targets of c must
+belong to a subset of all the functions at index k within in
+all the VTables that contain at least (k + 1) vfptrs. Here we
+assume VTables to be zero-based arrays of vfptrs. That is:
+
+T argets = {Vi[k] | Vi ∈ V, |Vi| > k},
+
+9
+
+where Vi is the VTable address point. |Vi| is the number
+
+of vfptrs in the VTable at Vi.
+
+In Figure 4, since class C overrides function vBfoo in base
+class B, the compiler introduces a thunk to perform runtime
+adjustments (Section II). An astute reader may wonder if thunk
+could cause a problem. The answer is no. Since vBfoo is not
+present in the VTable for B, it is not a valid target for offset
+0. Note that this is the expected behavior since vBfoo is a
+pure virtual function that cannot be directly invoked. However,
+thunk is a valid VTable entry and therefore captured as a valid
+target for offset 0.
+
+Nested Virtual Call Filtering. In some cases, this pointer
+used to invoke a virtual function is later used to make one or
+more virtual calls within the function body. We refer to such
+virtual calls as “Nested Virtual Calls”. vfGuard can generate
+a more precise policy for nested virtual calls.
+
+1. class M { virtual void vMfoo() {
+
+//vFn(); or
+this->vFn(); } };
+
+2.
+
+In the above example, vFn is a virtual function that
+is invoked on the same this pointer as its host function
+M::vMfoo, which is also a virtual function. Underneath,
+the binary implementation reuses the VTable used to invoke
+M::vMfoo to retrieve the vfptr (or thunk) pertaining to
+vFn. That is, between the nested virtual calls and the host
+virtual function, the vptr acts an invariant. Therefore at the
+nested callsite, target vFn must belong to a VTable to which
+M::vfoo also belongs.
+
+Given a virtual callsite with vfptr index k and host virtual
+function f, we can derive a more precise policy for each nested
+virtual callsite within f:
+
+T argets = {Vi[k] | Vi ∈ V, f ∈ Vi}
+
+Nested virtual callsites can be easily identiﬁed using our
+intra-procedural data ﬂow analysis. First, we check whether
+the this pointer at the given callsite is in fact the this pointer
+for the host function. That is, the expression for this pointer at
+that callsite should be ecx0 for thiscall calling convention
+or esp0 + 4 for stdcall calling convention. Next, we ensure
+that the host function is virtual. That is, there must exist at
+least 1 VTable to which the host function belongs. Finally, the
+ﬁltered targets are identiﬁed using the equation above.
+
+Note that the ﬁlter is applicable only in cases where host
+function is also virtual. For example,
+in Figure 1(a) (and
+Table II), A::Afoo reuses the this pointer to invoke vAduh,
+a virtual function. Since A::Afoo is not a virtual function,
+it is not contained within any VTable and therefore, T argets
+will be ∅. If the ﬁlter is inapplicable, vfGuard defaults to
+basic policy.
+
+Calling-Convention based Filtering. We ﬁlter the target list
+to be compatible with the calling convention followed at the
+callsite. At the callsite, the register that is utilized to pass the
+implicit this pointer (CallVF) reveals the calling convention
+that the callee function adheres to.
+
+VTable:AVTable:C0x40:  &A::vAfoo0x58:  &C::vAfoo0x44:  &A::vAbar0x5c:  &A::vAbar0x48: &A::vAduh0x60: &C::vAduh0x4c: &A::vAtest0x64: &C::vAtestVTable:B0x68: &C::vBfoo0x6c: &C::vCfoo0x50:  _purecall0x70: &<thunk to C::vBfoo(int)>0x54:  &B::vBbar0x74: &B::vBbarFirst, for each of the callsite target functions in the policy,
+we identify the calling convention the function adheres to.
+Next, for each callsite, we check if there is a mismatch
+between the convention at the callsite and the target, if so,
+we remove such conﬂicting targets from the list. If we are
+unable to identify the calling convention of the callee – which
+is possible if the callee does not use the implicit this pointer
+(e.g., A::vAbar, A::vAfoo, etc.), we take a conservative
+approach and retain the target.
+
+Incomplete Argument Utilization. Conceptually, all poly-
+morphs of a function must accept the same number of argu-
+ments. So, one potential ﬁlter could be to check if a function
+accepts the same number of arguments that are passed at the
+callsite. If not, the mismatching functions can be removed from
+potential targets for the callsite. However, in the binary, we
+only see the number of arguments used by a function and not
+the number of arguments it can accept.
+
+Mismatch for legitimate targets arises when a base class
+and a derived class operate on unequal number of argu-
+ments for a given virtual function. For example,
+in Fig-
+ure 1(a), we identify 3 arguments (2 arguments + this) for
+A::vAfoo whereas only 2 arguments (1 argument + this)
+for C::vAfoo. Reverse is the case for A::vAtest and
+C::vAtest with 1 and 2 arguments repectively. For a callsite
+that invokes vAtest, depending on the type of the object,
+both A::vAtest and C::vAtest are legitimate targets.
+Therefore, argument count is not feasible as a ﬁlter.
+
+V. POLICY ENFORCEMENT
+
+We enforce the policy generated by vfGuard by running
+the program on Pin: a dynamic binary translator. Other tech-
+niques such as Binary Rewriting( [25] and
+[22]) as used
+by [1]–[3], in-memory enforcement by injecting code into
+process memory (e.g., using Browser Helper Objects [26]),
+etc. are equally feasible.
+
+In our proof-of-concept approach, we intercept the control
+ﬂow at every previously identiﬁed callsite and check if the call
+target is allowable for the callsite. If the target is dis-allowed,
+the instance is recorded as a violation of policy. Effective
+enforcement must impose low space and runtime overheads.
+Under the basic policy, vfGuard captures the policy within 2
+maps. The ﬁrst map Mcs maps a callsite to the VTable offset
+at the callsite, and the second map Mtarget maps a given target
+to a 160-bitvector7 that represents the valid VTable offsets for
+the given target. That is, ith bit set to 1 indicates that the target
+is valid for offset i∗ 4. For a given CS, a Mcs entry is readily
+derived from τval in Equation 1 in Section IV-A. Mtarget is
+populated from the identiﬁed VTables (Section IV-B). For each
+VTable entry, the corresponding bitvector is updated to indicate
+a 1 for the offset at which the entry exists within the VTable.
+vfGuard performs 2 map lookups and 1 bitvector masking
+to verify the legitimacy of a given target at a callsite. That is,
+for a given callsite (CS) and target (T ), the target is validated
+if:
+
+BitM ask(Mcs(CS)) & Mtarget(T ) (cid:54)= 0
+
+Such a design enables quick lookup and limits space
+overhead from duplication of callsites and targets within the
+maps. While the map lookups and bitvector masking result
+in constant time runtime overhead, the space requirements of
+Mcs and Mtarget are linear with resepct to number of callsites
+and targets respectively.
+
+In case of callsites whose targets were ﬁltered, the target
+lookup is different from basic policy. Each callsite CS – whose
+targets were ﬁltered – is associated with a map MF iltered(CS)
+that maintains all the allowable call targets for CS. During
+enforcement, vfGuard ﬁrst checks if the callsite is present
+in MF iltered(CS) and validates the target. If callsite is not
+present in MF iltered (i.e., targets for the callsite were not
+ﬁltered), vfGuard performs the 2 map lookup and veriﬁes
+the target through Equation 3. Enforcing the ﬁltered policy
+introduces greater space overhead. The main reason being:
+targets reappear in multiple MF iltered for each of the callsites
+that the targets are valid at. We wish to investigate better
+enforcement in our future work.
+
+Effect of ASLR:. vfGuard performs policy enforcement
+with or without ASLR enabled. The callsite and targets in
+Mcs, Mtarget and MF iltered are stored as (module, offset)
+tuple rather than the concrete virtual address. When a module
+is loaded, the virtual addresses of callsite and target addresses
+are computed from the load address of the module.
+
+A. Cross-Module Inheritance
+
+In practice, classes in one module can inherit from classes
+deﬁned in another module [27]. Therefore, as new modules
+are loaded into a process address space, the allowable call
+targets for callsites in existing modules need to evolve to
+accommodate the potential targets in the new module. Given a
+list of approved modules that a program depends on, vfGuard
+can analyze each of the modules to generate the intra-module
+policy. From the execution monitor, vfGuard monitors mod-
+ule loads to capture any newly loaded modules and their load
+addresses. Intra-module policies are progressively adjusted (for
+ASLR) and maps Mcs, Mtarget and MF iltered are updated so
+as to capture the allowable targets for various callsite offsets
+across all approved modules. If a target in an unapproved
+modules is invoked, vfGuard records it as a violation.
+
+B. Other Enforcement Strategies
+
+Policy enforcement performed by vfGuard is only a
+proof-of-concept and not the focus. Prior approaches (e.g.,
+[1]–[3]) have leveraged static instrumentation to introduce
+Inline Reference Monitors (IRMs) to check the legitimacy of a
+branch target at runtime. We believe such approaches can im-
+prove the performance of vfGuard. Furthermore, depending
+on the number of modules loaded, the size of callsite and target
+maps can increase to result in signiﬁcant memory overhead,
+specially in case of ﬁltered targets. In such cases, cross-module
+dependencies can be analyzed to only allow cross-module calls
+in cases where known dependencies exist, thereby controlling
+the size of various enforcement maps.
+
+7The size of the bitvector is dictated by the size of the largest VTable in
+
+the binary. We found 160 to be sufﬁcient.
+
+We implemented vfGuard in the following code modules.
+The policy generation part of vfGuard is implemented as a
+
+10
+
+(3)
+
+VI.
+
+IMPLEMENTATION AND EVALUATION
+
+Program
+
+SpiderMonkey
+
+dplus-browser 0.5b
+
+TortoiseProc.exe
+
+Ground
+Truth
+811
+270
+568
+
+vfGuard
+
+942
+334
+595
+
+FP
+
+13.9%
+19.1%
+4.7%
+
+FN
+0
+0
+0
+
+TABLE III: VTable Identiﬁcation accuracy.
+
+Program
+
+SpiderMonkey
+
+dplus-browser 0.5b
+
+Ground
+Truth
+1780
+309
+
+vfGuard
+
+1754
+287
+
+FP
+0
+0
+
+FN
+1.4%
+7.1%
+
+TABLE IV: Callsite Identiﬁcation Accuracy. Ground-truth
+was generated using gcc with -fvtable-verify compile
+option.
+
+plugin for IDA-pro v6.2. An open source IDA-decompiler [12]
+was modiﬁed to perform data ﬂow analysis for callsite iden-
+tiﬁcation. The platform consists of 5.6K lines of Python code
+and 3.4K lines were added to it. A PinTool [19] was written
+using 850 lines of C++ code to perform policy enforcement.
+We evaluated vfGuard in several respects. We ﬁrst eval-
+uated the accuracy of virtual callsite and VTable identiﬁcation
+using several open source C++ programs, because source code
+is needed to obtain ground truth. Then, we measured the
+policy precision and compare with BinCFI and SafeDispatch.
+To evaluate the effectiveness of vfGuard, we tested multiple
+realworld exploits. Finally, we measured vfGuard’s coverage
+with respect to number of indirect branches protected, and
+performance overhead of policy enforcement.
+
+Test Set. To evaluate vfGuard, we consider a set of C++
+program modules presented in Tables III,
+IV and V. Firstly,
+our test set comprises of programs containing between 100
+and 2000 VTables, thereby providing sufﬁcient complexity for
+analysis. Secondly, the modules in the test set are a part of
+popular browsers like Firefox and Internet Explorer, which are
+known to contain several vulnerabilities. SpiderMonkey is the
+JavaScript engine employed by FireFox and Table V presents
+some of the modules used by Internet Explorer that contain
+reported vulnerabilities. Finally,
+the test set contains both
+open (Table III,
+IV) and closed source programs (Table V).
+While vfGuard operates on raw COTS binaries, open source
+programs provide the ground truth to evaluate vfGuard’s
+accuracy. Along with SpiderMonkey and the modules used by
+IE, the set consists of dplus browser, an open source browser
+and TortoiseSVN, an open source Apache subversion client for
+Windows.
+
+A. Identiﬁcation Accuracy
+
+To ensure policy soundness, vfGuard must identify all
+legitimate VTables and must not identify any false virtual
+callsites. To measure the accuracy, we picked SpiderMonkey
+and dplus-browser for the Itanium ABI, and TortoiseProc for
+the MSVC ABI. We constructed the “ground truth” by using
+compiler options that dump the VTables and their layouts
+in the binary. Speciﬁcally, -fdump-class-hierarchy
+
+and /d1reportAllClassLayout compiler options were
+used to compile the programs on g++ and Visual Studio
+2013 respectively. The results are tabulated in Table III. The
+compilers emit meta-data for (1) each class object’s layout in
+the memory, and (2) each VTable’s structure. We compared
+each of the VTables obtained from the ground truth against
+vfGuard. None of the legitimate VTables were missed in
+each of the cases. In all the cases, VTables identiﬁed by
+vfGuard contained some noise (from 4.7% to 19%). This
+was expected due to the conservative nature of vfGuard’s
+VTable scanning algorithm.
+callsite
+
+of
+vfGuard, we leveraged a recent g++ compiler option,
+the
+-fvtable-verify
+virtual callsites in the binary to validate the VTable that
+is invoking the virtual call. We compiled SpiderMonkey
+with and without
+the
+callsites that contained the compiler check to the callsites
+identiﬁed by vfGuard. Out of
+the functions that were
+successfully analyzed, vfGuard reported 0 false positives.
+It
+reported 1.4% and 7.1% false negatives (i.e., missed
+during identiﬁcation) for SpiderMonkey and dplus-browser
+respectively.
+
+the checks, and matched each of
+
+[8] that embeds checks at all
+
+identiﬁcation
+
+accuracy
+
+To
+
+evaluate
+
+These experiments indicate that
+
+the generated policies
+should be sound but a little imprecise, due to the noisy VTables
+and missing callsites.
+
+B. Policy Precision
+
+To measure how precise our generated policies are, we
+generate policies for C++ binary modules in Internet Explorer
+8. Table V presents the average number of targets per callsite
+under 3 conﬁgurations – basic policy, basic policy with Nested
+Callsite Filter (NCF) and basic policy with Nested Callsite
+Filter and Calling Convention Fiilter (CCF). Additionally, for
+each case, we estimated the number of targets in a policy
+generated by BinCFI. We included into the policy all the
+function entry points in the program. The exact reduction in
+the number of targets is tabulated in the last column. We can
+see that even with the basic policy generated by vfGuard,
+we were able to reﬁne BinCFI’s policy by over 95%. Here, the
+reﬁnement numbers pertain to the virtual callsites protected by
+vfGuard and not all the indirect branch instructions within
+the module. An optimal defense will combine vfGuard’s
+policy for virtual callsites along with those generated by
+BinCFI (or CCFIR) for other branch instructions.
+
+In general, we found no obvious correlation between the
+number of callsites and VTables in the binary to the effec-
+tiveness of the ﬁlters. While the ﬁlters improved precision
+in some cases, they did not in others. Graphs in Figure 5
+show the scattered distribution of number of callsites with
+respect to offset within the VTable at the callsite, and the
+number of VTables that contain a particular VTable size for
+mshtml.dll and wmvcore.dll. As expected, we found
+several VTables with small sizes of less than 10 elements.
+However, we also found a signiﬁcant number of VTables
+between sizes 50 and 125. While the algorithm used by
+vfGuard is efﬁcient in detecting the VTable start address,
+it is not very accurate in detecting the end points. This is the
+main hurdle for lowering the average call targets per callsite.
+
+11
+
+ABI and language semantics to better demarcate VTables.
+For example, colocated functions at a given offset – e.g.,
+A::vAfoo and C::vAfoo at offset 0x8 in Figure 1(d) –
+must be compatible with each other with respect to types of
+arguments accepted and type of value returned. We intend to
+pursue this direction in our future work.
+
+Virtual-dispatch-like C calls. Our virtual callsite identiﬁ-
+cation has captured all required steps for a virtual dispatch
+according to C++ ABI speciﬁcations, but it is still possible
+that some functions in the C code could resemble a legitimate
+C++ virtual function dispatch. For example:
+
+pa->pb->fn(pa);
+
+invocation. A potential solution could classify all
+
+In the binary, the above C statement resembles a C++ virtual
+call dispatch. pa being passed as an argument satisﬁes SetThis
+and could be perceived as a callsite. Commercial compilers
+tend to follow a ﬁnite number of code patterns during a virtual
+call
+the
+callsites based on code patterns used to perform the dispatch
+and look for abnormalities. For example, to dispatch virtual
+calls in mshtml.dll, the compiler typically invokes virtual calls
+using a call instruction of the form, “call [reg + offset]”
+where as, g++ produces code that performs, “add reg, offset;
+call reg”. While this is not a standard, a compiler tends to
+use similar code fragments to dispatch virtual calls within a
+given module. Since a sound policy must prevent false callsites,
+one can ﬁlter the potential incorrect callsites by looking for
+persistent virtual dispatch code fragments.
+
+VIII. RELATED WORK
+
+A. Control Flow Integrity
+
+Control ﬂow integrity was ﬁrst proposed by Abadi et al. in
+2005 [1] as part of the compiler framework to automatically
+place in-line reference monitors in the emitted binary code
+to ensure the legitimacy of control transfers. Since then, a
+great deal of research efforts have built on top of it. Some
+efforts extended the compiler framework to provide better
+CFI protection. In particular, MCFI [5] enables a concept
+of modular control ﬂow integrity by supporting separating
+compilation. KCoFI [28] provides control ﬂow integrity for
+commodity operating system kernels. RockJIT [4] aims to
+provide control ﬂow integrity for JIT compilers.
+
+Other efforts are made to enforce control ﬂow integrity
+directly on binary code. Efforts such as PittSFIeld [29] and
+CCFIR [2] enforce coarse-grained policy by aligning code.
+Based on a CPU emulator, Total-CFI [30] provides CFI pro-
+tection for multiple processes running in an entire operating
+system by extracting legitimate jump targets from relocation
+tables and import tables. MoCFI [6] rewrites ARM binary code
+to retroﬁt CFI protection on smartphone.
+
+B. VTable-Based Analysis
+
+Security solutions have leveraged VTables in C++ pro-
+grams both with and without source code. VTV [8] and
+SafeDispatch [7] provide compiler-based solutions to analyze
+various callsites in C++ source code and instrument virtual
+function calls to perform runtime checks to validate VTable or
+
+target virtual function for each callsite. VTGuard [31] inserts
+cookies into VTables at compile-time and at runtime, veriﬁes
+the cookie at the callsite to ensure legal VTable use.
+
+Callsite identiﬁcation in our work is similar to T-VIP [32]:
+work done independently and concurrently with ours. T-VIP
+starts from an indirect call instruction, obtains a backward
+slice and analyzes the slice to identify various steps in a virtual
+call. They instrument instructions that load VTable to validate
+integrity of VTable. Along similar lines, VTint [33] instru-
+ments C++ binaries to enforce a policy that requires VTables
+to originate from read-only sections. vfGuard identiﬁes the
+allowable call targets at callsites to generate a precise CFI
+policy. It offers protection at the callsite by restricting targets
+as opposed to ensuring VTable integrity.
+
+C. Binary Reverse Engineering
+
+Reverse engineering data structures from binary executa-
+bles is very valuable for many security problems. TIE [34] and
+Rewards [35] make use of dynamic binary analysis to recover
+the type information and data structure deﬁnitions from the
+execution of a binary program. On the other hand, recovering
+C++ level semantics and data structures poses a different set
+of problems. It is generally considered hard primarily due to
+the underlying complexity in the language semantics when
+compared to C.
+
+The problem of C++ reverse engineering was revisited by
+Sabanal et al. [36] in 2007. They use heuristic based scanning
+approach to identify different C++ code constructs within a
+binary and recover C++ level semantics. More recently, Folkin
+et al. [37] take a principled approach based on the C++
+language properties. They target to reconstruct the C++ class
+hierarchy from the binary. Objdigger [38] tracks deﬁnition and
+uses of this pointer through inter-procedural data ﬂow analysis
+to identify various objects instances and member methods of
+a class. While these solutions are interested in recovering
+the precise C++ semantics, our approach is more tuned in
+leveraging the restrictions imposed by such semantics.
+
+D. C++ De-compilation
+
+Several efforts have been made in the direction of C++
+decompilation [37], [39], [40]. A key task these tools must
+accomplish is to recover the class hierarchy from the binary.
+Our goals are signiﬁcantly different. We take an ABI-driven
+platform agnostic approach to infer the restrictions that C++
+semantics impose on the binary. While recovery of the class
+hierarchy improves our precesion, it is not a requirement.
+Availability of RTTI information and other debug informa-
+tion can only improve the quality of defense provided by
+vfGuard.
+
+IX. CONCLUSION
+
+In this paper, we present vfGuard, a system to generate a
+strict CFI policy for virtual calls in C++ binaries. It performs
+static analysis on the C++ binary directly to extract virtual
+callsites and VTables reliably to ensure the soundness of the
+generated policy and achieve high precision at the same time.
+According to our experiments with realworld C++ binaries, we
+demonstrated that vfGuard can indeed generate a sound CFI
+policy for protecting virtual calls. For the callsites protected by
+
+14
+
+vfGuard, it can achieve over 97% target reduction, compared
+to BinCFI. Even under suboptimal enforcement using Pin,
+vfGuard showed an average overhead of 18.3% per module.
+
+[19] C.-K. Luk, R. Cohn, R. Muth, H. Patil, A. Klauser, G. Lowney,
+S. Wallace, V. J. Reddi, and K. Hazelwood, “Pin: Building customized
+program analysis tools with dynamic instrumentation,” in Proceedings
+of the ACM SIGPLAN Conference on Programming Language Design
+and Implementation (PLDI’05), 2005, pp. 190–200.
+
+ACKNOWLEDGEMENT
+
+We would like to thank anonymous reviewers for their
+comments. We would also like to thank Pallavi Iyengar,
+Masters student at Syracuse University for helping us evaluate
+vfGuard. This research was supported in part by NSF Grant
+#1018217, NSF Grant #1054605 and DARPA Cyber Grand
+Challenge. Any opinions, ﬁndings and conclusions made in
+this material are those of the authors and do not necessarily
+reﬂect the views of the funding agencies.
+
+REFERENCES
+
+[1] M. Abadi, M. Budiu, U. Erlingsson, and J. Ligatti, “Control-ﬂow
+integrity,” in Proceedings of the 12th ACM Conference on Computer
+and Communications Security (CCS’05), 2005, pp. 340–353.
+
+[2] C. Zhang, T. Wei, Z. Chen, L. Duan, L. Szekeres, S. McCamant,
+D. Song, and W. Zou, “Practical control ﬂow integrity and random-
+ization for binary executables,” in Proceedings of the IEEE Symposium
+on Security and Privacy (Oakland’13), 2013, pp. 559–573.
+
+[3] M. Zhang and R. Sekar, “Control ﬂow integrity for COTS binaries,”
+the 22nd USENIX Security Symposium (Usenix
+
+in Proceedings of
+Security’13), 2013, pp. 337–352.
+
+[4] B. Niu and G. Tan, “RockJIT: Securing just-in-time compilation using
+modular control-ﬂow integrity,” in Proceedings of 21st ACM Conference
+on Computer and Communication Security (CCS ’14), 2014.
+[5] ——, “Modular control-ﬂow integrity,” in Proceedings of
+
+the 35th
+ACM SIGPLAN Conference on Programming Language Design and
+Implementation (PLDI’14), 2014.
+
+[6] L. Davi, A. Dmitrienko, M. Egele, T. Fischer, T. Holz, R. Hund,
+S. N¨urnberger, and A.-r. Sadeghi, “MoCFI: A framework to mitigate
+control-ﬂow attacks on smartphones,” in Proceedings of the 19th Annual
+Network and Distributed System Security Symposium (NDSS’12), 2012.
+[7] D. Jang, Z. Tatlock, and S. Lerner, “SafeDispatch: Securing C++ virtual
+calls from memory corruption attacks,” in Proceedings of 21st Annual
+Network and Distributed System Security Symposium (NDSS’14), 2014.
+´U. Erlingsson,
+L. Lozano, and G. Pike, “Enforcing forward-edge control-ﬂow integrity
+in GCC & LLVM,” in Proceedings of 23rd USENIX Security Symposium
+(USENIX Security’14), 2014, pp. 941–955.
+
+[8] C. Tice, T. Roeder, P. Collingbourne, S. Checkoway,
+
+[9] E. G¨oktas¸, E. Anthanasopoulos, H. Bos, and G. Portokalidis, “Out
+of control: Overcoming control-ﬂow integrity,” in Proceedings of 35th
+IEEE Symposium on Security and Privacy (Oakland’14), 2014.
+
+[10] N. Carlini and D. Wagner, “ROP is still dangerous: Breaking modern
+defenses,” in 23rd USENIX Security Symposium (USENIX Security’14),
+2014.
+“Stack Shield,” http://www.angelﬁre.com/sk/stackshield/.
+
+[11]
+[12] F. Chagnon,
+
+“IDA-Decompiler,” https://github.com/EiNSTeiN-/ida-
+
+decompiler.
+“Itanium C++ ABI,” http://mentorembedded.github.io/cxx-abi/abi.html.
+J.
+hood,”
+http://www.openrce.org/articles/ﬁles/jangrayhood.pdf, March 1994.
+
+“C++:
+
+Under
+
+Ray,
+
+the
+
+[15] B. Stroustrup, The C++ Programming Language, 4th ed. Addison-
+
+[13]
+[14]
+
+[16]
+
+Wesley, 2013.
+“THISCALL
+us/library/ek8tkfbw.aspx, 2013.
+
+calling
+
+convention,”
+
+http://msdn.microsoft.com/en-
+
+[17] D. Dewey and J. T. Gifﬁn, “Static detection of C++ vtable escape
+vulnerabilities in binary code.” in Proceedings of 19th Annual Network
+and Distributed System Security Symposium (NDSS’12), 2012.
+
+[18] Nektra, “Vtbl – IDA plugin,” https://github.com/nektra/vtbl-ida-pro-
+
+plugin, 2013.
+
+15
+
+[20] V. Bala, E. Duesterwald, and S. Banerjia, “Dynamo: A transparent
+dynamic optimization system,” in Proceedings of the ACM SIGPLAN
+2000 Conference on Programming Language Design and Implementa-
+tion (PLDI’00), 2000, pp. 1–12.
+“The
+disassembler
+rays.com/products/ida/.
+
+https://www.hex-
+
+debugger,”
+
+IDA Pro
+
+[21]
+
+and
+
+[22] M. Laurenzano, M. Tikir, L. Carrington, and A. Snavely, “PEBIL:
+Efﬁcient static binary instrumentation for linux,” in Proceedings of IEEE
+International Symposium on Performance Analysis of Systems Software
+(ISPASS’10), March 2010.
+
+[23] S. S. Muchnick, Advanced Compiler Design and Implementation. San
+
+Francisco, CA, USA: Morgan Kaufmann Publishers Inc., 1997.
+
+[24] R. Cytron, J. Ferrante, B. K. Rosen, M. N. Wegman, and F. K. Zadeck,
+“Efﬁciently computing static single assignment form and the control
+dependence graph,” ACM Transactions on Programming Languages and
+Systems (TOPLAS), 1991.
+
+[26]
+[27]
+
+dllimport
+
+[25] A. Srivastava, A. Edwards, and H. Vo, “Vulcan: Binary transformation
+in a distributed environment,” Microsoft Research, Tech. Rep. MSR-
+TR-2001-50, April 2001.
+“Browser Helper Objects,” http://sysinfo.org/bhoinfo.html.
+“Using
+C++
+http://msdn.microsoft.com/en-us/library/81h27t8c.aspx.
+J. Criswell, N. Dautenhahn, and V. Adve, “KCoFI: Complete control-
+ﬂow integrity for commodity operating system kernels,” in Proceedings
+of 35th IEEE Symposium on Security and Privacy (Oakland’14), 2014.
+[29] S. McCamant and G. Morrisett, “Evaluating SFI for a CISC Architec-
+ture,” in Proceedings of the 15th Annual USENIX Security Symposium
+(Usenix Security’06), 2006.
+
+dllexport
+
+classes,”
+
+[28]
+
+and
+
+in
+
+[30] A. Prakash, H. Yin, and Z. Liang, “Enforcing system-wide control
+ﬂow integrity for exploit detection and diagnosis,” in Proceedings
+of the 8th ACM SIGSAC Symposium on Information, Computer and
+Communications Security (ASIACCS’13), 2013, pp. 311–322.
+
+[31] M. Miller and K. Johnson, “Using virtual
+
+table protections to
+prevent the exploitation of object corruption vulnerabilities,” Patent,
+Jun. 7, 2012, US Patent App. 12/958,668.
+[Online]. Available:
+http://www.google.com/patents/US20120144480
+
+[32] R. Gawlik and T. Holz, “Towards automated integrity protection of
+C++ virtual function tables in binary programs,” in Proceedings of 30th
+Annual Computer Security Applications Conference (ACSAC’14), Dec
+2014.
+
+[34]
+
+[33] C. Zhang, C. Song, Z. K. Chen, Z. Chen, and D. Song, “VTint: defend-
+ing virtual function tables integrity,” in Proceedings of the 22nd Annual
+Network and Distributed System Security Symposium (NDSS’15), 2015.
+J. H. Lee, T. Avgerinos, and D. Brumley, “Tie: Principled reverse engi-
+neering of types in binary programs,” in Proceedings of the 18th Annual
+Network and Distributed System Security Symposium (NDSS’11), 2011.
+[35] Z. Lin, X. Zhang, and D. Xu, “Automatic reverse engineering of data
+structures from binary execution,” in Proceedings of the 17th Annual
+Network and Distributed System Security Symposium (NDSS’10), 2010.
+[36] P. V. Sabanal and M. V. Yason, “Reversing C++,” Blackhat Security
+
+Conference, 2007.
+
+[37] A. Fokin, E. Derevenetc, A. Chernov, and K. Troshina, “Smartdec:
+Approaching C++ decompilation,” in Reverse Engineering (WCRE),
+2011 18th Working Conference on, 2011, pp. 347–356.
+
+[38] W. Jin, C. Cohen, J. Gennari, C. Hines, S. Chaki, A. Gurﬁnkel,
+J. Havrilla, and P. Narasimhan, “Recovering C++ objects from binaries
+using inter-procedural data-ﬂow analysis,” in Proceedings of ACM
+SIGPLAN on Program Protection and Reverse Engineering Workshop
+(PPREW’14), 2014, pp. 1–11.
+“Boomerang decompiler,” http://boomerang.sourceforge.net/.
+I. Skochinsky, “Practical C++ decompilation.” [Online]. Available:
+https://archive.org/details/Recon 2011 Practical Cpp decompilation
+
+[39]
+[40]
+
+

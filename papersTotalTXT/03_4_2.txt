@@ -1,0 +1,1248 @@
+FreeSentry: Protecting Against Use-After-Free
+
+Vulnerabilities Due to Dangling Pointers
+
+Yves Younan
+
+Talos Security Intelligence and Research Group
+
+Cisco Systems
+
+ndss15@fort-knox.org
+
+Abstract—Use-after-free vulnerabilities have become an
+important class of security problems due to the existence
+of mitigations that protect against other types of vul-
+nerabilities. The effects of their exploitation can be just
+as devastating as exploiting a buffer overﬂow, potentially
+resulting in full code execution within the vulnerable
+program. Few protections exist against these types of
+vulnerabilities and they are particularly hard to discover
+through manual code inspection. In this paper we present
+FreeSentry: a mitigation that protects against use-after-free
+vulnerabilities by inserting dynamic runtime checks that
+invalidate pointers when the associated memory is released.
+If such an invalidated pointer is accessed, the program will
+subsequently crash, preventing an attacker from exploiting
+the vulnerability. When checking dynamically allocated
+memory, our approach has a moderate performance over-
+head on the SPEC CPU benchmarks: running with a
+geometric mean performance impact of around 25%. It
+has no overhead when deployed on widely used server
+side daemons such as OpenSSH or the Apache HTTP
+daemon. FreeSentry also discovered a previously unknown
+use-after-free vulnerability in one of the programs in SPEC
+CPU2000 benchmarks: perlbmk. This vulnerability seems
+to have been missed by other mitigations.
+
+I.
+
+INTRODUCTION
+
+Use-after-free vulnerabilities have become particu-
+larly widespread and few mitigations exist to protect
+against them, while even fewer are currently deployed
+in production environments. The vulnerability class is
+present in all types of applications and is the result of
+
+Permission to freely reproduce all or part of this paper for non-
+commercial purposes is granted provided that copies bear this notice
+and the full citation on the ﬁrst page. Reproduction for commercial
+purposes is strictly prohibited without the prior written consent of the
+Internet Society, the ﬁrst-named author (for reproduction of an entire
+paper only), and the author’s employer if the paper was prepared
+within the scope of employment.
+NDSS ’15, 8-11 February 2015, San Diego, CA, USA
+Copyright 2015 Internet Society, ISBN 1-891562-38-X
+http://dx.doi.org/10.14722/ndss.2015.23190
+
+retaining pointers to memory that has been freed and
+subsequently accessing these stale pointers. Exploiting
+other vulnerabilities, such as buffer overﬂows, has be-
+come harder due to mitigations [1]. This has resulted
+in use-after-free vulnerabilities becoming a signiﬁcantly
+more important target for exploitation in recent years.
+
+A study [2] which surveyed vulnerabilities and cor-
+responding exploits for Microsoft products from 2006-
+2012 found that
+there has been a signiﬁcant change
+in the vulnerabilities that are found and exploited by
+attackers due to the introduction of mitigations.
+In
+2011 and 2012, the most exploited memory errors for
+Microsoft products were use-after-free vulnerabilities.
+It was also the most exploited vulnerability for both
+Windows Vista and Windows 7 and is the most common
+type of memory error that occurs in Internet Explorer.
+Typically, during their monthly patch-cycle, Microsoft
+will release patches for Internet Explorer, ﬁxing several
+use-after-free vulnerabilities. Given that Windows Vista
+and Windows 7 (and Windows 8) are the Microsoft
+operating systems that have the most mitigations enabled
+to prevent successful exploitation of whole classes of
+traditional vulnerabilities, it is no surprise that attackers
+have shifted their attention to a vulnerability type that
+currently lacks widespread mitigations.
+
+Use-after-free vulnerabilities are very hard to spot
+during manual code review as they require knowing the
+pattern of allocation and deallocation that occurs during
+a program’s execution. The vulnerability is a temporary
+one, that only exists at particular points in time when
+the stale pointer presents itself. The stale pointer can
+be present for a long time in the program, but
+the
+actual vulnerability that occurs when the stale pointer
+is used can occur several functions or hundreds or even
+thousands of lines removed from the deallocation, further
+complicating the review process. As such, this type of
+vulnerability can easily be missed by even the most
+
+other point the program allocates memory for an object
+B that contains two function pointers and a character
+array of 8 bytes. Depending on how the memory has
+been reassigned, the resulting location for object B can
+encompass all or part of the previous memory inhabited
+by object A. However, when pointer p is accessed, the
+program expects to access four integers. If these integers
+overlap with the function pointers in object B,
+then
+attackers could be able to read or write these pointers
+as if they were integers, potentially allowing them to
+assign these integers values that would reference their
+injected code. When the function pointers are executed
+in object B, the injected code would be called instead
+of the intended function. Figure 1 provides a graphical
+representation of this issue.
+
+lines 11 and 4 respectively. The issue at
+
+Listing 1 shows an example program that suffers from
+two use-after-free vulnerabilities. The vulnerabilities ex-
+ist on lines 12 and 15 due to releasing of memory
+at
+line 12
+is related to dynamically allocated memory, while the
+issue at line 15 is due to a pointer to stack-allocated
+memory which is freed automatically at line 4 when
+the function returns. The vulnerabilities in this example
+are simply for illustrative purposes to demonstrate our
+approach in subsequent sections, they are not exploitable
+due to the lack of memory reuse between the freeing of
+memory and the use-after-free vulnerability. If memory
+was reused as depicted in Figure 1, then an attacker could
+potentially partially overwrite function ptr2 in object B
+with the value 99 (the ASCII value of the character c)
+at line 12.
+
+Listing 1. A C program that is vulnerable to use-after-free vulner-
+abilities
+
+char ∗ r e t p t r ( ) {
+
+A specialized case of the use-after-free vulnerability
+is the double free vulnerability where memory is released
+by calling free and that same object is then again freed
+at some later point
+in time. This potentially causes
+the memory allocator to overwrite memory management
+information stored in the free chunk, which could result
+in an exploitable state. The only difference between a
+double free and a regular use-after-free vulnerability is
+where the dangling pointer is used. In a regular use-after-
+free, the pointer can be used anywhere, while in the case
+of the double free, the stale pointer is used together with
+a call to free.
+
+III. APPROACH
+
+The core idea behind the protection that FreeSentry
+offers is to link objects back to their pointers. When the
+memory for the object in question gets freed, then the
+pointers that still reference the object can be invalidated.
+To do this, whenever a pointer is created or modiﬁed
+to point to a new object, the address of the pointer is
+registered as referring to our object. When the object is
+freed, the freeing function will look up all the pointers
+that point to the memory region inhabited by the object.
+If these pointers still point to our object (they could
+have been changed by unprotected code), the pointers are
+invalidated. When a pointer is invalidated, it is made to
+point to an invalid memory location which will cause the
+program to crash if it attempts to dereference it. These
+transformations are done automatically by FreeSentry, no
+programmer intervention is required.
+
+Listing 2 shows a transformation that is done to the
+
+example vulnerable program in Listing 1.
+
+Listing 2. Vulnerable C program protected with FreeSentry
+
+char p , ∗q ;
+q = &p ;
+return q ;
+
+}
+i n t main ( ) {
+
+char ∗a , ∗b ;
+i n t
+a = m a l l o c ( 1 6 ) ;
+b = a +5;
+f r e e ( a ) ;
+b [ 2 ] = ’ c ’ ;
+
+b = r e t p t r ( ) ;
+∗b = ’ c ’ ;
+
+}
+
+i ;
+
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+
+3
+
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+
+char ∗ r e t p t r ( ) {
+l a b e l s t a c k ( ) ;
+char p , ∗q ;
+q = &p ;
+r e g p t r (&q ) ;
+i n v a l i d a t e s t a c k ( ) ;
+return q ;
+
+}
+i n t main ( ) {
+
+i ;
+
+char ∗a , ∗b ;
+i n t
+a = m a l l o c ( 1 6 ) ;
+r e g p t r (&a ) ;
+b = a +5;
+r e g p t r (&b ) ;
+
+16
+17
+18
+19
+20
+21
+22
+
+f r e e ( a ) ;
+b [ 2 ] = ’ c ’ ;
+
+b = r e t p t r ( ) ;
+r e g p t r (&b ) ;
+∗b = ’ c ’ ;
+
+}
+
+In the transformed program in Listing 2, the following
+to an object, regptr()
+occurs. When a pointer is set
+is called with the address of the pointer, registering
+the pointer as pointing to that speciﬁc object. When
+malloc() gets called at line 12, FreeSentry intercepts it at
+runtime, calls the original malloc() function to perform
+the allocation and registers the memory bounds. When
+the free() function is called, it is also intercepted, the
+original free() function is called and the pointers that
+have been registered via regptr() are invalidated. The
+labelstack() and invalidatestack() functions perform the
+same functions as the intercepted malloc() and free()
+functions, but for stack-allocated memory.
+
+FreeSentry does not modify the way that pointers are
+represented; this means that the program will remain
+compatible with existing code that may not have been
+protected with the mitigation. This also allows develop-
+ers to opt out of protection for speciﬁc functions. For
+example, if a function has been veriﬁed manually to
+be safe, then the function can opt out of registering its
+pointers. Any memory that the unprotected function frees
+will still trigger the pointer invalidation as pointers to
+the freed memory could have been created elsewhere.
+The same occurs for any memory it allocates: this will
+still be labelled to allow pointers to the memory to be
+tracked in other locations. Opting out would only be done
+to improve performance. Section V-A2 discusses a case
+study on how opting out of a minimal amount of code
+can positively affect FreeSentry’s performance.
+
+Our main approach is compatible with objects created
+in all types of memory: whether dynamically allocated,
+global, static or created on the stack. Of these types of
+objects, global and static objects do not need to generally
+be checked for potential use-after-frees because global
+and static objects are only released when the program
+terminates. However, having a pointer to stack space
+that has been reclaimed for other purposes is possible,
+as the example in Section II demonstrates. This type of
+vulnerability is rare and can be more easily detected.
+In fact some compilers will generate warnings when
+returning a pointer to a stack variable. FreeSentry can run
+
+with or without stack protection enabled and we expect
+that the typical use-case of the mitigation will be to only
+protect dynamically allocated memory.
+
+A. Supporting data structures
+
+The memory layout for the supporting data structures
+is presented in Figure 2. The information that is regis-
+tered about a pointer and where it refers to is called the
+pointer registration information. To link the pointers to
+objects, two lookup tables are used. The ﬁrst one, which
+we call the object lookup table, is used to look up all
+the pointer registration information based on the address
+of an object. The second lookup table is used to look up
+that same information based on the address of a pointer
+and is called the pointer lookup table.
+
+The free function uses the ﬁrst approach to look up
+the information: when an object is freed, the pointer
+registration information is found based on the object’s
+memory location using the object lookup table. The code
+that tracks the pointers uses the second approach: based
+on the address of a pointer, we can ﬁnd the registration
+information.
+
+The ﬁrst way of looking up information could be
+eliminated if we transformed the free() calls in programs
+to pass the address of the pointer to the object being
+freed instead of passing the address of the object by
+value. However,
+this approach would mean that any
+calls to free() in unprotected code would no longer be
+able to invalidate the pointers pointing to that memory.
+Eliminating the second table is possible, since we can
+access the value of the pointer being passed into the reg-
+istration and can thus look up the registration information
+based on the object. However this would signiﬁcantly
+reduce performance as we would need to examine the
+registration information of all pointers that refer to a
+speciﬁc object to locate the desired pointer’s registration
+information.
+
+We also need to know the start of the object that
+a pointer is referencing when adding that pointer to the
+object’s lookup table. To do this we use a technique based
+on the one described in [3]: a unique label is stored for
+the memory area that an object inhabits when the object
+is allocated, called a label. When we register a pointer
+to an object, we look up the label of the object that the
+pointer references. That label is then used with the object
+lookup table to ﬁnd the pointer registration information,
+to which we then add the new pointer. Objects are a
+minimum size and can inhabit multiple memory areas
+
+4
+
+the old data will remain intact up to the smallest size (i.e.,
+min(oldsize, newsize)). Due to this lack of guarantee, any
+call to realloc() should invalidate all pointers to the old
+object. However, our goal is to remain as unintrusive as
+possible if there’s no potential for harm. As such, we will
+only invalidate pointers when the new pointer returned
+by realloc() is different from the old pointer passed into
+the function. If the mitigation is used as a testing tool
+to detect as many use-after-frees as possible, then it is
+beneﬁcial to turn on invalidating of all the old pointers.
+When realloc() allocates new memory, it copies the
+old data over to the new memory location and subse-
+quently frees the old memory location. Any pointers to
+the old memory location are now stale. An example
+of this type of use-after-free can be found in CVE-
+2009-0749 [4]. FreeSentry found a vulnerability of this
+type in the perlbmk benchmark which is part of the
+SPEC CPU2000 benchmarks used to test performance in
+Section V. The details of this vulnerability are discussed
+in Section V-B1.
+
+D. Stack protection
+
+If stack protection is enabled, we perform labelling
+of the stack frame when the function is entered and then
+invalidate any pointers that refer to this stack frame when
+leaving the function.
+
+There are two complications to this approach. First
+is the alloca() function, which allocates memory dynam-
+ically on the stack and as a result causes changes to
+the stack frame. To support this function, we ensure that
+all calls to alloca() allocate a multiple of our minimum
+object size and insert a library call after an alloca() to
+update the labelling to include this newly allocated area.
+The second issue is due to longjmp(), which is a
+function that will jump to the last place in the code where
+setjmp() was executed, resetting the stack pointer and
+other registers to the value they held at the time of the
+setjmp() call. These changes in stack pointer need to be
+tracked by FreeSentry to be able to invalidate the stack
+frames that have been freed due to the longjmp() call.
+To facilitate this, we intercept calls to this function and
+invalidate each stack frame separately by walking over
+the saved frame pointer until we reach the frame we’re
+returning to. This ensures that any pointers that become
+stale due to the longjmp() are properly invalidated.
+
+While FreeSentry supports protecting against dan-
+gling pointers to stack-allocated variables, their occur-
+rence are rare. As such, we assume that
+the typical
+
+1
+2
+3
+4
+
+6
+
+use case for the mitigation will not include the stack
+protection: the added performance impact of enabling
+stack protection is too high relative to the rarity of this
+type of vulnerability.
+
+E. Pointer arithmetic and out-of-bounds pointers
+
+If simple pointer arithmetic occurs increasing or de-
+creasing the value of a single pointer, then we do not
+consider this as a change in target object and thus no
+tracking is added at compile time. This is due to the
+fact that if no buffer overﬂows exist, we can assume
+that an object will stay within the bounds of the object
+it refers to. Out-of-bounds pointers can be created this
+way, but they simply will be considered to still point
+within bounds by our implementation. However these
+pointers will not be invalidated when the object is freed
+as we expect the values to be in bounds at the time of
+deallocation. This provides for maximum compatibility
+for FreeSentry: if a pointer is changed in unprotected
+code and now points to a new object, which might be
+immediately adjacent to the object being freed, then we
+cannot invalidate it if it no longer points within the
+bounds of the original object.
+
+If pointer arithmetic occurs where a value is assigned
+to a pointer based on arithmetic with a different pointer,
+then an out-of-bounds value can still occur which can
+cause incompatibility with our approach: if the out-of-
+bounds pointer points to a new memory location that is
+subsequently freed, then the pointer will be invalidated.
+If new pointer arithmetic occurs on this out-of-bounds
+pointer that would make it go in bounds again, then the
+result will still be invalid. This type of incompatibility
+only occurs with programs that generate illegal out-of-
+bounds values (i.e., not compatible with the C standard)
+and can be solved by combining our approach with
+a bounds checker that supports illegal out-of-bounds
+values. In Section V we discuss a workaround that we
+used to run the benchmarks on a program that generates
+these illegal out-of-bounds pointers.
+
+Another possibility that can exist is pointer arithmetic
+with freed values. For example, one piece of code that
+FreeSentry would break when used naively is shown in
+Listing 3:
+
+Listing 3. C program with pointer arithmetic
+
+i n t main ( ) {
+
+char ∗a , ∗b ;
+i n t d i f f e r e n c e ;
+a = m a l l o c ( 1 0 0 ) ;
+
+b = a + 8 ;
+f r e e ( a ) ;
+d i f f e r e n c e = b − a ;
+
+5
+6
+7
+8
+
+}
+
+Whether the code in Listing 3 is valid, is arguable:
+it is valid in C to subtract two pointers that refer to the
+same object. One might argue that if the object no longer
+exists, then the pointers can no longer point to the same
+object and thus one might expect undeﬁned behavior by
+the compiler. However, even if the memory has been
+reused, as long as the pointers are not dereferenced, then
+no exploitable use-after-free vulnerability has occurred.
+If our mitigation simply invalidated both pointers with-
+out taking this possibility into account, some programs
+might break (in fact, one of the benchmarks, perlbmk,
+performs this exact operation). To achieve maximum
+compatibility, our mitigation will invalidate pointers by
+making them point to a reserved area of memory. In
+our implementation, we assume that the top 1GB of
+memory has permissions that our user-mode program
+cannot access. This is the case for both 32-bit and 64-bit
+versions of both Linux and Windows, where the top areas
+of memory in a user-mode process are reserved for the
+kernel. Any access to the kernel address space, will result
+in a segmentation fault. This allows our implementation
+to invalidate a pointer by simply setting the ﬁrst two bits
+to one (on Windows systems, just setting the ﬁrst bit to
+one is enough as the top 2GB of memory is reserved).
+This allows this type of arithmetic to keep working1.
+
+F. Pointers copied as a different type
+
+One limitation in our approach is that it does not track
+pointers that are not copied as pointers, i.e., if a pointer
+is copied as a different type, this will not be tracked
+by our approach. This can occur for example, when a
+programmer calls the memcpy() function to copy one
+area of memory to another. The memory is copied as
+a void type and not through pointer assignment resulting
+in the copy not being tracked by our mitigation. While
+our approach cannot automatically detect the copying, it
+
+does allow for a programmer to register the pointers in
+the new memory area by manually calling the regptr()
+function with the address of the newly copied pointer.
+
+G. Unprotected code
+
+Unmodiﬁed code that is linked to code that is pro-
+tected by our mitigation will work without issues. Any
+pointer assignments and propagation in this code will not
+be tracked by our approach and any dangling pointers
+that result from this code will not be detected. However,
+calls to memory allocation functions will still be inter-
+cepted, allowing the correct labelling of newly allocated
+or reallocated memory and the correct invalidation of
+tracked pointers. We provide the ability for a programmer
+to manually opt out of tracking by setting a function
+attribute. This allows for ﬂexibility when deploying the
+mitigation, allowing a programmer to improve perfor-
+mance by making sure particular often-called functions
+are safe. We discuss the impact of selective opting out
+by a programmer in Section V-A2.
+
+H. C++
+
+Our prototype implementation, discussed in Section
+IV is aimed at C code due to the CIL framework that
+we use to transform the code. However, the principles
+hold the same for C++ as they do for C. Pointers
+operate in much the same way in C++ as they do in
+C, so tracking occurs in a similar manner. The smart
+pointers provided by C++ in the form of unique ptrs,
+auto ptrs, shared ptrs and weak ptrs are built on top
+of regular pointers using templates, which means they
+would all be trackable in the manner discussed in the
+previous sections. However, given the properties that
+these smart pointers provide, tracking could be simpliﬁed
+by eliminating some of the checks for conditions that
+cannot occur on a particular pointer subtype. Dynamic
+memory handling is similar to C: when new or new[] is
+called, the memory is labeled by FreeSentry and when
+delete or delete[] is called, the pointers to the memory
+are invalidated.
+
+1On Linux this introduces a minor compatibility issue, if the point-
+ers used in the arithmetic cross the memory boundary where these
+bits are ﬂipped: i.e. having a pointer above and below 0x40000000
+and a pointer above and below 0x80000000. However this is unlikely
+to happen in practice: it requires a dynamic memory allocation that
+crosses this boundary, having one pointer that is set above and one
+that is set below the boundary and then requires the application to
+free that memory and subsequently perform a subtraction of those
+two pointers
+
+IV. PROTOTYPE IMPLEMENTATION
+
+FreeSentry is implemented using CIL [5]. Whenever
+a pointer is set to an object, the pointer is registered by
+calling a library function regptr(), which creates a new
+pointer registration information, which stores the address
+of the pointer and the label of the object that is associated
+with it and stores pointers to that information in both in
+
+7
+
+the pointer and object lookup tables. When the program
+starts up, we allocate these various memory regions by
+using a constructor function in the library that is linked
+by the mitigation.
+
+Our default region size is 32 bytes in our prototype
+implementation, meaning that all objects must be a
+multiple of 32 bytes in size. To achieve this, we intercept
+all calls to the memory allocation functions: malloc(),
+calloc() and realloc(). We then increase the size of the
+allocated object to be a multiple of 32 bytes. We then
+ensure that
+these functions perform the labelling for
+the allocated objects to ensure that we can track the
+object sizes. We also made a minor modiﬁcation to the
+memory allocation library to ensure that all objects are
+aligned on a 32-byte boundary, mostly to simplify our
+implementation. If stack protection is enabled, then we
+also label the stack frames at the start of the function
+and use gcc options to ensure that stack frames start at a
+32-byte boundary and are a multiple of 32 bytes in size.
+
+A. Optimizations
+
+There are two major optimizations performed by our
+approach that both rely on call graph analysis that we
+perform on the program. We examine which functions
+a particular function calls and to go through that call
+chain until we either hit a leaf function or a library
+call. If along the call chain, any function calls the free()
+function (or any variant function that has the potential to
+free memory, such as realloc(), library functions that free
+pointers passed into it, etc), we consider that function
+a leaf function that calls free(). We propagate the free-
+calls through the functions in the program, allowing us
+to know if any function calls free() at any time. To be
+able to support this modelling, we provide models for the
+functions in typical system libraries such as libc, libm and
+openssl: noting whether they potentially free any memory
+they did not themselves allocate. When we encounter a
+function that doesn’t exist in the program, nor in our
+model (i.e., a library call that we do not recognize), we
+err on the side of safety and assume that this function
+calls free() and propagate it accordingly. Note that the
+model (which simply indicates if a library function calls
+free or not) is not required for FreeSentry to work, if
+no model is available then we assume that all unknown
+functions call free and it simply reduces the potential
+for optimization. This also means that a developer is not
+required to ever update the default models as they already
+provide all the basic information for the default system
+libraries. If new calls are added without an updated
+
+model, then they are simply assumed to call free and
+functions that call them are not optimized.
+
+The ﬁrst optimization that relies on this approach
+simply removes pointer tracking for a local variable if the
+function does not at any point call free and does not take
+the address of that local variable. We still track changes
+to pointers in global and dynamic memory, including
+copies of local variables to this memory, as well as
+dereferences of local variables that result in changes
+to pointers. This provides for signiﬁcant optimizations
+because CIL introduces many temporary variables when
+transforming programs, which simply hold intermediate
+values for complex calculations. This also allows a
+further optimization for the stack-based approach: if no
+addresses of local variables are taken, then a function
+cannot return a pointer to it’s local stack frame, allowing
+us to remove the labelling and invalidating calls for that
+function.
+
+A second optimization is to introduce loop optimiza-
+tion. If no function calls that free memory are performed
+in a loop and there are no unexpected exits out of the
+loop (i.e., no return statements), then the registration
+for simple pointer assignments (i.e., where there is no
+arithmetic or dereferencing on the left hand side value)
+is moved outside of the loop. Statements that use this
+pointer value will still be tracked, but since the pointer
+is overwritten every loop iteration, it is only tracked when
+the loop ends since it can’t become stale in the loop.
+
+Both these approaches are safe, because there can be
+no releasing of memory due to a lack of function calls
+that call free() in the respective optimized scopes.
+
+A few other optimizations include the fact pointers
+that are set to point to global memory are not tracked
+because this memory can never be freed2. We also
+do not update pointer information when simple pointer
+arithmetic occurs that simply changes the value of the
+base pointer (e.g., p++;) , given that we assume that
+memory stays within bounds as discussed in Section
+III-E.
+
+V. EVALUATION
+
+In this section we evaluate how FreeSentry performs
+in terms of performance overhead. We also provide
+a security evaluation and discussion, showing that the
+mitigation is able to prevent exploitation of real-world
+
+2A rare vulnerability can occur when a module is unloaded, as
+
+evidenced by CVE-2010-0425[6]
+
+8
+
+Table I.
+
+SECURITY EVALUATION AGAINST REAL WORLD VULNERABILITIES
+
+CVE id
+
+CVE-2003-0015
+CVE-2004-0416
+CVE-2007-1521
+CVE-2007-1522
+CVE-2007-1711
+
+Affected Programs
+CVS <= 1.1.14
+
+CVS 1.12.x-1.12.8 and 1.11.x-1.11.16
+PHP before 4.4.7 and 5.x before 5.2.2
+
+PHP 5.2.0 and 5.2.1
+PHP 4.4.5 and 4.4.6
+
+Result
+
+Protected
+Protected
+Protected
+Protected
+Protected
+
+B. Security Evaluation
+
+1) Perlbmk vulnerability: Perlbmk is one of the pro-
+grams that makes up the SPEC CPU2000 benchmark
+suite. It is a stripped down version of the Perl interpreter
+that removes many operating system speciﬁc functions
+and aims to create a version of Perl aimed speciﬁcally
+at CPU benchmarking.
+
+In the function yy lex() in the ﬁle toke.c, the program
+implements lexical analysis for Perl programs. While
+running the benchmark’s reference load, the program
+exhibits a use-after-free vulnerability.
+
+Listing 4. Perlbmk use-after-free vulnerability
+
+d = s ;
+i f
+
+( P L l e x s t a t e == LEX NORMAL)
+
+s = s k i p s p a c e ( s ) ;
+
+i f
+
+( P L l e x s t a t e == LEX NORMAL
+&& isSPACE (∗ d ) ) {
+
+2576
+
+2578
+
+2618
+
+The relevant code snippets are duplicated in Listing
+4. At line 2576, d aliases pointer s. Then at line 2578,
+the function skipspace() is called. This function will,
+depending on the program state, end up calling realloc()
+on the memory pointed to by s to increase the size to
+allow for a larger line of text to be read into memory.
+When the realloc() in question is called using the refer-
+ence load provided by the SPEC CPU2000 benchmark,
+the memory will be allocated at a different
+location
+and the data will be copied. When this happens, all
+references to the memory that s refers to are invalidated
+by our mitigation. This includes the pointer d. When d is
+dereferenced at line 2617, the program crashes because
+it refers to freed memory. To be able to measure the
+performance overhead of perlbmk, we ﬁxed the program
+using the least intrusive method by recording the value
+of isSPACE(*d) in a variable at line 2577 and then using
+this variable in the comparison at
+line 2617. Fixing
+this vulnerability resulted in no further crashes in the
+program.
+
+2) Real world vulnerabilities:
+
+In this section we
+evaluate our mitigation against vulnerabilities that were
+
+found against real world applications. We selected the
+vulnerabilities solely on the availability of public proof-
+of-concept exploits (POCs). This limited our selection to
+5 vulnerabilities.
+
+The results of running these POCs against our mit-
+igation are presented in Table I: a value of “protected”
+means that the attempted use-after-free was prevented
+and the program crashed trying to dereference an inval-
+idated pointer (i.e. dereferencing a pointer to memory
+above 3GB in our implementation). The programs oper-
+ated normally when not running the exploit. The focus
+in Table I is on double free vulnerabilities as these are
+the vulnerabilities for which public exploits are available.
+While many other use-after-free vulnerabilities have been
+discovered in C programs, there are very few with public
+exploits for open source C programs. For mitigations
+that provide a safer memory allocator, a double free
+vulnerability is the easiest type of vulnerability to detect:
+simply mark a chunk as free and check if it is free before
+performing a second free operation. However, for our
+mitigation with its focus on pointer tracking, double free
+vulnerabilities are the exact same thing as a use-after-free
+vulnerability as they both result from a dangling pointer
+reference. In the case of a double free, the dereference
+on the dangling pointer occurs during the free operation
+(where we do not perform any extra checks with respect
+to double frees), while in the general use-after-free case,
+the dereference occurs in another operation. Given that
+both types of vulnerabilities require dereferencing the
+pointer, the double frees tested here provide the exact
+same information about our mitigation as a more general
+use-after-free vulnerability.
+
+Finally, a vulnerability [9] was privately reported
+by Damien Millescamps to the ClamAV team, which
+would trigger a use-after-free in version 0.98.4 of the
+software when scanning a maliciously crafted PE binary.
+The reporter provided a proof-of-concept binary that
+would trigger the vulnerability. Compiling ClamAV with
+FreeSentry resulted in the program crashing trying to
+access an invalid pointer as soon as the free memory
+is accessed, preventing exploitation of this vulnerability.
+
+11
+
+VI. RELATED WORK
+
+A typical approach to preventing use-after-free vul-
+nerabilities is to use garbage collection. However this
+does not deallocate memory instantaneously, but defers
+this to a scheduled time interval or till memory con-
+straints require it to be collected. When garbage collec-
+tion is done, only memory to which no references exist
+anymore is deallocated, preventing pointers from refer-
+ring to deallocated memory [10]. However, C programs
+will generally not clear all pointers to a memory location
+when they free that location. As such, using garbage
+collection without modifying the program could result in
+the program using an unacceptable amount of memory. It
+also requires abandoning potentially customized memory
+allocators and using the garbage collector instead.
+
+Dhurjati and Adve [11] propose a mitigation that
+protects against dangling pointers by ensuring that a new
+virtual page is used for every allocation of the program.
+To conserve memory this new virtual page is mapped
+onto the same physical page as the original allocation.
+This allows the mitigation to prevent stale pointers from
+using the memory, but also reduces memory overhead by
+reusing the original allocation. While the approach also
+has a low overhead for UNIX servers, it suffers from
+a signiﬁcant slowdown when used with programs that
+perform frequent memory allocations.
+
+Cling [12] is a memory allocator that is designed
+to prevent attacks against use-after-free vulnerabilities
+by making them harder to exploit. The overhead for
+the approach is very low, but some of the performance
+improvements and slowdowns are achieved due to the
+fact that a different memory allocator is used, which
+makes it harder to compare overhead completely. Cling
+does not eliminate the use-after-free problem entirely. It
+only allows address space reuse for freed objects among
+objects of the same type. However, while it constraints
+exploitation vectors, it does not really solve all issues
+introduced by dangling pointers if the program’s control
+ﬂow makes it hard to guess the object type being allo-
+cated. It also does not support protection against dangling
+pointers that refer to memory on the stack.
+
+Undangle [13] is another mitigation that prevents use-
+after-free vulnerabilities. Like Cling, it does not require
+source code. It works by using taint tracking to track
+how pointers are copied to other pointers. When memory
+is destroyed, it can then see what pointers still point
+to the memory location. It can report all the dangling
+pointers that point to a particular memory location at a
+
+given set in time and allows a user to specify a window
+when to report these ﬁndings, allowing it to be used as a
+bug tracking tool, but which can result in false positives.
+Due to the very high performance overhead, the approach
+is not really practical for deployment use and relies on
+execution traces to perform analysis.
+
+CETS [8] provides a compile-time approach to protect
+against dangling pointers in C. It does this by maintaining
+a unique identiﬁer with each object and then associates
+the identiﬁer with a pointer when the pointer is set to
+point to the object. Whenever a pointer is dereferenced,
+the mitigation checks if the pointer’s unique identiﬁer is
+still allocated. CETS achieves a mean overhead of 48%
+for the programs measured. However, due to a lack of
+robustness in their prototype implementation, a number
+of the more complex SPEC CPU benchmarks were not
+able to compile with their approach. If we compare the 14
+benchmarks that overlap between both studies, the mean
+overhead for CETS for these benchmarks is around 48%,
+while FreeSentry has an overhead of around 29% with
+stack protection enabled and 12% with only dynamic
+memory protection enabled. CETS does not have the
+option of enabling only dynamic memory protection. Due
+to the lack of complex benchmarks supported by CETS
+it is also unclear if there would be an additional impact
+on performance for the regular benchmarks when adding
+support for these more complex programs.
+
+DieHard [14] is a memory allocator that is designed
+to probabilistically tolerate errors including buffer over-
+ﬂows and dangling pointers. It does randomized allo-
+cation within a heap of a particular size, meaning that
+chunks of memory are allocated at random locations
+within this memory area. To prevent use-after-free at-
+tacks, it also randomizes the reuse of chunks. DieHarder
+[15] extends this approach by improving randomization
+which makes exploitation harder, but attackers who can
+control allocations (such as an attacker using JavaScript),
+could still simply allocate memory until their desired
+chunk is reused. DieHarder has a comparable geometric
+mean performance overhead to FreeSentry: DieHarder
+has an overhead of around 30% when compared to
+dlmalloc 2.7.
+
+SAFEDISPATCH [16], VTGuard [17] and VTV [18]
+are three approaches that protect against the most widely
+used technique to exploit use-after-free vulnerabilities:
+overwriting virtual table pointers. These types of pointers
+are used in C++ objects to be able to support dynamic
+dispatching, so that the virtual method to execute for
+
+12
+
+the desired class can be decided at run-time. These ap-
+proaches focus speciﬁcally on protecting these tables and
+thus their overhead is very low. However, if an attacker
+does not target the virtual table pointer, but instead targets
+a pointer within an object (such as the vulnerability
+discussed in Section II) then these mitigations would not
+be effective.
+
+There are also a number of other approaches that com-
+bine bounds checking and dangling pointer mitigation.
+
+Safe C [19] is a bounds checker for C that also
+provides protection against dangling pointers. It deﬁnes a
+kind of safe pointer that contains the following attributes:
+value, pointer base, size, storage class (heap,
+local,
+global) and capability (forever, never). The value attribute
+is the actual pointer, the base and size attributes are used
+for spatial check while the storage class and capability
+attributes are used for temporal checks. However the
+pointer representation is changed, resulting in an incom-
+patibility with existing code. The added checks also have
+a signiﬁcant impact on performance.
+
+Clause et al. [20] developed a dynamic taint tool
+that checks for both spatial and temporal errors for
+dynamically allocated memory. It works by assigning
+taint marks to objects and assigning the same taint mark
+to pointers to these objects. The taint marks for pointers
+are then propagated and transformed through the program
+whenever an operation (such as arithmetic) on a pointer
+occurs. When the pointer is dereferenced, the taint mark
+for the pointer is compared to the taint mark of the
+object. If the taint marks differ then a memory error
+has occurred. The approach discussed by Clause at al.
+works on binaries rather than source code, but requires
+hardware assistance to be able to efﬁciently check and
+propagate the taint marks.
+
+Fail-safe C [21] is a compiler that
+
+implements a
+memory safe version of the ANSI C standard. It does
+this using a number of techniques: fat pointers and inte-
+gers (because pointers can be cast to integers and back
+again) for bounds checking, keeping track of runtime
+type information, garbage collection to prevent dangling
+pointers, etc. The overhead of this approach is, however,
+signiﬁcant. The programs in the ByteMARK benchmark
+were slowed down by two to four times on average.
+
+Xu et al. [22] track metadata that they associate with
+pointers to provide checks for both spatial and temporal
+errors and ﬂags the spatial or bounds errors when a
+pointer is dereferenced. As with the previous approach,
+
+the overhead is signiﬁcant, on average the benchmarks
+reported in the paper were slowed down up to two times.
+
+Safe languages are languages where it is generally not
+possible for any known memory corruption vulnerability
+to exist as the language constructs prevent them from
+occurring. A number of safe languages are available that
+will prevent these kinds of implementation vulnerabilities
+entirely. There are safe languages [23], [24], [25], [26],
+[27], [28] that remain as close to C or C++ as possible,
+these are generally referred to as safe dialects of C. While
+some safe languages [29] try to stay more compatible
+with existing C programs, use of these languages may
+not always be practical for existing applications due to
+the effort required to transform a project to adhere to the
+syntactical changes imposed by these languages.
+
+VII. FUTURE WORK
+
+While this approach focuses speciﬁcally on prevent-
+ing and measuring the technique to provide protection
+against use-after-free vulnerabilities, the approach can
+be extended to include bounds checking techniques that
+perform bounds checking using the available bounds
+information [3] for a modest increase in performance.
+While both the FreeSentry and bounds checking mitiga-
+tions have non-trivial overhead, their combination should
+keep the overhead relatively close to the numbers of the
+worst performing technique, since processing for both
+techniques occurs during pointer creation and modiﬁca-
+tion and not when the pointer is accessed.
+
+VIII. CONCLUSION
+
+There are many widely deployed mitigations, includ-
+ing stack cookies and address space layout randomiza-
+tion that are present in many of the current compilers
+and operating systems. However,
+there are currently
+no widely deployed mitigations that prevent use-after-
+free vulnerabilities. This has resulted in use-after-free
+vulnerability becoming the most exploited type of vulner-
+abilities on Windows operating systems. In this paper, we
+presented FreeSentry, a mitigation which is transparent
+to an unwitting programmer allowing easy deployment
+to provide protection, but also provides the ﬂexibility to
+allow programmers who are aware of the mitigation to
+optimize their interaction with it. This allows us to offer
+a more focused protection, which allows a more com-
+plicated mitigation to be applied, with a lower measured
+overhead than the ones that are currently deployed. Our
+performance overhead is moderate for CPU-intensive
+
+13
+
+programs, while for programs that have high I/O it has
+no impact on performance, allowing it to be deployed
+as-is for server applications that rely on heavy I/O. In
+environments where security is of paramount importance,
+this type of mitigation can signiﬁcantly improve security
+at a modest cost.
+
+ACKNOWLEDGEMENTS
+
+The author would like to thank Matthew Watchinski,
+Richard B. Johnson, David Sufﬂing, David A. Raynor,
+Jason V. Miller, Miet Loubele, Aaron Adams and Donato
+Ferrante for their insightful comments during the devel-
+opment of the mitigation. The author would also like to
+thank Juan Caballero for his help as shepherd for this
+paper and the anonymous reviewers for their comments
+and suggestions.
+
+REFERENCES
+
+[1] Y. Younan, W. Joosen, and F. Piessens, “Runtime countermea-
+sures for code injection attacks against c and c++ programs,”
+ACM Computing Surveys, vol. 44, no. 3, Jun. 2012.
+
+[2] S. S. Nagaraju, C. Craioveanu, E. Florio, and M. Miller,
+“Software vulnerability exploitation trends”,” Microsoft, Tech.
+Rep., 2013.
+
+[3] Y. Younan, P. Philippaerts, L. Cavallaro, R. Sekar, F. Piessens,
+and W. Joosen, “PAriCheck: an efﬁcient pointer arithmetic
+checker for C programs,” in ACM Symposium on Information,
+Computer and Communications Security, April 2010.
+
+[4] CVE-2009-0749, “Use-after-free vulnerability in the gifread-
+nextextension function in lib/pngxtern/gif/gifread.c in optipng
+0.6.2.”
+
+[5] G. C. Necula, S. McPeak, S. P. Rahul, and W. Weimer, “CIL:
+Intermediate language and tools for analysis and transformation
+of C programs,” in Proceedings of the Conference on Compiler
+Construction (CC’02), ser. Lecture Notes in Computer Science,
+vol. 2304, Grenoble, France, Mar. 2002, pp. 213–228.
+[6] CVE-2010-0425, “Apache mod isapi dangling pointer.”
+[7] P. Akritidis, M. Costa, M. Castro, and S. Hand, “Baggy
+bounds checking: An efﬁcient and backwards-compatible de-
+fense against out-of-bounds errors,” in Proceedings of the 18th
+USENIX Security Symposium, Montreal, QC, Aug. 2009.
+
+[8] S. Nagarakatte, J. Zhao, M. M. K. Martin, and S. Zdancewic,
+“Cets: Compiler enforced temporal safety for c,” in Proceed-
+ings of the International Conference on Memory Management
+(ISMM 2010), Jun. 2010.
+
+[9] CVE-2014-9050,
+
+“Heap-based
+
+the
+cli scanpe function in libclamav/pe.c in clamav before 0.95.4
+allows remote attackers to cause a denial of service (crash)
+via a crafted y0da crypter pe ﬁle.”
+
+overﬂow in
+
+buffer
+
+[11] D. Dhurjati and V. Adve, “Efﬁciently detecting all dangling
+pointer uses in production servers,” in Proceedings of the In-
+ternational Conference on Dependable Systems and Networks.
+Philadelphia, Pennsylvania,: IEEE Computer Society, 2006, pp.
+269–280.
+
+[13]
+
+[12] P. Akritidis, “Cling: A memory allocator to mitigate dangling
+pointers,” in Proceedings of the 19th USENIX Security Sympo-
+sium. USENIX Association, 2010.
+J. Caballero, G. Grieco, M. Marron, and A. Nappa, “Undangle:
+early detection of dangling pointers in use-after-free and double
+free vulnerabilities,” in Proceedings of the 2012 International
+Symposium on Software Testing and Analysis. ACM Press,
+2012, pp. 133–143.
+
+[14] E. D. Berger and B. G. Zorn, “Diehard: probabilistic memory
+safety for unsafe languages,” in Proceedings of the 2006 con-
+ference on Programming language design and implementation.
+Ottawa, ON: ACM Press, 2006, pp. 158–168.
+
+[15] G. Novak and E. D. Berger, “Dieharder: Securing the heap,”
+in Proceedings of the 17th ACM Conference on Computer and
+Communications Security, 2010.
+
+[16] D. Jang, Z. Tatlock, and S. Lerner, “SAFEDISPATCH: Se-
+curing c++ virtual calls from memory corruption attacks,” in
+Proceedings of the Network and Distributed System Security
+Symposium (NDSS), San Diego, CA, 2014.
+
+[17] K. Johnson and M. Miller, “Exploit mitigation in Windows 8,”
+
+in Blackhat USA, Las Vegas, NV, 2012.
+
+[18] C. Tice, T. Roeder, P. Collingbourne, S. Checkoway, U. Er-
+lingsson, L. Lozano, and G. Pike, “Enforcing forward-edge
+control-ﬂow integrity in GCC & LLVM,” in Proceedings of
+the 23rd USENIX Security Symposium, San Diego, CA, 2014.
+[19] T. M. Austin, S. E. Breach, and G. S. Sohi, “Efﬁcient detection
+of all pointer and array access errors,” in Proceedings of the
+Conference on Programming Language Design and Implemen-
+tation, Orlando, FL, Jun. 1994, pp. 290–301.
+J. Clause, I. Doudalis, A. Orso, and M. Prvulovic, “Effective
+memory protection using dynamic tainting,” in Proceedings
+of
+the 22nd IEEE and ACM International Conference on
+Automated Software Engineering (ASE 2007), Atlanta, GA,
+Nov. 2007, pp. 284–292.
+
+[20]
+
+[21] Y. Oiwa, “Implementation of the memory-safe full ansi-c
+compiler,” in Proceedings of the Conference on Programming
+Language Design and Implementation, Dublin, Ireland, Jun.
+2009, pp. 259–269.
+
+[22] W. Xu, D. C. DuVarney, and R. Sekar, “An Efﬁcient and
+Backwards-Compatible Transformation to Ensure Memory
+Safety of C Programs,” in Proceedings of
+the 12th ACM
+SIGSOFT International Symposium on Foundations of Software
+Engineering, Newport Beach, CA, October 2004, pp. 117–126.
+[23] T. Jim, G. Morrisett, D. Grossman, M. Hicks, J. Cheney, and
+Y. Wang, “Cyclone: A safe dialect of C,” in USENIX Annual
+Technical Conference, Monterey, CA, Jun. 2002, pp. 275–288.
+[24] D. Grossman, G. Morrisett, T. Jim, M. Hicks, Y. Wang, and
+J. Cheney, “Region-based memory management in Cyclone,”
+in Proceedings of the Conference on Programming Language
+Design and Implementation, Berlin, Germany, Jun. 2002, pp.
+282–293.
+
+[10] H. Boehm and M. Weiser, “Garbage collection in an uncooper-
+ative environment,” Software, Practice and Experience, vol. 18,
+no. 9, pp. 807–820, September 1988.
+
+[25] G. Necula, S. McPeak, and W. Weimer, “CCured: Type-safe
+retroﬁtting of legacy code,” in Conference Record of POPL
+2002: The 29th SIGPLAN-SIGACT Symposium on Principles
+
+14
+
+[26]
+
+of Programming Languages, Portland, OR, Jan. 2002, pp. 128–
+139.
+J. R. Larus, T. Ball, M. Das, R. DeLine, M. F¨ahndrich,
+J. Pincus, S. K. Rajamani, and R. Venkatapathy, “Righting
+software,” IEEE Software, vol. 21, no. 3, pp. 92–100, May
+2004.
+
+[27] D. Dhurjati, S. Kowshik, V. Adve, and C. Lattner, “Mem-
+ory safety without runtime checks or garbage collection,” in
+Proceedings of the 2003 Conference on Language, Compiler,
+and Tool Support for Embedded Systems, San Diego, CA, Jun.
+2003, pp. 69–80.
+
+[28] S. Kowshik, D. Dhurjati, and V. Adve, “Ensuring code safety
+without runtime checks for real-time control systems,” in
+Proceedings of
+the International Conference on Compilers
+Architecture and Synthesis for Embedded Systems, Grenoble,
+France, Oct. 2002, pp. 288–297.
+J. Condit, M. Harren, S. McPeak, G. C. Necula, and
+W. Weimer, “CCured in the real world,” in Proceedings of the
+Conference on Programming Language Design and Implemen-
+tation, San Diego, CA, 2003, pp. 232–244.
+
+[29]
+
+15
+
+

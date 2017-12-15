@@ -1,0 +1,2142 @@
+The Pythia PRF Service
+
+Adam Everspaugh and Rahul Chaterjee, University of Wisconsin—Madison;  
+
+Samuel Scott, University of London; Ari Juels and Thomas Ristenpart, Cornell Tech
+
+https://www.usenix.org/conference/usenixsecurity15/technical-sessions/presentation/everspaugh
+
+This paper is included in the Proceedings of the 24th USENIX Security SymposiumAugust 12–14, 2015 • Washington, D.C.ISBN 978-1-931971-232Open access to the Proceedings of  the 24th USENIX Security Symposium is sponsored by USENIXThe Pythia PRF Service
+
+Adam Everspaugh(cid:31), Rahul Chatterjee(cid:31), Samuel Scott(cid:31)(cid:31), Ari Juels†, and Thomas Ristenpart‡
+
+(cid:31)University of Wisconsin–Madison, {ace,rchat}@cs.wisc.edu
+
+(cid:31)(cid:31)Royal Holloway, University of London, sam.scott.2012@live.rhul.ac.uk
+
+†Jacobs Institute, Cornell Tech, juels@cornell.edu
+
+‡Cornell Tech, ristenpart@cornell.edu
+
+Abstract
+cryptographic
+
+services
+
+such
+
+Conventional
+
+as
+hardware-security modules and software-based key-
+management systems offer
+the ability to apply a
+pseudorandom function (PRF) such as HMAC to inputs
+of a client’s choosing. These services are used, for
+example,
+to harden stored password hashes against
+ofﬂine brute-force attacks.
+
+We propose a modern PRF service called PYTHIA de-
+signed to offer a level of ﬂexibility, security, and ease-
+of-deployability lacking in prior approaches. The key-
+stone of PYTHIA is a new cryptographic primitive called
+a veriﬁable partially-oblivious PRF that reveals a por-
+tion of an input message to the service but hides the
+rest. We give a construction that additionally supports
+efﬁcient bulk rotation of previously obtained PRF val-
+ues to new keys. Performance measurements show that
+our construction, which relies on bilinear pairings and
+zero-knowledge proofs, is highly practical. We also give
+accompanying formal deﬁnitions and proofs of security.
+We implement PYTHIA as a multi-tenant, scalable
+PRF service that can scale up to hundreds of millions
+of distinct client applications on commodity systems. In
+our prototype implementation, query latencies are 15 ms
+in local-area settings and throughput is within a factor
+of two of a standard HTTPS server. We further report
+on implementations of two applications using PYTHIA,
+showing how to bring its security beneﬁts to a new en-
+terprise password storage system and a new brainwallet
+system for Bitcoin.
+
+1
+
+Introduction
+
+Security improves in a number of settings when appli-
+cations can make use of a cryptographic key stored on
+a remote system. As an important example, consider
+the compromise of enterprise password databases. Best
+practice dictates that passwords be hashed and salted be-
+
+fore storage, but attackers can still mount highly effective
+brute-force cracking attacks against stolen databases.
+
+Well-resourced enterprises such as Facebook [38]
+have therefore incorporated remote cryptographic oper-
+ations to harden password databases. Before a password
+is stored or veriﬁed, it is sent to a PRF service external
+to the database. The PRF service applies a cryptographic
+function such as HMAC to client-selected inputs under
+a service-held secret key. Barring compromise of the
+PRF service, its use ensures that stolen password hashes
+(due to web server compromise) cannot be cracked using
+an ofﬂine brute-force attack: an attacker must query the
+PRF service from a compromised server for each pass-
+word guess. Such online cracking attempts can be mon-
+itored for anomalous volumes or patterns of access and
+throttled as needed.
+
+While PRF services offer compelling security im-
+provements, they are not without problems. Even large
+organizations can implement them incorrectly. For ex-
+ample, Adobe hardened passwords using 3DES but in
+ECB mode instead of CBC-MAC (or another secure PRF
+construction) [23], a poor choice that resulted in disclo-
+sure of many of its customers’ passwords after a breach.
+Perhaps more fundamental is that existing PRF services
+do not offer graceful remediation if a compromise is de-
+tected by a client. Ideally it should be possible to cryp-
+tographically erase (i.e., render useless via key deletion)
+any PRF values previously used by the client, without
+requiring action by end users and without affecting other
+clients. In general, PRF services are so inaccessible and
+cumbersome today that their use is unfortunately rare.
+
+In this paper, we present a next-generation PRF ser-
+vice called PYTHIA to democratize cryptographic hard-
+ening. PYTHIA can be deployed within an enterprise to
+solve the issues mentioned above, but also as a public,
+multi-tenant web service suitable for use by any type of
+organization or even individuals. PYTHIA offers several
+security features absent in today’s conventional PRF ser-
+vices that are critical to achieving the scaling and ﬂexibil-
+
+USENIX Association  
+
+24th USENIX Security Symposium  547
+
+1
+
+ity required to simultaneously support a variety of clients
+and applications. As we now explain, achieving these
+features necessitated innovations in both cryptographic
+primitive design and system architecture.
+
+Key features and challenges. We refer to an entity us-
+ing PYTHIA as a client. For example, a client might be
+a web server that performs password-based authentica-
+tion for all of its end users. Intuitively, PYTHIA allows
+such a client to query the service and obtain the PRF out-
+put Y = Fk(t, m) for a message m and a tweak t of the
+client’s choosing under a client-speciﬁc secret key k held
+by the service. Here, the tweak t is typically a unique
+identiﬁer for an end user (e.g., a random salt).
+In our
+running password storage example, the web server stores
+Y in a database to authenticate subsequent logins.
+
+PYTHIA offers security features that at, ﬁrst glance,
+sound mutually exclusive. First, PYTHIA achieves mes-
+sage privacy for m while requiring clients to reveal t to
+the server. Message privacy ensures that the PRF ser-
+vice obtains no information about the message m; in our
+password-storage example, m is a user’s password. At
+the same time, though, by revealing t to the PRF ser-
+vice, the service can perform ﬁne-grained monitoring of
+related requests: a high volume or otherwise anomalous
+pattern of queries on the same t would in our running ex-
+ample be indicative of an ongoing brute-force attack and
+might trigger throttling by the PRF service.
+
+By using a unique secret key k for each client, PYTHIA
+supports individual key rotation should the value Y be
+stolen (or feared to be stolen). With traditional PRF
+services and password storage, such key rotation is a
+headache, and in many settings impractical, because it
+requires transitioning stored values Y1, . . . , Yn (one for
+each user account) to a new PRF key. The only way to
+do so previously was to have all n users re-enter or reset
+their passwords. In contrast, the new primitive employed
+for Fk in PYTHIA supports fast key rotation: the server
+can erase k, replace it with a new key k(cid:31), and issue a
+compact (constant-sized) token with which the client can
+quickly update all of its PRF outputs. This feature also
+enables forward-security in the sense that the client can
+proactively rotate k without disrupting its operation.
+
+PYTHIA provides other features as well, but we defer
+their discussion to Section 2. Already, those listed above
+surface some of the challenging cryptographic tensions
+that PYTHIA resolves. For example, the most obvious
+primitive on which to base PYTHIA is an oblivious PRF
+(OPRF) [27], which provides message privacy. But for
+rate-limiting, PYTHIA requires clients to reveal t, and ex-
+isting OPRFs cannot hide only a portion of a PRF input.
+Additionally, the most efﬁcient OPRFs (c.f., [28]) are not
+amenable to key rotation. We discuss at length other re-
+
+lated concepts (of which there are many) in Section 7.
+Partially-oblivious PRFs. We introduce partially
+oblivious PRFs (PO-PRFs) to rectify the above ten-
+sion between ﬁne-grained key management and bulk key
+management and achieve a primitive that supports batch
+key rotation. We give a PO-PRF protocol in the random
+oracle model (ROM) similar to the core of the identity-
+based non-interactive key exchange protocol of Sakai,
+Ohgishi, and Kasahara [44]. This same construction
+was also considered as a left-or-right constrained PRF
+by Boneh and Waters [13]. That said, the functional-
+ity achieved by our PO-PRF is distinct from these prior
+works and new security analyses are required. Despite
+relying on pairings, we show that the full primitive is fast
+even in our prototype implementation.
+
+In addition to a lack of well-matched cryptographic
+primitives, we ﬁnd no supporting formal deﬁnitions that
+can be adapted for veriﬁable PO-PRFs. (Brieﬂy, previous
+deﬁnitions and proofs for fast OPRFs rely on hashing in
+the ROM before outputting a value [16, 28]; in our set-
+ting, hashing breaks key rotation.) We propose a new as-
+sumption (a one-more bilinear decisional Difﬁe-Hellman
+assumption), give suitable security deﬁnitions, and prove
+the security of the core primitive in PYTHIA under these
+deﬁnitions (in the appendix; complete results in [25]).
+Our new deﬁnitions and technical approaches may be of
+independent interest.
+Using PYTHIA in applications.
+We implement
+PYTHIA and show that it offers highly practical per-
+formance on Amazon EC2 instances. Our experiments
+demonstrate that PYTHIA is practical to deploy using off-
+the-shelf components, with combined computation cost
+of client and server under 12 milliseconds. A single
+8-core virtualized server can comfortably support over
+1,000 requests per second, which is already within a fac-
+tor of two of a standard HTTPS server in the same con-
+ﬁguration.
+(Our PYTHIA implementation performs all
+communication over TLS.) We discuss scaling to han-
+dle more trafﬁc volume in the body; it is straightforward
+given current techniques.
+
+We demonstrate the beneﬁts and practicality of
+PYTHIA for use in a diverse set of applications. First is
+our running example above: we build a new password-
+database system using a password “onion” that com-
+bines parallelized calls to PYTHIA and a conventional
+key hashing mechanism. Our onion supports PYTHIA
+key rotation, hides back-end latency to PYTHIA during
+logins (which is particularly important when accessing
+PYTHIA as a remote third-party service), and achieves
+high security in a number of compromise scenarios.
+
+Finally, we show that PYTHIA provides valuable fea-
+tures for different settings apart from enterprise pass-
+word storage. We implement a client that hardens a type
+
+548  24th USENIX Security Symposium 
+
+USENIX Association
+
+2
+
+USENIX Association  
+
+24th USENIX Security Symposium  549
+
+Figure1:DiagramofPRFderivationsenabledbyPYTHIA.Everythinginsidethelargeboxisoperatedbytheserver,whichonlylearnstweaksandnottheshadedmessages.ofpassword-protectedvirtual-currencyaccountcalleda“brainwallet”[14];useofPYTHIAherepreventsofﬂinebrute-forceattacksofthetypethathavebeencommoninBitcoin.OurprototypeimplementationofPYTHIAisbuiltwithopen-sourcecomponentsanditselfisopen-source.WehavealsoreleasedAmazonEC2imagestoallowcom-panies,individuals,andresearcherstospin-upPYTHIAinstancesforexperimentation.2OverviewandChallengesWenowgiveahigh-leveloverviewofPYTHIA,themoti-vationsforitsfeatures,whatpriorapproachesweinves-tigated,andthethreatmodelsweassume.Firstweﬁxsometerminologyandahigh-levelconceptualviewofwhataPRFservicewouldideallyprovide.Theserviceisprovisionedwithamastersecretkeymsk.Thiswillbeusedtobuildatreethatrepresentsderivedsub-keysand,ﬁnally,outputvalues.SeeFigure1,whichdepictsanexamplederivationtreeassociatedwithPYTHIAaswellaswhichportionsofthetreeareheldbytheserver(withinthelargebox)andwhichareheldbytheclient(theleaves).Keysofvariouskindsaredenotedbycir-clesandinputsbysquares.Fromthemskwederiveanumberofensemblekeys.Eachensemblekeyisusedbyaclientforasetofre-latedPRFinvocations—theensemblekeysgiverisetoisolatedPRFinstances.WelabeleachensemblekeyinthediagrambyK[w].Herewindicatesaclient-chosenensembleselector.Anensemblepre-keyK[w]isalargerandomvaluechosenandheldbytheserver.To-gether,mskandK[w]areusedtoderivetheensemblekeykw=HMAC(msk,K[w]).Atableisnecessarytosup-portcryptographicerasureof(orupdatesto)individualensemblekeys,whichamountstodeleting(orupdating)atableentry.EachensemblekeycanbeusedtoobtainPRFoutputsoftheformFkw(t,m)whereFisa(to-be-deﬁned)PRFkeyedbykw,andtheinputissplitintotwoparts.Wecalltatweakfollowing[30]andmthemessage.Look-ingaheadtwillbemadepublictoPYTHIAwhilemwillbeprivate.ThisisindicatedbytheshadingofthePRFoutputboxesintheﬁgure.Deploymentscenarios.Tomotivateourdesignchoicesandsecuritygoals,werelayseveralenvisioneddeploy-mentscenariosforPYTHIA.Enterprisedeployment:AsingleenterprisecandeployPYTHIAinternally,givingqueryaccessonlytoothersys-temstheycontrol.AtypicalsetupisthatPYTHIAﬁeldsqueriesfromwebserversandotherpublic-facingsys-temsthatare,unfortunately,athighriskofcompromise.PRFqueriestoPYTHIAhardenvaluesstoredonthesevulnerableservers.Thisisparticularlysuitedtostoringcheck-valuesforpasswordsorotherlow-entropyauthen-ticationtokens,whereonecanstoreFkw(t,m)wheretisarandomlychosen,per-useridentiﬁer(asalt)andmisthelow-entropypasswordorauthenticationtoken.HerewcanbedistinctforeachserverusingPYTHIA.Publiccloudservice:ApubliccloudsuchasAma-zonEC2,GoogleComputeEngine,orMicrosoftAzurecandeployPYTHIAasaninternal,multi-tenantservicefortheircustomers.Multi-tenantheremeansthatdiffer-entcustomersquerythesamePYTHIAservice,andthecloudprovidermanagestheservice,ensemblepre-keytable,etc.ThisenablessmallerorganizationstoobtainthebeneﬁtsofusingPYTHIAforothercloudproperties(e.g.,webserversrunningonvirtualmachineinstances)whileleavingmanagementofPYTHIAitselftoexperts.PublicInternetservice:OnecantakethepubliccloudservicedeploymenttotheextremeandrunPYTHIAin-stancesthatcanbeusedfromanywhereontheInternet.Thisraisesadditionalperformanceconcerns,asonecan-notrelyonfastintra-datacenternetworklatencies(sub-millisecond)butratheronwide-arealatencies(tensofmilliseconds).ThebeneﬁtisthatPYTHIAcouldthenbeusedbyarbitrarywebclients,forexamplewewillex-plorethisscenariointhecontextofhardeningbrainwal-letsviaPYTHIA.OnecouldtailoraPRFservicetoeachoftheseset-tings,howeveritisbettertodesignasingle,application-agnosticservicethatsupportsallofthesesettingssi-multaneously.Asingledesignpermitsreuseofopen-sourceimplementations;standardized,secure-by-defaultconﬁgurations;andsimpliﬁesthelandscapeofPRFser-vices.Securityandfunctionalitygoals.Providingasinglesuitabledesignrequiresbalancinganumberofsecurityandfunctionalitygoals.Themostobviousrequirementsareforaservicethat:provideslow-latencyprotocols3(i.e., single round-trip and amenable for implementation
+as simple web interfaces); scales to hundreds of millions
+of ensembles; and produces outputs indistinguishable
+from random values even when adversaries can query the
+service. To this list of basic requirements we add:
+• Message privacy: The PRF service must learn noth-
+ing about m. Message privacy supports clients that
+require sensitive values such as passwords to remain
+private even if the service is compromised, or to
+promote psychological acceptability in the case that
+a separate organization (e.g., a cloud provider) man-
+ages the service.
+
+• Tweak visibility: The server must learn tweak t to
+permit ﬁne-grained rate-limiting of requests.1 In the
+password storage example, a distinct tweak is as-
+signed to each user account, allowing the service to
+detect and limit guessing attempts against individ-
+ual user accounts.
+
+• Veriﬁability: A client must be able to verify that
+a PRF service has correctly computed Fkw for a
+ensemble selector w and tweak/message pair t, m.
+This ensures, after ﬁrst use of an ensemble by a
+client, that a subsequently compromised server can-
+not surreptitiously reply to PRF queries with incor-
+rect values.2
+
+must be able to provide an update token ∆w to roll
+forward PRF outputs under K[w] to become PRF
+
+• Client-requested ensemble key rotations: A client
+must be permitted to request a rotation of its en-
+semble pre-key K[w] to a new one (cid:31)K[w]. The server
+outputs under (cid:31)K[w], meaning that the PRF is key-
+
+updatable with respect to ensemble keys. Addition-
+ally, ∆w must be compact, i.e., constant in the num-
+ber of PRF invocations already performed under w.
+Clients can mandate that rotation requests be au-
+thenticated (to prevent malicious key deletion). A
+client must additionally be able to transfer an en-
+semble from one selector w to another selector w(cid:31).
+• Master secret rotations: The server must be able to
+rotate the master secret key msk with minimal im-
+pact on clients. Speciﬁcally, the PRF must be key-
+updatable with respect to the master secret key msk
+so that PRF outputs under msk can be rolled for-
+
+ward to a new master secret (cid:31)msk. When such a
+
+rotation occurs, the server must provide a compact
+update token δw for each ensemble w.
+
+1In principle, the server need only be able to link requests involv-
+ing the same t, not learn t. Explicit presentation of t is the simplest
+mechanism that satisﬁes this requirement.
+
+2This matters, for example, if an attacker compromises the commu-
+nication channel but not the server’s secrets (msk and K[w]). Such an
+attacker must not be able to convince the client that arbitrary or incor-
+rect values are correct.
+
+• Forward security: Rotation of an ensemble key or
+master secret key results in complete erasure of the
+old key and the update token.
+
+Two sets of challenges arise in designing PYTHIA.
+The ﬁrst is cryptographic. It turns out that the combi-
+nation of requirements above are not satisﬁed by any ex-
+isting protocols we could ﬁnd. Ultimately we realized
+a new type of cryptographic primitive was needed that
+proves to be a slight variant of oblivious PRFs and blind
+signatures. We discuss the new primitive, and our efﬁ-
+cient protocol realizing it, in the next section. The second
+set of challenges surrounds building a full-featured ser-
+vice that provides the core cryptographic protocol, which
+we treat in Section 4.
+
+3 Partially-oblivious PRFs
+
+We introduce the notion of a (veriﬁable) partially-
+oblivious PRF. This is a two-party protocol that allows
+the secure computation of Fkw (t, m), where F is a PRF
+with server-held key kw and t, m are the input values.
+The client can verify the correctness of Fkw (t, m) rel-
+ative to a public key associated to kw. Following our
+terminology, t is a tweak and m is a message. We say
+the PRF is partially oblivious because t is revealed to the
+server, but m is hidden from the server.
+
+Partially oblivious PRFs are closely related to, but dis-
+tinct from, a number of existing primitives. A standard
+oblivious PRF [27], or its veriﬁable version [28], would
+hide both t and m, but masking both prevents granular
+rate limiting by the server. Partially blind signatures [1]
+allow a client to obtain a signature on a similarly par-
+tially blinded input, but these signatures are randomized
+and the analysis is only for unforgeability which is insuf-
+ﬁcient for security in all of our applications.
+
+We provide more comparisons with related work in
+Section 7 and a formal deﬁnition of the new primitive in
+Appendix B. Here we will present the protocol that suf-
+ﬁces for PYTHIA. It uses an admissible bilinear pairing
+e : G1 × G2 → GT over groups G1, G2, GT of prime
+order q, and a pair of hash functions H1 : {0, 1}∗ → G1
+and H2 : {0, 1}∗ → G2 (that we will model as ran-
+dom oracles). More details on pairings are provided in
+Appendix B. A secret key kw is an element of
+p. The
+PRF F that the protocol computes is:
+
+Fkw (t, m) = e(cid:30)H1(t), H2(m)(cid:29)kw .
+
+This construction coincides with the Sakai, Ohgishi, and
+Kasahara [44] construction for non-interactive identity-
+based key exchange, where t and m would be different
+identities and kw a secret held by a trusted key authority.
+Likewise, this construction is equivalent to the left-or-
+right constrained PRF of Boneh and Waters [13]. The
+
+550  24th USENIX Security Symposium 
+
+USENIX Association
+
+4
+
+PRF-Srv (msk)
+
+PRF-Cl (w, t, m)
+r ←$
+x ← H2(m)r
+
+q
+
+w, t, x-
+
+˜x ← e(H1(t), x)
+kw ← HMAC(msk, K[w])
+pw ← gkw
+y ← ˜xkw
+π ←$ ZKP(DLg(pw) = DL˜x(y))
+
+pw, y, π
+
+If pw matches &
+π veriﬁes then
+
+Ret y1/r
+Else Ret ⊥
+
+Figure 2: The partially-oblivious PRF protocol used
+in PYTHIA. The value π is a non-interactive zero-
+knowledge proof that the indicated discrete logs match.
+The client also checks that pw matches ones seen previ-
+ously when using selector w.
+
+contexts of these prior works are distinct from ours and
+our analyses will necessarily be different, but we note
+that all three settings similarly exploit the algebraic struc-
+ture of the bilinear pairing. See Section 7 for further dis-
+cussion of related work.
+
+In our protocol,
+
+The client-server protocol that computes Fkw (t, m) in
+a partially-oblivious manner is given in Figure 2. There
+we let g be a generator of G1. We now explain how the
+protocol achieves our requirements described in the last
+section.
+Blinding the message:
+the client
+blinds the message m, hiding it from the server, by rais-
+q. As
+ing it to a randomly selected exponent r ←$
+e(cid:31)H1(t), H2(m)r(cid:30) = e(cid:31)H1(t), H2(m)(cid:30)r, the client can
+unblind the output y of PRF-Srv by raising it to 1/r. This
+protocol hides m unconditionally, as H2(m)r is a uni-
+formly random element of G2.
+Veriﬁability: The protocol enables a client to verify that
+the output of PRF-Srv is correct, assuming the client has
+previously stored pw. The server accompanies the output
+y of the PRF with a zero-knowledge proof π of correct-
+ness.
+
+Speciﬁcally, for a public key pw = gkw, where g
+is a generator of G1, the server proves DLg(pw) =
+DL˜x(y). Standard techniques (see, e.g., Camenisch and
+Stadler [17]) permit efﬁcient ZK proofs of this kind in the
+random oracle model. 3 The notable computational costs
+for the server are one pairing and one exponentiation in
+
+3Some details: The prover picks v ←$
+
+q and then computes t1 =
+gv and t2 = ˜xv and c ← H3(g, pw, ˜x, y, t1, t2). Let u = v − c· k.
+The proof is π = (c, u). The veriﬁer computes t(cid:31)1 = gu · pc
+w and
+t(cid:31)2 = ˜xuyc. It outputs true if c = H3(g, pw, ˜x, y, t(cid:31)1, t(cid:31)2).
+
+GT ; for the client, one pairing and two exponentiations
+in GT . 4
+Efﬁcient key updates: The server can quickly and
+easily update the key kw for a given ensemble selec-
+tor w by replacing the table entry s = K[w] with a
+new, randomly selected value s(cid:31), thereby changing kw =
+HMAC(msk, s) to k(cid:31)w = HMAC(msk, s(cid:31)). It can then
+transmit to the client an update token of the form ∆w =
+k(cid:31)w/kw ∈ q.
+Fkw (t, m) =e (cid:31)H1(t), H2(m)(cid:30)kw by raising it to ∆w;
+
+it is easy to see that Fkw (t, m)∆w = Fk(cid:31)w (t, m).
+
+The client can update any stored PRF value
+
+The server can use the same mechanism to update
+msk, which requires generating a new update token for
+each w and pushing these tokens to clients as needed.
+Unblinded variants. For deployments where oblivious-
+ness of messages is unnecessary, we can use a faster, un-
+blinded variant of the PYTHIA protocol that dispenses
+with pairings. The only changes are that the client sends
+m to the server, there is no unblinding of the server’s re-
+sponse, and, instead of computing
+
+the server computes
+
+˜x ← e(H1(t), x)
+
+˜x ← H3(t(cid:29) m) .
+
+All group operations in this unblinded variant are over a
+standard elliptic curve group G = (cid:28)g(cid:27) of order q and we
+use a hash function H3 : {0, 1}∗ → G.
+An alternative unblinded construction would be to
+have the server apply the Boneh-Lynn-Shacham short
+signatures [12] to the client-submitted t(cid:29) m; veriﬁcation
+of correctness can be done using the signature veriﬁca-
+tion routine, and we can thereby avoid ZKPs. This BLS
+variant may save a small amount of bandwidth.
+
+These unblinded variants provide the same services
+(veriﬁability and efﬁcient key updates) and security with
+the obvious exception of the secrecy of the message m.
+In some deployment contexts an unblinded protocol may
+be sufﬁcient, for example when the client can maintain
+state and submit a salted hash m instead of m directly.
+In this context, the salt should be held as a secret on the
+client and never sent to the server.
+
+4 The PYTHIA Service Design
+
+Figure 3 gives the high-level API exposed by PYTHIA
+to a client. We now describe its functions in terms of
+the lifecycle of an ensemble key. We assume a security
+parameter n specifying symmetric key lengths; a typical
+choice would be n = 128.
+
+4The client’s pairing can be pre-computed while waiting for the
+
+server’s reply.
+
+USENIX Association  
+
+24th USENIX Security Symposium  551
+
+5
+
+Command
+Init(w [, options])
+
+Eval(w, t, m)
+Reset(w, authtoken)
+
+GetAuth(w)
+
+Description
+Create table entry K[w] (for ensemble
+key kw)
+Return PRF output Fkw (t, m)
+Update K[w] (and thus kw); return
+update token ∆w
+Send one-time authentication token
+authtoken to client
+
+Figure 3: The basic PYTHIA API.
+
+We defer to later sections the underlying client-server
+protocols and to Appendix A details on key lifecycle
+management options, additional API calls for token man-
+agement and ensemble transfer, and a discussion of mas-
+ter secret key rotation.
+
+Ensemble initialization. To begin using the PYTHIA
+service, a client creates an ensemble key for selector w
+by invoking Init(w [, options]). PYTHIA generates a
+fresh, random table entry K[w]. Recall that ensemble
+key kw = HMAC(msk, K[w]). So Init creates kw as
+a byproduct.
+
+Ideally, w should be an unguessable byte string. (An
+easily guessed one may allow attackers to squat on a key
+selector, thereby mounting a denial-of-service (DoS) at-
+tack.) For some applications, as we explain below, this
+isn’t always possible. If an ensemble key for w already
+exists, then the PYTHIA service returns an error to the
+client. Otherwise, the client receives a message signify-
+ing that initialization is successful.
+
+Init includes a number of options we detail in Ap-
+
+pendix A.
+
+PRF evaluation. To obtain a PRF value, a client can
+perform an evaluation query Eval(w, t, m), which re-
+turns Fkw (t, m). Here t is a tweak and m is a mes-
+sage. To compute the PRF output, the client and server
+perform a one-round cryptographic protocol (meaning a
+single message from client to server, and one message
+back). We present details in Section 3, but remind the
+reader that t is visible to the server in the client-server
+protocol invoked by Eval, while m is blinded.
+
+The server rate-limits requests based on the tweak t,
+and can also raise an alert if the rate limit is exceeded.
+We give example rate limiting policies in Section 5.
+
+Ensemble-key reset. A client can request that an en-
+semble key kw be reset by invoking Reset(w). This reset
+is accomplished by overwriting K[w] with a fresh, ran-
+dom value. The name service returns a compact (e.g.,
+256-bit) update token ∆w that the client may use to up-
+date all PRF outputs for the ensemble. It stores this to-
+ken locally, encrypted under a public key speciﬁed by the
+client, as explained below.
+
+Note that reset results in erasure of the old value of kw.
+Thus a client that wishes to delete an ensemble key kw
+permanently at the end of its lifecycle can do so with a
+Reset call.
+
+Reset is an authenticated call, and thus requires the
+
+following capability.
+Authentication. To authenticate itself for API calls, the
+client must ﬁrst invoke GetAuth, which has the server
+transmit an (encrypted) authentication token authtoken
+to the client out-of-band. The token expires after a pe-
+riod of time determined by a conﬁguration parameter in
+PYTHIA. Our current implementation uses e-mail for
+this, see Appendix A for more details. Of course, in
+some deployments one may want authentication to be
+performed in other ways, such as tokens dispensed by
+administrators (for enterprise settings) or simply given
+out on a ﬁrst-come-ﬁrst-serve basis for each ensemble
+identiﬁer (for public Internet services).
+
+Implementation
+
+4.1
+We implemented a prototype PYTHIA PRF service as
+a web application accessed over HTTPS. All requests
+are ﬁrst handled by an nginx web server with uWsgi as
+the application server gateway that relays requests to a
+Django back-end. The PRF-Srv functionality is imple-
+mented as a Django module written in Python. Storage
+for the server’s key table and rate-limiting information is
+done in MongoDB.
+
+We use the Relic cryptographic library [2] (written
+in C) with our own Python wrapper. We use Barreto-
+Naehrig 254-bit prime order curves (BN-254) [4]. These
+curves provide approximately 128-bits of security.
+
+In our experiments the service is run on a single (vir-
+tual) machine, but our software stack permits compo-
+nents (web server, application sever, database) to be dis-
+tributed among multiple machines with updates to con-
+ﬁguration ﬁles.
+
+For the purpose of comparison, we implemented three
+variants of the PYTHIA service. The ﬁrst two are the un-
+blinded protocols described in Section 3. In these two
+schemes, the client sends m in the clear (possibly hashed
+with a secret salt value ﬁrst) and the server replies with
+In the ﬁrst scheme, denoted UNB,
+y = H1(t(cid:31) m)k.
+1 and a zero-knowledge proof
+the server provides p = gk
+where g1 is a generator of G1. The second scheme, de-
+noted BLS, uses a BLS signature for veriﬁcation. The
+server provides p = gk
+2 where g2 is a generator of G2 and
+the client veriﬁes the response by computing and com-
+paring the values: e(y, g2) = e(H1(t(cid:31) m), p).
+
+Our partially-oblivious scheme is denoted PO.
+For the evaluation below we use a Python client im-
+plementing PRF-Cl for all three schemes using the same
+
+552  24th USENIX Security Symposium 
+
+USENIX Association
+
+6
+
+Group Group Op
+5.7
+6.7
+9.8
+
+G1
+G2
+GT
+
+Time (µs)
+
+Exp
+175
+572
+1145
+
+Hashing
+77
+210
+–
+
+pairing operation (e) takes 1005 µs
+
+Figure 4: Time taken by each operation in BN-254
+groups. Hashing times are for 64-byte inputs.
+
+libraries indicated above for the server and httplib2 to
+perform HTTPS requests.
+
+4.2 Performance
+For performance and scalability evaluation we hosted
+our PYTHIA server implementation on Amazon’s Elastic
+Compute Cloud (EC2) using a c4.xlarge instance which
+provides 8 virtual CPUs (Intel Xeon third generation,
+2.9GHz), 15 GB of main memory, and solid state storage.
+The web server, nginx, was conﬁgured with basic set-
+tings recommended for production deployment including
+one worker process per CPU.
+Latency. We measured client query latency for each
+protocol using two clients: one within the same Amazon
+Web Service (AWS) availability zone (also c4.xlarge)
+and one hosted at the University of Wisconsin–Madison
+with an Intel Core i7 CPU (3.4 GHz). We refer to the ﬁrst
+as the LAN (local-area network) setting and the second
+as the WAN (wide-area network) setting. In the LAN set-
+tings we used the AWS internal IP address. All queries
+were made over TLS and measurements include the time
+required for clients to blind messages and unblind results
+(PO), as well as verify proofs provided by the server (un-
+less indicated otherwise). All machines used for evalua-
+tion were running Ubuntu 14.04.
+
+Microbenchmarks for group operations appear in
+Figure 4 and Figure 5 shows the timing of individual op-
+erations that comprise a single PRF evaluation. All re-
+sults are mean values computed over 10,000 operations.
+These values were captured on an EC2 c4.xlarge instance
+using the Python proﬁling library line proﬁler. The most
+expensive operations, by a large margin, are exponentia-
+tion in Gt and the pairing operation. By extension, PO
+sign, prove, and verify operations become expensive.
+
+We measured latencies averaged over 1,000 PRF re-
+quests (with 100 warmup requests) for each scheme and
+the results appear in Figure 6. Computation time domi-
+nates in the LAN setting due to the almost negligible net-
+work latency. The WAN case with cold connections (no
+HTTP KeepAlive) pays a performance penalty due to the
+four round-trips required to set up a new TCP and TLS
+connection. While even 400 ms latencies are not pro-
+hibitive in our applications, straightforward engineering
+
+Server Op
+
+Table
+
+Rate-limit
+
+Sign
+Prove
+
+Client Op
+
+Blind
+Unblind
+Verify
+
+UNB
+0.3
+0.5
+
+UNB
+-
+-
+0.9
+
+Time (ms)
+
+1.2
+0.9
+BLS
+0.3
+0.3
+
+BLS
+-
+-
+2.0
+
+PO
+1.5
+2.5
+
+PO
+0.3
+1.2
+4.0
+
+Figure 5: Computation time for major operations to
+perform a PRF evaluation. Table retrieves K[w] from
+database; Rate-limit updates rate-limiting record in
+database; and Sign generates the PRF output;
+
+Scheme
+UNB
+BLS
+PO
+RTT ping
+
+Cold
+7.0
+7.9
+14.9
+
+LAN
+Hot
+3.8
+4.9
+11.8
+0.1
+
+Latency (ms)
+
+No π
+2.4
+2.4
+5.2
+
+Cold
+389
+392
+403
+
+WAN
+Hot
+82
+85
+96
+82
+
+No π
+80
+80
+84
+
+Figure 6: Average latency to complete a PRF-Cl with
+client-server communication over HTTPS. LAN: client
+and server in the same EC2 availability zone. WAN:
+server in EC2 US-West (California) and client in Madi-
+son, WI. Hot connections made with HTTP KeepAlive
+enabled; cold connections with KeepAlive disabled. No
+π: KeepAlive enabled; prove and verify computations
+are skipped.
+
+improvements would vastly improve WAN timing: us-
+ing TLS session resumption, using lower-latency secure
+protocol like QUIC [43], or even switching to a custom
+UDP protocol (for an example one for oblivious PRFs,
+see [5]).
+Throughput. We used the distributed load testing tool
+autobench to measure maximum throughput for each
+scheme. We compare to a static page containing a typi-
+cal PRF response served over HTTPS as a baseline. We
+used two clients in the same AWS region as the server.
+All connections were cold: no TLS session resumption
+or HTTP KeepAlive. The maximum throughput for a
+static page is 2,200 connections per second (cps); UNB
+and BLS 1,400 cps; and PO 1,350 cps. Thus our PYTHIA
+implementation can handle a large number of clients on
+a single EC2 instance. If needed, the implementation can
+be scaled with standard techniques (e.g., a larger number
+of web servers and application servers on the front-end
+with a distributed key-value store on the back-end).
+Storage. Our implementation stores all ensemble pre-
+key table (K) entries and rate-limiting information in
+MongoDB. A table entry is two 32 byte values: a SHA-
+
+USENIX Association  
+
+24th USENIX Security Symposium  553
+
+7
+
+256 hash of the ensemble selector w and its associated
+value K[w]. In MongoDB the average storage size is 195
+bytes per entry (measured as the average of 100K en-
+tries), including database overheads and indexes. This
+implementation scales easily to 100 M clients with under
+20 GB of storage.
+
+To rate-limit queries, our implementation stores tweak
+values along with a counter and a timestamp (to ex-
+pire old entries) in MongoDB. Tweak values are also
+hashed using SHA-256 which ensures entries are of con-
+stant length. In our implementation each distinct tweak
+requires an average of 144 bytes per entry (including
+overheads and indexes). Note however that rate limit-
+ing entries are purged periodically as counts are only
+required for one rate-limiting period. Our implementa-
+tion imposes rate-limits at hour granularity. Assuming a
+maximum throughput of 2,000 requests per second, rate-
+limiting storage never exceeds 1 GB.
+
+All told, with only 20 GB stored data, PYTHIA can
+serve over 100 M clients and perform rate-limiting at
+hour granularity. Thus ﬁelding a database for PYTHIA
+can be accomplished on commodity hardware.
+
+5 Password Onions
+
+Web servers and other systems frequently store pass-
+words in hashed form. A password onion is the result of
+additionally invoking a PRF service to harden the hash.
+In currently suggested onions, one sequentially combines
+local hashing and application of the PRF service.
+
+We now present a service that we have implemented
+on top of PYTHIA for managing password onions. First,
+we describe the limitations of contemporary systems
+as exempliﬁed by a recently disclosed architecture em-
+ployed by Facebook [39]. Then we show how our
+password-onion system, which was easily engineered on
+top of PYTHIA, can address these limitations.
+
+In what follows, we use the term “client” or “web
+server” to denote the server performing authentication
+and storing derived values from passwords and “PRF
+server” to denote the PYTHIA service.
+
+5.1 Facebook password onion
+An example of a contemporary system, used by Face-
+book, is given in Figure 7.5 Their PRF service applies
+HMAC using a service-held secret and returns the result.
+In this architecture, an adversary that compromises the
+web server and the password hashes it stores must still
+
+5This ﬁgure is of “archaeological” interest.
+
+It appears that vul-
+nerabilities in MD5 led to the addition of a layer of processing un-
+der SHA-1; when vulnerabilities were found in SHA-1, Facebook then
+added layers of SHA-256. As we explain later, full-blown replacement
+of MD5 and SHA-1 with SHA-256 was not easily accomplished.
+
+PW-Onion(pw)
+h1 ← MD5(pw)
+sa ←$ {0, 1}160
+h2 ← HMAC[SHA-1](h1, sa)
+h3 ← PRF-Cl(h2) = HMAC[SHA-256](h2, msk)
+h4 ← scrypt(h3, sa)
+h5 ← HMAC[SHA-256](h4)
+Ret (sa, h5)
+
+Figure 7: The Facebook password onion. PRF-Cl(h2)
+invokes
+the Facebook PRF service HMAC[SHA-
+256](h2, Ks) with PRF-service secret key Ks.
+
+mount an online attack against the PRF service to com-
+promise accounts. This is a big advance on the hashing-
+only practices that are commonly used.
+
+The Facebook architecture nevertheless has some
+shortcomings. It is easy to see from Figure 7 that Face-
+book’s system, like most contemporary PRF services,
+lacks several important features present in PYTHIA. One
+is message privacy: the Facebook PRF service applies
+HMAC to h2. This is the salted hash of the password,
+and so learning the salt as well as compromising the PRF
+service sufﬁces to re-enable ofﬂine brute-force attacks.
+This threat is avoided by PYTHIA due to blinding.
+
+Another feature is batch key updates. In fact, the Face-
+book PRF service doesn’t permit autonomous key up-
+dates at all, in the sense of an update to msk that can be
+propagated into PRF output updates. Should the client
+(password database) be compromised, the only way to
+reconstitute a hash in an existing password onion is to
+wait until a user logs in and furnishes pw.
+It is not
+clear whether the Facebook PRF service performs granu-
+lar rate-limiting, although no such capability is indicated
+in [38]. PYTHIA, as we shall see, addresses all of these
+issues by design in our password onion system.
+
+The Facebook onion also presents a subtle perfor-
+mance issue. By applying cryptographic primitives se-
+rially, the time to hash a password equals the time for
+local computations, call it tlocal, plus the time for the
+round-trip PRF service call, call it tprf . An attacker that
+compromises the web service and PRF service incurs no
+network latency, and thus may gain a considerable ad-
+vantage in guessing time over an honest web server. In
+our PYTHIA-based password onion service, we address
+this issue by observing that it is possible to avoid seri-
+alization of key derivation functions on the web server
+and the PRF service call. That is, we introduce in our
+PYTHIA-based service the idea of parallelizable pass-
+word onions.
+
+554  24th USENIX Security Symposium 
+
+USENIX Association
+
+8
+
+UpParOnion(w, sa, pw)
+z ← PBKDF(pw, sa)
+u ← PRF-Cl(w, sa, pw)
+h ← uz
+Ret (h, sa)
+
+Figure 8: An updatable, parallelizable password onion.
+PRF-Cl returns elements of a group G. The value w is a
+unique PRF-service identiﬁer for the web server (e.g., a
+random 256-bit string) and sa is a random per-user salt
+value.
+
+5.2 PYTHIA password onion
+The onion algorithm we construct for PYTHIA is shown
+the output of PRF-Cl is
+in Figure 8.
+an element of a group GT . To use this service, a
+web server stores (h, sa) upon password registration;
+it veriﬁes a proffered password pw(cid:31) by checking that
+UpParOnion(w, sa, pw(cid:31)) = h. Written out we have that:
+
+For PYTHIA,
+
+h = uz = e(H1(sa), H2(pw))kwz.
+
+This design ensures that the key update functions in the
+PYTHIA API may be used to update onions as well. For
+example, to update an ensemble key kw to k(cid:31)w, the service
+computes and furnishes to the web server an update token
+∆w = k(cid:31)w/kw. The web server may compute h∆w for
+each stored value h.
+Parallelization.
+Password veriﬁcation here is paral-
+lelizable in the sense that z and u may be computed in-
+dependently and then combined. Such parallel imple-
+mentation of the onion achieves a password veriﬁcation
+latency of max{tlocal, tprf} (plus a single exponentia-
+tion), as opposed to tlocal + tprf in a serialized imple-
+mentation.
+
+A web server generally aims to achieve a veriﬁcation
+latency equal to some latency target T that is high enough
+to slow ofﬂine brute-force attacks, but low enough not to
+burden users. For a parallelized onion a web server can
+meet its latency target by setting tlocal, tprf ≈ T . At the
+same time an ofﬂine attacker that has compromised the
+web server and PYTHIA must perform about tlocal+tF >
+T work to check a single password guess, where tF is
+the computation time of Fkw (i.e., tprf minus network
+latency). An attacker can parallelize, but her total work
+still goes up relative to the serial onion approach for the
+same latency target T .
+
+We estimate the security improvement of parallel
+onions over serial onions using our benchmarks from
+Section 4.2. We ﬁx a login latency budget of T =
+300 ms.6 The latency costs for a PYTHIA query with
+
+6This is the default setting for Python’s bcrypt and scrypt modules,
+though all PBDKFs are tunable so one can choose T to be any value
+desired.
+
+hot connections are 12 ms (LAN) and 96 ms (WAN). If
+one performs computations serially with a ﬁxed T then
+PBKDF computations need to be reduced by 4% (LAN)
+and 32% (WAN) compared to the parallel approach. In
+the event that the PYTHIA server and password database
+are compromised, the serial onion enables speedup of of-
+ﬂine dictionary attacks by the same percentages.
+
+Rate limiting and logging. The transparency of tweaks
+enables the PYTHIA PRF service in this setting to execute
+any of a wide range of rate-limiting policies with per-
+account visibility (in contrast to what may be in Face-
+book an account-blind PRF service). As an example
+demonstrating the ﬂexibility of our architecture, in our
+implementation PYTHIA performs a tiered rate-limiting:
+for a given account (t), it limits queries to at most 10 per
+hour per account, and at most 300 per month. (In ex-
+pectation, guessing a random 4-digit PIN would require
+1.4 years under this policy.) It logs violations of these
+thresholds.
+In a production environment, it could also
+send alerts to security administrators.
+
+We emphasize that a wide range of other rate-limiting
+policies is possible. We also point out that PYTHIA’s rate
+limiting supplements that normally implemented at the
+web server for remote login requests. PYTHIA performs
+rate limiting and may issue alerts even if the web server
+is compromised.
+
+Key update. The key update calls in the PYTHIA API,
+and the ability to rotate either kw or msk efﬁciently,
+propagates up to the password onion service. Key up-
+dates instantly invalidate the web server’s existing pass-
+word database—a useful capability in case of compro-
+mise. A compromised database becomes useless to an
+attacker attempting to recover passwords, even with the
+ability to query PYTHIA. Using a key update token, the
+web server can then recover from compromise by re-
+freshing its database.
+
+We created a client simulator with MongoDB and
+the mongoengine Python module. With this we bench-
+marked key updates with 100,000 database entries. The
+client requested a key update from PYTHIA, received the
+update token ∆w, and updated each database entry. The
+complete update required less than 1 ms per entry, and
+terminated in less than 97 seconds for all 100,000 en-
+tries. For a larger database we assume updates scale lin-
+early, and so an update for 1 million users completes in
+under 17 minutes.
+
+The web server need not need lock the database to per-
+form updates; it can execute them in parallel with normal
+login operations. Doing so does require additional ver-
+sioning information for each entry to indicate the version
+of kw (in the simplest form, whether or not it has received
+the latest update).
+
+USENIX Association  
+
+24th USENIX Security Symposium  555
+
+9
+
+6 Hardened Brainwallets
+
+Brainwallets are a common but dangerous way to se-
+cure accounts in the popular cryptocurrency Bitcoin, as
+well as in less popular cryptocurrencies such as Litecoin.
+Here we describe how the PYTHIA service can be used
+directly as a means to harden brainwallets. This appli-
+cation showcases the ease with which a wide variety of
+applications can be engineered around PYTHIA.
+
+How brainwallets work. Every Bitcoin account has an
+associated private / public key pair (sk, pk). The private
+key sk is used to produce digital (ECDSA) signatures
+that authorize payments from the account. The public
+key pk permits veriﬁcation of these signatures. It also
+acts as an account identiﬁer; a Bitcoin address is derived
+by hashing pk (under SHA-256 and RIPEMD-160) and
+encoding it (in base 58, with a check value).
+
+Knowledge of the private key sk equates with control
+of the account. If a user loses a private key, she therefore
+loses control over her account. For example, if a high en-
+tropy key sk is stored exclusively on a device such as a
+mobile phone or laptop, and the device is seized or physi-
+cally destroyed, the account assets become irrecoverable.
+Brainwallets offer an attractive remedy for such phys-
+ical risks of key loss. A brainwallet is simply a password
+or passphrase P memorized by a Bitcoin account holder.
+The private key sk is generated directly from P . Thus
+the user’s memory serves as the only instrument needed
+to authorize access to the account.
+
+In more detail, the passphrase is typically hashed using
+SHA-256 to obtain a 256-bit string sk = SHA-256(P ).
+Bitcoin employs ECDSA signatures on the secp256k1
+elliptic curve; with high probability (≈ 1 − 2−126), sk
+is less than the group order, and a valid ECDSA pri-
+vate key. (Some websites employ stronger key derivation
+functions. For example, WrapWallet by keybase.io [29]
+derives sk from an XOR of each of PBKDF2 and scrypt
+applied to P and permits use of a user-supplied salt.)
+
+Since a brainwallet employs only P as a secret, and
+does not necessarily use any additional security mea-
+sures, an attacker that guesses P can seize control of a
+user’s account. As account addresses are posted publicly
+in the Bitcoin system (in the “blockchain”), an attacker
+can easily conﬁrm a correct guess. Brainwallets are thus
+vulnerable to brute-force, ofﬂine guessing attacks. Nu-
+merous incidents have come to light showing that brain-
+wallet cracking is pandemic [14].7
+
+7At one point, rumor had it that cracking brainwallets was more
+proﬁtable than “mining,”, the basic process of generating fresh Bit-
+coins.
+
+6.1 A PYTHIA-hardened brainwallet
+PYTHIA offers a simple, powerful means of protecting
+brainwallets against ofﬂine attack. Hardening P in the
+same manner as an ordinary password yields a strong key
+˜P that can serve in lieu of P to derive sk.
+
+To use PYTHIA, a user chooses a unique identiﬁer id,
+e.g., her e-mail address, an account identiﬁer acct, and a
+passphrase P . The identiﬁer acct might be used to distin-
+guish among Bitcoin accounts for users who wish to use
+the same password for multiple wallets. The client then
+sends (w = id, t = id(cid:29) acct, m = P ) to the PYTHIA
+service to obtain the hardened value Fkw (t, m) = ˜P .
+Here, id is used both as an account identiﬁer and as part
+of the salt. Message privacy in PYTHIA ensures that the
+service learns nothing about P . Then ˜P is hashed with
+SHA-256 to yield sk. The corresponding public key
+pk and address are generated in the standard way from
+sk [7].
+
+PYTHIA forces a would-be brainwallet attacker to
+mount an online attack to compromise an account. Not
+only is an online attack much slower, but it may be rate-
+limited by PYTHIA and detected and ﬂagged. As the
+PYTHIA service derives ˜P using a user-speciﬁc key, it
+additionally prevents an attacker from mounting a dictio-
+nary attack against multiple accounts. While in the con-
+ventional brainwallet setting, two users who make use
+of the same secret P will end up controlling the same
+account, PYTHIA ensures that the same password P pro-
+duces distinct per-user key pairs.
+
+Should an attacker compromise the PYTHIA service
+and steal msk and K, the attacker must still perform an
+ofﬂine brute-force attack against the user’s brainwallet.
+So in the worst case, a user obtains security with PYTHIA
+at least as good as without it.
+Additional security issues. A few subtle security issues
+deserve brief discussion:
+
+•
+
+Stronger KDFs: To protect against brute-force
+attack in the event of PYTHIA compromise,
+a resource-intensive key-derivation function may
+be desirable, as is normally used in password
+databases. This can be achieved by replacing the
+SHA-256 hash of ˜P above with an appropriate KDF
+computation, or alternatively using an onion ap-
+proach described in Section 5.
+
+• Denial-of-service: By performing rate-limiting,
+PYTHIA creates the risk of targeted denial-of-
+service attacks against Bitcoin users. As Bitcoin
+is pseudonymous, use of an e-mail address as a
+PYTHIA key-selector sufﬁces to prevent such at-
+tacks against users based on their Bitcoin addresses
+alone. Users also have the option, of course, of us-
+ing a semi-secret id. A general DoS attack against
+
+556  24th USENIX Security Symposium 
+
+USENIX Association
+
+10
+
+the PYTHIA service is also possible, but of similar
+concern for Bitcoin itself [8].
+
+• Key rotation: Rotation of an ensemble key kw (or
+the master key msk) induces a new value of ˜P and
+thus a new (sk, pk) pair and account. A client can
+handle such rotations in the na¨ıve way:
+transfer
+funds from the old address to the new one.
+
+• Catastrophic failure of PYTHIA: If a PYTHIA ser-
+vice fails catastrophically, e.g., msk or K is lost,
+then in a typical setting, it is possible simply to
+reset users’ passwords.
+In the brainwallet case,
+the result would be loss of virtual-currency assets
+protected by the server—a familiar event for Bit-
+coin users [35]. This problem can be avoided,
+for instance, using a threshold implementation of
+PYTHIA, as mentioned in Section 6.2 or storing sk
+in a secure, ofﬂine manner like a safe-deposit box
+for disaster recovery.
+
+6.2 Threshold Security
+In order to gain both redundancy and security, we give
+a threshold scheme that can be used with a number of
+Pythia servers to protect a secret under a single pass-
+word. This scheme uses Shamir’s secret sharing thresh-
+old scheme [45] and gives (k, n) threshold security. That
+is, initially, n Pythia servers are contacted and used to
+protect a secret s, and then any k servers can be used to
+recover s and any adversary that has compromised fewer
+than k Pythia servers learns no information about s.
+Preparation. The client chooses an ensemble key se-
+lector w, tweak t, password P , and contacts n Pythia
+servers to compute qi = PRF-Cli(w, t, P ) mod p for
+0 < i ≤ n. The client selects a random polynomial
+of degree k − 1 with coefﬁcients from ∗p where p is
+a suitably large prime: f (x) = (cid:31)k−1
+j=0 xjaj. Let the
+secret s = a0. Next the client computes the vector
+Φ = (φ1, ..., φn) where φi = f (i) − qi. The client
+durably stores the value Φ, but does not need to protect
+it (it’s not secret). The client also stores public keys pi
+from each Pythia server to validate proofs when issuing
+future queries.
+Recovery. The client can reconstruct s if she has Φ by
+querying any k Pythia servers giving k values qi. These
+qi values can be applied to the corresponding Φ values
+to retrieve k distinct points that lie on the curve f (x).
+With k points on a degree k − 1 curve, the client can
+use interpolation to recover the unique polynomial f (x),
+which includes the curve’s intercept a0 = s.
+Security.
+If an adversary is given Φ, w, t, the public
+keys pi, a ciphertext based on s, and the secrets from
+m < k Pythia servers, the adversary has no information
+
+that will permit her to verify password guesses ofﬂine.
+Compared to [45], this scheme reduces the problem of
+storing n secrets to having access to n secure OPRFs and
+durable (but non-secret) storage of the values Φ and pub-
+lic keys pi.
+Veriﬁcation. Veriﬁcation of server responses occurs
+within the Pythia protocol. If a server is detected to be
+dishonest (or goes out of service), it can be easily re-
+placed by the client without changing the secret s. To re-
+place a Pythia server that is suspected to be compromised
+or detected as dishonest, the client reconstructs the secret
+s using any k servers, executes Reset operations on all
+remaining servers:
+this effects a cryptographic erasure
+on the values Φ and f (x). The client then selects a new,
+random polynomial, keeping a0 ﬁxed, and generates and
+stores an updated Φ(cid:29) that maps to the new polynomial.
+
+7 Related Work
+
+We investigated a number of designs based on exist-
+ing cryptographic primitives in the course of our work,
+though as mentioned none satisﬁed all of our design
+goals. Conventional PRFs built from block ciphers or
+hash functions fail to offer message privacy or key rota-
+tion. Consider instead the construction H(t(cid:28) m)kw for
+H : {0, 1}∗ → G a cryptographic hash function map-
+ping onto a group G. This was shown secure as a con-
+ventional PRF by Naor, Pinkas, and Reingold assum-
+ing decisional Difﬁe-Hellman (DDH) is hard in G and
+when modeling H as a random oracle [40]. It supports
+key rotations (in fact it is key-homomorphic [11]) and
+veriﬁability can be handled using non-interactive zero-
+knowledge proofs (ZKP) as in PYTHIA. But this ap-
+proach fails to provide message privacy if we submit both
+t and m to the server and have it compute the full hash.
+One can achieve message-hiding by using blinding:
+have the client submit X = H(t(cid:28) m)r for random
+r ∈ |G| and the server reply with X kw as well as a ZKP
+proving this was done correctly. The resulting scheme
+is originally due to Chaum and Pedersen [19], and sug-
+gested for use by Ford and Kaliski [26] in the context
+of threshold password-authenticated secret sharing (see
+also [3, 15, 20, 34]). There an end user interacts with
+one or more blind signature servers to derive a secret au-
+thentication token.
+If G comes equipped with a bilin-
+ear pairing, one can dispense with ZKPs. The resulting
+scheme is Boldyreva’s blinded version [10] of BLS sig-
+natures [12]. However, neither approach provides gran-
+ular rate limiting when blinding is used: the tweak t is
+hidden from the server. Even if the client sends t as well,
+the server cannot verify that it matches the one used to
+compute X and attackers can thereby bypass rate limits.
+To ﬁx this, one might use Ford-Kaliski with a sep-
+
+USENIX Association  
+
+24th USENIX Security Symposium  557
+
+11
+
+arate secret key for each tweak. This would result in
+having a different key for each unique w, t pair. Mes-
+sage privacy is maintained by the blinding, and querying
+w, t, H(t(cid:31) (cid:31) m)r for t (cid:30)= t(cid:31) does not help an attacker cir-
+cumvent per-tweak rate limiting. But now the server-side
+storage grows in the number of unique w, t pairs, a client
+using a single ensemble w must now track N public keys
+when they use the service for N different tweaks, and
+key rotation requires N interactions with the PRF server
+to get N separate update tokens (one per unique tweak
+for which a PRF output is stored). When N is large and
+the number of ensembles w is small as in our password
+storage application, these inefﬁciencies add signiﬁcant
+overheads.
+
+Another issue with the above suggestions is that their
+security was only previously analyzed in the context of
+one-more unforgeability [42] as targeted by blind signa-
+tures [18] and partially blind signatures [1]. (Some were
+analyzed as conventional PRFs, but that is in a model
+where adversaries do not get access to a blinded server
+oracle.) The password onion application requires more
+than unforgeability because message privacy is needed.
+(A signature could be unforgeable but include the en-
+tire message in its signature, and this would obviate the
+beneﬁts of a PRF service for most applications.) These
+schemes, however, can be proven to be one-more PRFs,
+the notion we introduce, under suitable one-more DDH
+style assumptions using the same proof techniques found
+in Appendix B.
+
+Fully oblivious PRFs [27] and their veriﬁable ver-
+sions [28] also do not allow granular rate limiting. We
+note that the Jarecki, Kiayias, and Krawczyk construc-
+tions of veriﬁable OPRFs [28] in the RO model are
+essentially the Ford-Kaliski protocol above, but with
+an extra hash computation, making the PRF output
+H(cid:31)(t(cid:31) m(cid:31) H(t(cid:31) m)kw ). Our notion of one-more un-
+predictability in the appendix captures the necessary re-
+quirements on the inner cryptographic component, and
+might modularize and simplify their proofs. Their trans-
+form is similar to the unique blind signature to OPRF
+transformation of Camenisch, Neven, and shelat [16].
+None of these efﬁcient oblivious PRF protocols support
+key rotations (with compact tokens or otherwise) as the
+ﬁnal hashing step destroys updatability.
+
+The setting of capture-resilient devices shares with
+ours the use of an off-system key-holding server and the
+desire to perform cryptographic erasure [32, 33]. They
+only perform protocols for encryption and signing func-
+tionalities, however, and not (more broadly useful) PRFs.
+They also do not support granular rate limiting and mas-
+ter secret key rotation.
+
+Our main construction coincides with prior ones
+for other contexts. The Sakai, Ohgishi, and Kasa-
+hara [44] identity-based non-interactive key exchange
+
+protocol computes a symmetric encryption key as
+e(H1(ID1), H2(ID2))k for k a master secret held by
+a trusted party and ID1 and ID2 being the identities
+of the parties. See [41] for a formal analysis of their
+scheme. Boneh and Waters suggest the same construc-
+tion as a left-or-right constrained PRF [13]. The settings
+and their goals are different from ours, and in particular
+one cannot use either as-is for our applications. Na¨ıvely
+one might hope that returning the constrained PRF key
+H1(t)kw to the client sufﬁces for our applications, but
+in fact this totally breaks rate-limiting. Security analysis
+of our protocol requires new techniques, and in particu-
+lar security must be shown to hold when the adversary
+has access to a half-blinded oracle — this rules out the
+techniques used in [13, 41].
+
+Key-updatable
+
+encryption [11]
+
+and proxy re-
+encryption [9] both support key rotation, and could
+be used to encrypt password hashes in a way support-
+ing compact update tokens and that prevents ofﬂine
+brute-force attacks. But this would require encryption
+and decryption to be handled by the hardening service,
+preventing message privacy.
+
+Veriﬁable PRFs as deﬁned by [21,22,31,36] allow one
+to verify that a known PRF output is correct relative to a
+public key. Previous veriﬁable PRF constructions are not
+oblivious, let alone partially oblivious.
+
+Threshold and distributed PRFs [21, 37, 40] as well as
+distributed key distribution centers [40] enable a sufﬁ-
+ciently large subset of servers to compute a PRF output,
+but previous constructions do not provide the granular
+rate limiting and key rotation we desire. However, it is
+clear that there are situations where applications would
+beneﬁt from a threshold implementation of PYTHIA, for
+both redundancy and distribution of trust, as discussed in
+Section 6.2 for the case of brainwallets.
+
+8 Conclusion
+
+We presented the design and implementation of PYTHIA,
+a modern PRF service. Prior works have explored the use
+of remote cryptographic services to harden keys derived
+from passwords or otherwise improve resilience to com-
+promise. PYTHIA, however, transcends existing designs
+to simultaneously support granular rate limiting, efﬁcient
+key rotation, and cryptographic erasure. This set of fea-
+tures, which stems from practical requirements in appli-
+cations such as enterprise password storage, proves to
+require a new cryptographic primitive that we refer to as
+a partially oblivious PRF.
+
+Unlike a (fully) oblivious PRF, a partially oblivious
+PRF causes one portion of an input to be revealed to
+the server to enable rate limiting and detection of on-
+line brute-force attacks. We provided a bilinear-pairing
+based construction for partially oblivious PRFs that is
+
+558  24th USENIX Security Symposium 
+
+USENIX Association
+
+12
+
+highly efﬁcient and simple to implement (given a pair-
+ings library), and also supports efﬁcient key rotations. A
+formal proof of security is unobtainable using existing
+techniques (such as those developed for fully oblivious
+PRFs). We thus gave new deﬁnitions and proof tech-
+niques that may be of independent interest.
+
+We implemented PYTHIA and show how it may be
+easily integrated it into a range of applications. We de-
+signed a new enterprise “password onion” system that
+improves upon the one recently reported in use at Face-
+book. Our system permits fast key rotations, enabling
+practical reactive and proactive key management, and
+uses a parallelizable onion design which, for a given au-
+thentication latency, imposes more computational effort
+on attackers after a compromise. We also explored the
+use of PYTHIA to harden brainwallets for cryptocurren-
+cies.
+
+Acknowledgements
+
+The authors thank Kenny Paterson for feedback on an
+early draft of this paper. This work was supported in part
+by NSF grants CNS-1330308, CNS-1065134, and CNS-
+1330599, as well as a gift from Microsoft.
+
+References
+[1] Masayuki Abe and Tatsuaki Okamoto. Provably secure partially
+blind signatures. In Advances in Cryptology–CRYPTO. Springer,
+2000.
+
+[2] D. F. Aranha and C. P. L. Gouvˆea. RELIC is an Efﬁcient LI-
+brary for Cryptography. https://github.com/relic-
+toolkit/relic.
+
+[3] Ali Bagherzandi, Stanislaw Jarecki, Nitesh Saxena, and Yanbin
+Lu. Password-protected secret sharing. In Computer and Com-
+munications Security. ACM, 2011.
+
+[4] Paulo SLM Barreto and Michael Naehrig. Pairing-friendly el-
+liptic curves of prime order. In Selected Areas in Cryptography.
+Springer, 2006.
+
+[5] Mihir Bellare, Sriram Keelveedhi, and Thomas Ristenpart. Du-
+In
+
+server-aided encryption for deduplicated storage.
+
+pless:
+USENIX Security. USENIX, 2013.
+
+[6] Mihir Bellare, Chanathip Namprempre, David Pointcheval,
+Michael Semanko, and Matthew Franklin. The one-more-RSA-
+inversion problems and the security of Chaum’s blind signature
+scheme. Journal of Cryptology, 16(3), 2003.
+
+[7] Technical background of version 1 Bitcoin addresses.
+
+https://en.bitcoin.it/wiki/Technical_
+background_of_version_1_Bitcoin_addresses.
+
+[8] Bitcoin wiki, “weaknesses”. https://en.bitcoin.it/
+
+wiki/Weaknesses.
+
+[9] Matt Blaze, Gerrit Bleumer, and Martin Strauss. Divertible proto-
+cols and atomic proxy cryptography. In Advances in Cryptology–
+EUROCRYPT. Springer, 1998.
+
+[10] Alexandra Boldyreva. Threshold signatures, multisignatures and
+blind signatures based on the gap-Difﬁe-Hellman-group signature
+scheme. In Public Key Cryptography. Springer, 2002.
+
+[11] Dan Boneh, Kevin Lewi, Hart Montgomery, and Ananth Raghu-
+nathan. Key homomorphic PRFs and their applications. In Ad-
+vances in Cryptology–CRYPTO. Springer, 2013.
+
+[12] Dan Boneh, Ben Lynn, and Hovav Shacham. Short signatures
+from the Weil pairing. In Advances in Cryptology–ASIACRYPT.
+Springer Berlin Heidelberg, 2001.
+[13] Dan Boneh and Brent Waters.
+functions and their applications.
+ASIACRYPT. Springer, 2013.
+
+Constrained pseudorandom
+In Advances in Cryptology-
+
+[14] Brainwallet.
+
+Brainwallet.
+
+https://en.bitcoin.it/wiki/
+
+[15] Jan Camenisch, Anna Lysyanskaya, and Gregory Neven.
+Practical yet universally composable two-server password-
+authenticated secret sharing. In Computer and Communications
+Security. ACM, 2012.
+
+[16] Jan Camenisch, Gregory Neven, and abhi shelat.
+
+able adaptive oblivious transfer.
+EUROCRYPT. Springer Berlin Heidelberg, 2007.
+
+Simulat-
+In Advances in Cryptology–
+
+[17] Jan Camenisch and Markus Stadler. Proof systems for general
+statements about discrete logarithms. Technical Report No. 260,
+Dept. of Computer Science, ETH Zurich, 1997.
+
+[18] David Chaum. Blind signatures for untraceable payments.
+
+Advances in Cryptology. Springer, 1983.
+
+In
+
+[19] David Chaum and Torben Pryds Pedersen. Wallet databases with
+observers. In Advances in Cryptology–CRYPTO. Springer, 1993.
+[20] Mario Di Raimondo and Rosario Gennaro. Provably secure
+threshold password-authenticated key exchange. In Advances in
+Cryptology–EUROCRYPT. Springer, 2003.
+
+[21] Yevgeniy Dodis. Efﬁcient construction of (distributed) veriﬁable
+random functions. In Public Key Cryptography. Springer, 2002.
+[22] Yevgeniy Dodis and Aleksandr Yampolskiy. A veriﬁable random
+function with short proofs and keys. In Public Key Cryptography.
+Springer, 2005.
+
+[23] Paul Ducklin. Anatomy of a password disaster – Adobe’s
+https:
+
+giant-sized
+//nakedsecurity.sophos.com/2013/11/04/
+anatomy-of-a-password-disaster-adobes-
+giant-sized-cryptographic-blunder/.
+
+2013.
+
+cryptographic
+
+blunder,
+
+[24] Taher ElGamal. A public key cryptosystem and a signature
+scheme based on discrete logarithms. In Advances in Cryptology–
+CRYPTO. Springer, 1985.
+
+[25] Adam Everspaugh, Rahul Chatterjee, Samuel Scott, Ari Juels,
+and Thomas Ristenpart. The Pythia PRF service. Full ver-
+sion of this paper. http://pages.cs.wisc.edu/˜ace/
+papers/pythia.pdf.
+
+[26] Warwick Ford and Burton S. Kaliski, Jr. Server-assisted genera-
+tion of a strong secret from a password. In International Work-
+shops on Enabling Technologies: Infrastructure for Collabora-
+tive Enterprises. IEEE, 2000.
+
+[27] Michael J Freedman, Yuval Ishai, Benny Pinkas, and Omer Rein-
+gold. Keyword search and oblivious pseudorandom functions. In
+Theory of Cryptography. Springer, 2005.
+
+[28] Stanislaw Jarecki, Aggelos Kiayias, and Hugo Krawczyk.
+Round-optimal password-protected secret sharing and t-PAKE
+in the password-only model.
+In Advances in Cryptology–
+ASIACRYPT. Springer, 2014.
+
+[29] Max Krohn and Chris Coyne. Wrap Wallet.
+
+keybase.io/warp.
+
+https://
+
+[30] Moses Liskov, Ronald L Rivest, and David Wagner. Tweakable
+In Advances in Cryptology–CRYPTO. Springer,
+
+block ciphers.
+2002.
+
+USENIX Association  
+
+24th USENIX Security Symposium  559
+
+13
+
+[31] Anna Lysyanskaya.
+
+dom functions from the DH-DDH separation.
+Cryptology–CRYPTO. Springer, 2002.
+
+Unique signatures and veriﬁable ran-
+In Advances in
+
+[32] Philip MacKenzie and Michael K Reiter. Delegation of crypto-
+graphic servers for capture-resilient devices. Distributed Com-
+puting, 16(4), 2003.
+
+[33] Philip MacKenzie and Michael K Reiter. Networked crypto-
+graphic devices resilient to capture. International Journal of In-
+formation Security, 2(1), 2003.
+
+[34] Philip MacKenzie, Thomas Shrimpton, and Markus Jakobsson.
+Threshold password-authenticated key exchange. In Advances in
+Cryptology–CRYPTO. Springer, 2002.
+
+[35] R. McMillan. The inside story of Mt. Gox, bitcoin’s $460 million
+
+disaster. Wired, 2014.
+
+[36] Silvio Micali, Michael Rabin, and Salil Vadhan. Veriﬁable ran-
+dom functions. In Foundations of Computer Science. IEEE, 1999.
+[37] Silvio Micali and Ray Sidney. A simple method for generat-
+ing and sharing pseudo-random functions, with applications to
+clipper-like key escrow systems.
+In Advances in Cryptology–
+CRYPTO. Springer, 1995.
+
+[38] Alec Muffet. Facebook: Password hashing & authentication. Pre-
+
+sentation at Real World Crypto, 2015.
+
+[39] Allec Muffet.
+
+thentication.
+54b660049af94.
+
+Facebook:
+
+Password hashing and au-
+https://video.adm.ntnu.no/pres/
+
+[40] Moni Naor, Benny Pinkas, and Omer Reingold.
+
+tributed pseudo-random functions and KDCs.
+Cryptology–EUROCRYPT. Springer, 1999.
+
+Dis-
+In Advances in
+
+[41] Kenneth G Paterson and Sriramkrishnan Srinivasan. On the re-
+lations between non-interactive key distribution, identity-based
+encryption and trapdoor discrete log groups. Designs, Codes and
+Cryptography, 52(2), 2009.
+
+[42] David Pointcheval and Jacques Stern. Provably secure blind
+In Advances in Cryptology–ASIACRYPT.
+
+signature schemes.
+Springer, 1996.
+
+[43] Jim Roskind. QUIC: Multiplexed stream transport over UDP.
+
+Google working design document, 2013.
+
+[44] R. Sakai, K. Ohgishi, and M. Kasahara. Cryptosystems based on
+
+pairing. In Cryptography and Information Security, 2000.
+
+[45] Adi Shamir. How to share a secret. Communications of the ACM,
+
+22(11):612–613, 1979.
+
+A Additional PYTHIA API details
+
+Many PYTHIA-dependent services can beneﬁt from ad-
+ditional API features and calls beyond the primary ones
+discussed in the body of the paper.
+(For example, the
+PYTHIA password onion system in Section 5 uses the
+Transfer API call.) We detail these other API features in
+this appendix.
+Key-management options. The client can specify a
+number of options in the call Init regarding management
+of the ensemble key kw. The client can provide a contact
+email address to which alerts and authentication tokens
+may be sent. (If no e-mail is given, no API calls requiring
+authentication are permitted at present and no alerts are
+provided. Later versions of PYTHIA will support other
+authentication and alerting methods.)
+
+Selector option
+Email
+Resettable
+Limit
+Time-out
+Public-key
+
+Alerts
+
+Description
+Contact email for selector
+Whether client-requested rotations allowed
+Establish rate-limit per t
+Date/time to delete kw
+Key under which to encrypt and store up-
+date and authentication tokens
+Whether to email contact upon rate limit vi-
+olation
+
+Figure 9: Optional settings for establishing key selectors
+in PYTHIA.
+
+Command
+Transfer(w, w(cid:31) [, options])
+
+SendTokens(w, authtoken)
+
+PurgeTokens(w, authtoken)
+
+new
+
+ensemble
+outputs update token
+
+Description
+Creates
+w(cid:31);
+∆w→w(cid:31) ; resets kw
+Sends stored update tokens to
+client
+Purges all stored update to-
+kens for ensemble w
+
+Figure 10: The PYTHIA API. The individual calls are
+explained in detail in the text.
+
+The client can specify whether kw should be resettable
+(default is “yes”). The client can specify a limit on the
+total number of Fkw queries that should be allowed be-
+fore resetting K[w] (default is unlimited) and/or an ab-
+solute expiration date and time in UTC at which point
+K[w] is deleted (default is no time-out). Either of these
+options overrides the resettable ﬂag. The client can spec-
+ify a public key pkcl for a public-key encryption scheme
+under which to encrypt authentication tokens and update
+tokens (for Reset, Transfer, as described below, and for
+master secret key rotations). Finally, the client can re-
+quest that alerts be sent to the contact email address in
+the case of rate limit violations. This option is ignored
+if no contact email is provided. The options are summa-
+rized in Figure 9.
+
+PYTHIA also offers some additional API calls, given
+
+in Figure 10, which we now describe.
+Ensemble transfer. A client can create a new ensemble
+w(cid:31) (with the same options as in Init) while receiving an
+update token that allows PRF outputs under ensemble w
+to be rolled forward to w(cid:31). This is useful for importing
+a password database to a new server. The PYTHIA ser-
+vice returns an update token ∆w→w(cid:31) for this purpose and
+stores it encrypted under pkcl. For the case w(cid:31) = w, this
+call also allows option updates on an existing ensemble
+w.
+Update-token handling. The PYTHIA service stores
+update tokens encrypted under pkcl, with accom-
+panying timestamps for versioning.
+The API call
+SendTokens causes these to be e-mailed to the client,
+
+560  24th USENIX Security Symposium 
+
+USENIX Association
+
+14
+
+while PurgeTokens causes update-token ciphertexts to
+be deleted from PYTHIA.
+
+Note that once an update token is deleted, old PRF
+values to which the token was not applied become cryp-
+tographically erased — they become random values un-
+related to any messages. A client can therefore delete the
+key associated with an ensemble by calling Reset and
+PurgeTokens.
+Master secret rotations. PYTHIA can also rotate its
+master secret key msk to a new key msk(cid:31). Recall that en-
+semble keys are computed as kw = HMAC(msk, K[w]),
+so rotation of msk results in rotation of all ensemble
+keys. To rotate to a new msk(cid:31), the server computes kw
+for all ensembles w with entries in K, and stores δw en-
+crypted under pkcl. If no encryption key is set, then the
+token is stored in the clear. This is a forward-security
+issue while it remains, but only for that particular key
+ensemble. At this point msk is safe to delete. Clients
+can be informed of the key rotation via e-mail.
+
+Subsequent SendTokens requests will return the re-
+sulting update token, along with any other stored update
+tokens for the ensemble. If multiple rotations occur be-
+tween client requests, then these can be aggregated in the
+stored update token for each ensemble. This is trivial if
+they are stored in the clear (just multiply the new token
+against the old) and also works if they are encrypted with
+an appropriately homomorphic encryption scheme such
+as ElGamal [24].
+
+B Formal Security Analyses
+
+We provide formal security notions for partially oblivi-
+ous PRFs, and proofs of security relative to them for our
+scheme from Section 3.
+Partially-oblivious PRFs. A partially oblivious PRF
+protocol Π = (K, PRF-Cl, PRF-Srv, F ) consists of the
+following. The key generation algorithm K outputs a
+public key and private key pair (pk, sk). We assume
+that from sk one can compute pk easily. The PRF-Srv
+algorithm takes input the secret key sk and a client re-
+quest message (a bit string) and returns a server re-
+sponse message (another bit string). The client algo-
+rithm PRF-Cl takes inputs a tweak t and message m,
+can make a single call to PRF-Srv, and outputs a value.
+Finally we associate to the protocol a keyed function
+Fsk : {0, 1}∗ × {0, 1}∗ → {0, 1}∗. A scheme is correct
+if executing PRF-ClPRF-Srvsk(·)(t, m) with fresh coins
+matches Fsk(t, m) with probability one. In words, the
+protocol computes the appropriate function of t, m.
+Bilinear pairing setups. Let G1, G2, GT be groups
+all of order p that have associated to them an admissi-
+ble bilinear pairing e : G1 × G2 → GT . Recall that
+
+T
+
+1 , gβ
+
+2 ) = gαβ
+
+for generators g1 ∈ G1, g2 ∈ G2, there exists a gen-
+erator gT ∈ GT such that e(gα
+for all
+α, β ∈ p. As shorthand for below we refer to a pair-
+ing setup G = (g1, g2, gT , G1, G2, GT , e) and assume
+some compact description of G as a bit-string where ap-
+propriate.
+The scheme. The partially-oblivious PRF at the core8 of
+our bilinear pairing scheme from Section 3 is as follows
+for some ﬁxed pairing setup G. Let H1 : {0, 1}∗ → G1
+and H2 : {0, 1}∗ → G2 be hash functions that we will
+later model as random oracles.
+Key generation K picks a random exponent sk and
+computes a public key pk = gs
+1k. The PRF-Cl(t, m)
+p and sends t and
+algorithm computes a mask r ←$
+x = H2(m)r to the server. The PRF-Srv(sk, t, x) com-
+putes y = e(H1(t), x)sk and a ZKP π that DLg1 (pk) =
+DL˜x(y) where ˜x = e(H1(t), x). It sends pk, y, π to the
+client, who veriﬁes the ZKP, deletes it, and then outputs
+y1/r. The correctness of the scheme follows from the
+correctness of the ZKP and the properties of the pairing.
+The ZKP is used to ensure that a malicious server re-
+sponds as per the protocol.
+In the following security
+analyses we focus primarily on malicious clients, and for
+simplicity analyze a simpler version of the protocol that
+omits the ZKP. The proofs found below can be extended
+to the full protocol by applying the zero-knowledge se-
+curity of the proof systems that we use (i.e., use the
+zero-knowledge simulator to produce fake, but realistic-
+looking to the client, proofs).
+
+B.1 Unpredictability Security
+We deﬁne a one-more unpredictability security notion.
+It modiﬁes one-more unforgeability [42] to be suitable
+for the setting of unpredictable functions (as opposed to
+publicly veriﬁable signatures). The game is shown in
+Figure 11. We associate to any protocol Π, adversary A,
+and query number q the one-more-unpredictability ad-
+vantage deﬁned as
+Advom-unp
+
+(A) = Pr(cid:31) om-UNPAΠ,q ⇒ true(cid:30) .
+
+The probability here (and for games deﬁned later below)
+is over all random coins used by the procedures and the
+adversary. The event refers to the probability that the
+value returned by the main procedure is true. In words,
+the deﬁnition requires that an adversary cannot produce (cid:11)
+outputs of the PRF using less than (cid:11) queries on partially-
+blinded inputs to the server. One can easily extend this
+notion to deal with full blinded inputs as well, but we
+will not need this.
+
+Π,q
+
+8For brevity we omit key selectors here, and instead focus on ana-
+lyzing security for a single key instance. Assuming properly generated
+keys for each selector, one can show that security for a single key in-
+stance implies security for many.
+
+15
+
+USENIX Association  
+
+24th USENIX Security Symposium  561
+
+1k)
+
+p
+
+Game om-BCDHBG
+sk ←$
+qh, q1,t, q2,t ← 0
+(i1, j1, σ1), . . . ,( i(cid:31), j(cid:31), σ(cid:31)) ←$ ATarg1,Targ2,Help(G, gs
+If qh ≥ (cid:18) then Ret false
+If ∃α . (iα > q1,t) ∨ (jα > q2,t) then Ret false
+If ∃α (cid:27)= β . (iα, jα) = (iβ, jβ) then Ret false
+Ret ∀α . e(Xiα , Yjα )k = σα
+Targ1
+q1,t ← q1,t + 1 ; Xq1,t ←$ G1 ; Ret Xq1,t
+Targ2
+q2,t ← q2,t + 1 ; Yq2,t ←$ G2 ; Ret Yq2,t
+Help(Z)
+qh ← qh + 1 ; Ret Z sk
+Figure
+BCDH assumption
+G = (g1, g2, gt, G1, G2, GT , e).
+
+Security
+for
+
+game
+bilinear
+
+pairing
+
+12:
+
+for
+
+a
+
+one-more
+setting
+
+an H1(t) query, B queries Targ1 to obtain a G1-element
+that we will denote X[t], sets ct to be the number of H1
+queries so far (including the current), and returns X[t]
+to A. Whenever A makes an H2(m) server query, B
+queries Targ2, obtains a G2-element that we will denote
+Y [m], sets dm to be the number of H2 queries so far (in-
+cluding the current), and returns Y [m] to A. Whenever
+A makes a PRF-Srv(t, Y ) query, the adversary B com-
+putes Z ← e(H1(t), Y ), and then queries Z to its helper
+oracle Help to obtain a value σ ∈ GT . It returns σ to A.
+triples
+Eventually A outputs
+point
+(t1, m1, σ1), . . . , (tq, mq, σq).
+adversary B outputs
+the
+pairs
+(ct1 , dm1 , σ1), . . . , (cmq , dmq , σq).
+
+of
+this
+of
+
+series
+At
+
+sequence
+
+Suppose A wins its game. Then it made at most q − 1
+queries to PRF-Srv and so B makes at most q− 1 queries
+to Help. It is also the case that all predictions by A are
+for unique tag, message pairs, meaning that B’s output
+will also be for unique pairs of targets. Finally, it is clear
+that correct predictions σi are also BCDH solutions.
+
+a
+
+B.2 Pseudorandomness Security
+See the full version of this paper [25] for one-more PRF
+security deﬁnitions and associated proofs.
+
+Game om-UNPAΠ
+(pk, sk) ←$ K
+c ← 0
+(t1, m1, σ1), . . . ,( t(cid:31), m(cid:31), σ(cid:31)) ←$ APRF-Srv,H1,H2
+If ∃i (cid:27)= j . (ti, mi) = (tj, mj) then Ret false
+Ret (∧i(σi = F H1,H2
+PRF-Srv(t, Y )
+c ← c + 1
+Ret PRF-SrvH1,H2
+
+(ti, mi)) ∧ c < (cid:18))
+
+(t, Y )
+
+sk
+
+sk
+
+Figure 11: Security game for one-more unpredictability.
+
+This notion of security is sufﬁcient for PYTHIA in ap-
+plications where the output of the protocol is not stored,
+but rather used as an unforgeable credential such as with
+our hardened Brainwallet application (Section 6).
+
+it
+
+The security of our scheme is based on the fol-
+lowing one-more bilinear computational Difﬁe-Hellman
+(BCDH) problem, an extension of the one-more CDH
+assumption given by Boldyreva [10].
+To the best
+of our knowledge this assumption is new, but
+is
+a straightforward adaptation of previous one-more as-
+sumptions [6, 10] to our setting. For a pairing setup G,
+game om-BCDHG is deﬁned in Figure 12. In words, the
+adversary gets a group element gs
+1k ∈ G1 as well as
+target oracles Targ1, Targ2 that return random group ele-
+ments in G1, G2 respectively. Finally the adversary can
+query a helper oracle Help that raises GT elements to the
+k. To win, it must compute (cid:28) values e(Xi, Yj)k for (cid:28)
+larger than the number of helper queries and each Xi, Yj
+a unique pair of (distinct) values returned by the target or-
+acle. Let Advom-cdh
+
+(B) = Pr(cid:31) om-BCDHBG ⇒ true(cid:30).
+
+We have the following theorem establishing the one-
+more unpredictability of our scheme The proof is essen-
+tially identical to the proof of Boldyreva’s blind signa-
+tures [10].
+
+G
+
+Theorem 1 Let Π be the simpliﬁed partially oblivious
+PRF protocol for a pairing setup G and H1, H2 mod-
+eled as random oracles. Then for any one-more un-
+predictability adversary A making at most q PRF-Srv
+queries, we give in the proof below a one-more CDH ad-
+versary B such that
+
+Advom-unp
+
+Π
+
+(A) ≤ Advom-cdh
+
+G
+
+(B)
+
+where B runs in time that of A plus O(q) group opera-
+tions.
+Proof: We assume without loss of generality that A
+never repeats a query to either random oracle and makes
+a random oracle H1(ti) and H2(mi) query for each
+(ti, mi, σi) triple it outputs. The adversary B will work
+as follows when given inputs G, X and access to oracles
+Targ1, Targ2, Help. First, it runs A. Whenever A makes
+
+562  24th USENIX Security Symposium 
+
+USENIX Association
+
+16
+
+

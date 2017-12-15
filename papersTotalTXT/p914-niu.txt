@@ -1,0 +1,2193 @@
+Per-Input Control-Flow Integrity
+
+Ben Niu
+
+Lehigh University
+
+19 Memorial Dr West
+Bethlehem, PA, 18015
+ben210@lehigh.edu
+
+Gang Tan
+
+Lehigh University
+
+19 Memorial Dr West
+Bethlehem, PA, 18015
+
+gtan@cse.lehigh.edu
+
+ABSTRACT
+Control-Flow Integrity (CFI) is an effective approach to mitigat-
+ing control-ﬂow hijacking attacks. Conventional CFI techniques
+statically extract a control-ﬂow graph (CFG) from a program and
+instrument the program to enforce that CFG. The statically gener-
+ated CFG includes all edges for all possible inputs; however, for a
+concrete input, the CFG may include many unnecessary edges.
+
+We present Per-Input Control-Flow Integrity (PICFI or πCFI),
+which is a new CFI technique that can enforce a CFG computed
+for each concrete input. πCFI starts executing a program with
+the empty CFG and lets the program itself lazily add edges to the
+enforced CFG if such edges are required for the concrete input.
+The edge addition is performed by πCFI-inserted instrumentation
+code. To prevent attackers from arbitrarily adding edges, πCFI
+uses a statically computed all-input CFG to constrain what edges
+can be added at runtime. To minimize performance overhead, op-
+erations for adding edges are designed to be idempotent, so they
+can be patched to no-ops after their ﬁrst execution. As our evalu-
+ation shows, πCFI provides better security than conventional ﬁne-
+grained CFI with comparable performance overhead.
+
+Categories and Subject Descriptors
+D.4.6 [Software]: Operating Systems—Security and Protection
+
+Keywords
+Control-Flow Integrity; Dynamic CFI
+
+1.
+
+INTRODUCTION
+
+Modern software exploitation techniques such as Return-Oriented
+Programming (ROP [27]) rely on hijacking the control ﬂow of a
+victim program to abnormally execute dangerous system calls (e.g.,
+mprotect and execve). Although mainstream operating sys-
+tems (i.e., Windows, Linux and OSX) have deployed mitigation
+methods such as Data Execution Prevention (DEP) and Address
+Space Layout Randomization (ASLR), control-ﬂow hijacking is
+still one of the largest threats to software security. Besides those
+
+Permission to make digital or hard copies of all or part of this work for personal or
+classroom use is granted without fee provided that copies are not made or distributed
+for proﬁt or commercial advantage and that copies bear this notice and the full citation
+on the ﬁrst page. Copyrights for components of this work owned by others than the
+author(s) must be honored. Abstracting with credit is permitted. To copy otherwise, or
+republish, to post on servers or to redistribute to lists, requires prior speciﬁc permission
+and/or a fee. Request permissions from Permissions@acm.org.
+CCS’15, October 12–16, 2015, Denver, Colorado, USA.
+Copyright is held by the owner/author(s). Publication rights licensed to ACM.
+ACM 978-1-4503-3832-5/15/10 ...$15.00.
+DOI: http://dx.doi.org/10.1145/2810103.2813644.
+
+already-in-use mitigation methods, another effective way of de-
+fending against control-ﬂow hijacking attacks is Control-Flow In-
+tegrity (CFI, [1]). In its conventional form, CFI statically computes
+a Control-Flow Graph (CFG) and instruments the binary code by
+adding checks before indirect branches (i.e., indirect calls, indirect
+jumps, and returns). These checks ensure any control transfer dur-
+ing execution never deviates from the CFG, even under attacks.
+
+Despite effectiveness, not every CFI implementation provides
+the same level of protection, since CFI’s security depends on the
+precision of the enforced CFG. The more precise the CFG is, the
+less choices attackers have when redirecting the control ﬂow, the
+more security a particular CFI implementation provides. Coarse-
+grained CFI (e.g., CCFIR [34], binCFI [35], and kBouncer [21])
+enforces a coarse-grained CFG in which there are a few equiva-
+lence classes of target addresses (or even just one equivalence class)
+and an indirect branch is allowed to target one of the equivalence
+classes. For example, binCFI allows return instructions to return
+to all possible return addresses. Unfortunately, the precision of
+coarse-grained CFI is too low and it is still possible to mount ROP
+attacks on coarse-grained CFI, as shown in recent work [13, 10,
+8]. Fine-grained CFI enforces a much higher-precision CFG; each
+indirect branch can have its own set of target addresses. For in-
+stance, MCFI [19] and forward-edge CFI [29] are compiler-based
+frameworks that build ﬁne-grained CFGs from source code using
+high-level type information.
+
+Whether it be coarse-grained or ﬁne-grained CFI, a fundamen-
+tal limitation of previous CFI methods is that the enforced CFGs
+are computed by static analysis, which has to consider all possible
+program inputs. Consequently, the precision of a statically com-
+puted CFG cannot be better than an “ideal” CFG, which is the
+minimal CFG when considering all program inputs. Computing
+such “ideal” CFGs is in general intractable and static analysis has
+to over-approximate. More importantly, even an “ideal” CFG in-
+cludes unnecessary edges for a concrete program input. Therefore,
+our idea is to explore whether it is possible to generate a CFG for
+each concrete input and enforce it at runtime for that input alone.
+Intuitively, the per-input CFG should have a better precision than a
+statically computed, all-input CFG.
+
+In this paper, we present Per-Input Control-Flow Integrity (PICFI,
+or πCFI), a general CFI method for generating and enforcing per-
+input CFGs. Since it is impossible to enumerate all inputs of a pro-
+gram, computing the CFG for each input and storing all per-input
+CFGs are infeasible. Instead, we adopt the following approach: we
+start a program with the empty CFG and let the program itself lazily
+compute the CFG on the ﬂy. One idea of computing the CFG lazily
+is to add edges to the CFG at runtime, before indirect branches
+need those edges. In this way, the per-input CFG generation prob-
+lem becomes feasible: for an arbitrary input, the dynamically gen-
+
+914erated and enforced CFG is equivalent to what should have been
+computed prior to the execution.
+
+However, two challenges still remain to be addressed. First,
+since edge addition is issued by untrusted code, how to prevent
+it from arbitrarily adding edges? πCFI should be able to identify
+those edges that shall never be added. To address this challenge,
+πCFI reuses previous CFI methods to ﬁrst compute an all-input
+CFG statically. Speciﬁcally, our πCFI implementation builds on
+MCFI and RockJIT [20] for all-input C/C++ CFG generation us-
+ing source-level type information and class hierarchies, but it could
+be based on any previous CFI method. Then πCFI starts running
+the program with the empty CFG being enforced. At runtime, the
+program adds edges on the ﬂy, but πCFI disallows addition of any
+edge not included in the static, all-input CFG. In other words, the
+all-input CFG serves as the upper bound for what edges can be
+added to the enforced CFG during runtime.
+
+The second challenge is how to achieve small performance over-
+head for enforcing πCFI? For each indirect branch, there is a need
+to add the necessary edge into the CFG. This can be achieved by
+code instrumentation; that is, by inserting extra code that adds edges
+into the original program. However, such instrumentation can be
+costly since every time the indirect branch gets executed, the edge-
+addition operation needs to be performed. πCFI adopts a perfor-
+mance optimization technique, with some loss of CFG precision.
+This technique turns edge addition to address activation. In par-
+ticular, instead of directly adding edges, πCFI activates target ad-
+dresses. Activating an address essentially adds all edges with that
+address as the target into the currently enforced CFG. The bene-
+ﬁt of using address activation operations is that they can be made
+idempotent operations with some careful design. With idempotent
+operations, we can safely patch them to no-ops after their ﬁrst exe-
+cution, minimizing performance overhead.
+
+In summary, we highlight our contributions below:
+
+• We propose πCFI, a general CFI method for generating and
+enforcing per-input CFGs. Our experiments show that πCFI
+eliminates many unnecessary edges in its enforced CFGs.
+For SPECCPU2006 benchmarks, on average the number of
+edges in the enforced CFGs are only about 10.4% of the
+number of edges in static, all-input CFGs. Moreover, πCFI’s
+runtime overhead is small; only 3.2% on average for SPEC-
+CPU2006 benchmarks.
+
+• We propose techniques that make the per-input CFI idea efﬁ-
+cient and secure, including lazy CFG computation, idempo-
+tent address activation, and secure code patching.
+
+• We have built a framework to harden applications with πCFI,
+and evaluated πCFI’s security and performance with respect
+to SPECCPU2006, the Google V8 JavaScript engine, and the
+Nginx HTTP server. Our implementation is publicly avail-
+able for download on https://github.com/mcfi.
+
+The remainder of this paper is organized as follows. We intro-
+duce related work in Sec. 2 before providing an overview of πCFI
+in Sec. 3. We describe technical details of πCFI in Sec. 4 and
+the implementation in Sec. 5. We analyze πCFI’s security in Sec.
+6 and performance in Sec. 7. Finally in Sec. 8 and 9 we discuss
+future work and draw conclusions.
+
+2. RELATED WORK
+
+CFI [1] extracts a Control-Flow Graph (CFG) from a program
+and instruments the program by adding checks before indirect branch
+instructions. During runtime, before any indirect branch is exe-
+cuted, the inserted checks query the CFG to ensure that only targets
+
+whitelisted in the CFG are allowed. As a result, CFI guarantees that
+any runtime control-ﬂow transfer must correspond to an edge in the
+CFG. The converse does not always hold, as a CFG is a static over-
+approximation of a program’s runtime control ﬂow. A program can
+have many CFGs; some are more precise than others.
+
+For each CFG of a program, indirect branches and their targets
+can be partitioned into equivalence classes. Indirect branches can
+target any indirect branch targets in the same equivalence class,
+but none in other equivalence classes. Different CFI techniques
+support different numbers of equivalence classes. In general, CFI
+techniques in the literature can be classiﬁed into two categories:
+coarse-grained CFI and ﬁne-grained CFI, depending on their sup-
+port for equivalence classes.
+
+Coarse-grained CFI supports program-agnostic number of equiv-
+alence classes, which is usually no more than three.
+In coarse-
+grained CFGs, typically each kind of indirect branches is allowed
+to target one equivalence class. For instance, in binCFI return in-
+structions are allowed to target all return addresses, which are ad-
+dresses following call instructions. Example coarse-grained CFI
+techniques include PittSFIeld [16], NaCl [32, 26], CCFIR [34],
+binCFI [35], and MIP [18]. The major beneﬁt of coarse-grained
+CFI is that coarse-grained CFGs are easier to build, even without
+access to source code (e.g., [17]). But on the down side, the coarse-
+grained CFGs are too permissive so that it is still possible to mount
+attacks in general, as demonstrated in recent work [13, 10, 8].
+
+Fine-grained CFI supports program-dependent number of equiv-
+alence classes. Each indirect branch can have its own target set.
+Example ﬁne-grained CFI approaches include several systems [12,
+31, 2, 9, 23]. However, limited by their CFI enforcement mecha-
+nisms, none of them supports modularity (dynamic code linking or
+Just-In-Time compilation). Tice et al. [29] proposed an approach
+to ﬁne-grained CFI with (partial) modularity support. However, it
+does not protect return instructions, and its modularity support in-
+troduces time windows for attacks during dynamic module linking.
+MCFI [19] is the ﬁrst ﬁne-grained CFI technique that supports dy-
+namic code linking, and its follow-up work RockJIT [20] extends
+MCFI to support ﬁne-grained CFG generation for C++ and secure
+Just-In-Time (JIT) compilation.
+(In the remainder of this paper,
+We use MCFI to reference the combined work in [19] and [20].)
+Lockdown [22] is another ﬁne-grained CFI enforcement system,
+which can work on stripped binaries without access to source code.
+However, its execution performance overhead is higher than MCFI
+because its implementation is based on dynamic binary translation.
+None of the above mentioned CFI techniques supports per-input
+CFGs; they provide less security than πCFI. Independently and
+concurrently with πCFI, HAFIX [4] enforces per-input CFGs using
+specially built hardware. However, compared to πCFI’s support for
+all indirect branches, HAFIX only supports per-input CFGs with
+respect to returns. HAFIX also lacks support for multi-threaded
+programs, which are supported by πCFI. In addition, πCFI is a
+pure software-based technique that can run on existing commodity
+hardware, which is more deployable than HAFIX that modiﬁes the
+hardware.
+
+Systems such as XFI [12] protect the integrity of the stack by
+using a shadow stack. It ensures that a return instruction always
+returns to its actual runtime call site. πCFI’s protection on return
+instructions falls between conventional CFI and the shadow-stack
+defense: it ensures a return instruction in a function can return to
+only those call sites that have so far called the function. πCFI, on
+the other hand, better protects other indirect branches (e.g., indirect
+calls) and is compatible with unconventional control ﬂow mech-
+anisms such as exception handling. A more detailed comparison
+will be offered in the next section.
+
+915Code-Pointer Integrity (CPI [15]) is a recent system that isolates
+all data related to code pointers into a protected safe memory re-
+gion and thus can mitigate control-ﬂow hijacking attacks.
+It is
+also a compiler-based framework and has low performance over-
+head. However, it relies on a whole-program analysis that sepa-
+rates code-pointer data and the rest and lacks modularity support.
+Furthermore, CPI does not directly enforce a control-ﬂow graph.
+The control-ﬂow graph provided by CFI methods such as πCFI
+is valuable to other software-protection mechanisms because they
+can use it to perform static-analysis based optimization and veriﬁ-
+cation [33].
+
+3. πCFI MOTIVATION AND OVERVIEW
+
+Before introducing the detailed system design of πCFI, in this
+section we present an overview, including its threat model, some
+terminology, motivation for per-input CFGs, and the beneﬁts of ad-
+dress activation.
+
+3.1 Threat model
+
+πCFI protects user-level applications. Its trusted computing base
+
+includes the following components: the underlying software-hardware
+stack (including the CPU, the virtual machine if there is one, and
+the operating system); πCFI’s LLVM-based compilation toolchain;
+and πCFI’s runtime. In the entire execution of a πCFI-protected
+program, the runtime maintains the code and data separation: those
+virtual memory pages containing code (including dynamically gen-
+erated code) and read-only data are non-writable, and those vir-
+tual pages containing data are non-executable. Similar to other
+CFI work, πCFI assumes that attackers have full control over all
+writable virtual memory pages allocated to the application. An at-
+tacker can modify any location of those pages between two consec-
+utive instructions.
+
+3.2 Terminology
+
+We introduce some terminology that will make the following dis-
+cussion more convenient. Conceptually, a CFI method involves two
+kinds of control-ﬂow graphs:
+
+• A static, all-input CFG. This is typically computed by static
+analysis. We call this the Static CFG, abbreviated to SCFG.
+
+• The CFG that is currently enforced. Checks are inserted be-
+fore indirect branches to consult this CFG to decide whether
+indirect branches are allowed. We call this the Enforced
+CFG, abbreviated to ECFG.
+
+In previous CFI methods, SCFG = ECFG, and we call them con-
+ventional CFI. In πCFI, SCFG ⊇ ECFG. When a program starts
+in πCFI, the ECFG is the empty graph. As the program runs, the
+ECFG grows, but πCFI uses the SCFG to upper bound the growth;
+that is, the ECFG is always a subgraph of the SCFG.
+
+These two kinds of CFGs could be represented as two separate
+data structures, but πCFI uses one single data structure to represent
+both:
+the SCFG is represented as two tables; the ECFG is rep-
+resented by marking the SCFG with special bits, which tell what
+addresses have been activated. We will discuss the representation
+in detail in the implementation section (Sec. 5).
+
+3.3 Motivation for per-input CFGs
+
+πCFI’s Enforced CFG (ECFG) is computed for each speciﬁc in-
+put. We next use a toy C program listed in Figure 1 to illustrate its
+high-level idea and security beneﬁts. The main function in the pro-
+gram has an if branch, whose condition depends on the number of
+
+/* We omit code that handles user inputs. The
+
+...
+return;
+
+if (argc < 2) {
+
+code contains a stack buffer overflow so
+that attackers can control the following
+return instruction’s target. */
+
+1 void foo(void) {
+2
+3
+4
+5
+6
+7
+8 }
+9 int main(int argc, char *argv[]) {
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19 }
+
+foo();
+L1:
+... /* irrelevant code, omitted */
+execve(...); /* arguments omitted */
+
+} else {
+foo();
+L2: ...
+
+}
+
+Figure 1: A motivating example for per-input CFGs.
+
+command-line arguments. Assume that the number of command-
+line arguments is greater than or equal to two in a particular pro-
+duction environment. The main function invokes the foo function
+(whose code is omitted) to handle user inputs. Let us assume that
+foo’s code has a stack-overﬂow vulnerability that enables attack-
+ers to control its return target. Apparently, this vulnerability can
+be easily exploited to hijack the control ﬂow of this program. (For
+simplicity, we ignore ASLR and stack canaries in our discussion
+since they are orthogonal defense mechanisms to CFI.)
+
+With conventional CFI protection, which enforces a CFG for all
+inputs, this particular program is still vulnerable. Notice that the
+main function invokes foo at two different places. As a result,
+both L1 and L2 are possible return addresses for foo.
+In con-
+ventional CFI, foo’s return is always allowed to target both ad-
+dresses. Therefore, even if the program executes only the else
+branch when deployed, attackers can still control foo’s return and
+redirect it to L1. With appropriate data manipulation, the attacker
+might execute the following execve with arbitrary arguments.
+
+With πCFI, such an attack can be prevented. One possible in-
+strumentation method is shown in Figure 2 so that the program can
+add its required edges during execution.
+(Instead of edge addi-
+tion, πCFI actually uses address activation, which will be discussed
+later.) The program is started with the empty ECFG. At runtime,
+the else branch will be executed, but right before foo is called
+at line 20, the edge from foo’s return to L2 is added (by calling
+πCFI’s trusted runtime at line 19). When foo returns, it is only
+allowed to target L2, not L1, as no such an edge has been added to
+the ECFG.
+
+We note that the example in Figure 1 can also be protected by
+defenses that protect the stack through a shadow stack. For in-
+stance XFI [12] adopts the shadow-stack defense to protect return
+addresses. This ensures that a function returns to the caller that
+called it. As a result, the return instruction in foo can return
+only to L2 when it is called in the else branch.
+In compari-
+son, πCFI’s protection on return instructions is weaker: it ensures
+a return instruction in a function can return to only those call sites
+that have so far called the function. On the other hand, πCFI of-
+fers a number of beneﬁts than the shadow-stack approach. First,
+it provides stronger protection for indirect calls. For instance, if
+in an SCFG an indirect call is allowed to target two functions, say
+f1 and f2, but in one code path only f1’s address is taken, then
+the indirect call will be disallowed to target f2 in πCFI. XFI, as
+
+916/* We omit code that handles user inputs. The
+
+code contains a stack buffer overflow so
+that attackers can control the following
+return instruction’s target. */
+
+if (argc < 2) {
+
+...
+return;
+
+1 void foo(void) {
+2
+3
+4
+5
+6
+7
+8 }
+9 int main(int argc, char *argv[]) {
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23 }
+
+/* connect foo’s return to L1 */
+add_edge(foo, L1); /* Instrumentation */
+foo();
+L1:
+... /* irrelevant code, omitted */
+execve(...); /* arguments omitted */
+
+} else {
+
+}
+
+/* connect foo’s return to L2 */
+add_edge(foo, L2); /* Instrumentation */
+foo();
+L2: ...
+
+Figure 2: Edge-addition instrumentation for the motivating exam-
+ple.
+
+it stands, allows an indirect call to target any address according
+to the static CFG and cannot restrict the set of targets per a spe-
+ciﬁc input as πCFI does. Second, the shadow-stack defense tra-
+ditionally has compatibility issues with code that uses unconven-
+tional control-transfer mechanisms including setjmp/longjmp, ex-
+ceptions, and continuations since they do not follow the rigid call-
+return matching paradigm. πCFI offers the compatibility advantage
+because it can be parametrized by any SCFG and is compatible with
+code that uses unconventional control-transfer mechanisms.
+
+However, since πCFI does not perform address deactivation (ex-
+cept in rare situations when a code module is explicitly unloaded),
+one worry is that most of the time its ECFG grows along with the
+program execution. In theory, an attacker might use some mali-
+cious input to trigger the activation of all targets in an SCFG, in
+which case πCFI falls back to conventional CFI. This is especially
+a concern for a long running program that keeps taking inputs, such
+as a web server or a web browser. However, we believe πCFI offers
+beneﬁts even for such kind of programs, for the following reasons:
+
+• An attacker would need to ﬁnd a set of inputs that can trigger
+the activation of all targets of her/his interest; this is essen-
+tially asking the attacker to solve the code coverage problem,
+a traditionally hard problem in software testing.
+
+• Our preliminary experiments (presented in Sec. 6) suggest
+that the number of edges in an ECFG stabilizes to a small
+percentage of the total number of edges in an SCFG even for
+long running programs that continuously take normal user
+inputs. We believe this is due to several factors. First, a
+typical application includes a large amount of error-handling
+code, which will not be run in normal program execution.
+For instance, Saha et al. [24] found that 48% of Linux 2.6.34
+driver code is found in functions that handle at least one er-
+ror and in general systems software contains around 43% of
+the code in functions that contain multiple blocks of error-
+handling code. Second, an application may contain code that
+handle different conﬁgurations (like the motivating example)
+of execution environments. It is generally hard for a static
+
+analysis to construct a per-conﬁguration CFG as it has to con-
+sider features such as environment variables and C macros.
+Finally, static analysis has to over-approximate when con-
+structing static CFGs. As a result, many dynamically un-
+reachable edges are included. For instance, static analysis
+may fail to recognize dead code in the application and allow
+indirect branches to target addresses in the dead code. This
+is especially the case for functions in library code.
+
+• A long running program that continuously takes user inputs
+typically forks new processes or pre-forks a pool of processes
+for handling new inputs. For instance, web servers such as
+Apache and Nginx pre-fork a process pool for handling web
+requests. In πCFI, the CFG growth of a child process is inde-
+pendent of the CFG growth of the parent process. This setup
+limits the CFG growth of such programs.
+
+3.4 From edge addition to address activation
+The simple instrumentation shown in Figure 2 has performance
+problems: each time foo is invoked, add_edge is also invoked.
+Although we can use static analysis to eliminate redundant edge-
+addition calls (e.g., it might be possible to hoist such calls outside
+a loop), it would be hard to minimize such instrumentation code.
+Instead, we propose an alternative approach.
+
+We design every operation that modiﬁes the ECFG to be idem-
+potent and eliminate it by patching it to no-ops after its ﬁrst exe-
+cution. An idempotent operation is designed so that the effect of
+performing it twice is the same as the effect of performing it only
+once. Therefore, after the ﬁrst time, there is no need to perform it
+again. For example, the operation on line 19 in Figure 2 is idempo-
+tent: it transfers the control to the trusted runtime, and the runtime
+adds an edge from foo’s return to L2 to the CFG. Before the run-
+time returns, it can patch the code at line 19 with no-ops to reduce
+any subsequent execution’s cost.1 Furthermore, as we will explain,
+using idempotent operations is also important for code synchro-
+nization when performing online code patching in multi-threaded
+applications running on multi-core architectures.
+
+However, how to make every edge addition idempotent? Con-
+sider an example of an indirect call. Before the indirect call, we
+could add an edge addition to register the edge required to execute
+the call. However, this operation is not idempotent, because the in-
+direct call may have a different target next time it is invoked. One
+solution is to use an operation that adds all possible edges for the
+indirect call according to the SCFG. This operation is idempotent,
+but is incompatible with dynamic linking, during which the SCFG
+itself changes and new targets for the indirect call may be added.
+
+Our solution is to turn edge addition to address activation of stat-
+ically known addresses to enable idempotence. In general, we ob-
+serve that only if an indirect branch’s target address is activated,
+can the address be reachable by the indirect branch. Activating an
+address has the same effect as adding all edges that target the ad-
+dress from the current (and future) SCFG to the current (and future)
+ECFG. Activating a statically known address is idempotent, as ac-
+tivating the same address twice has the same effect as activating it
+only once.
+
+4. πCFI SYSTEM DESIGN
+
+In this section, we discuss the detailed system design of πCFI,
+including how it achieves secure online code patching, how it ac-
+
+1The edge addition happens only once in the code of Figure 2, but in other
+examples such an operation may be executed multiple times, for instance,
+when it is in a loop.
+
+917Virtual Address Space
+
+SCFG/ECFG
+
+πCFI runtime
+
+Unmapped region
+Page mapping
+
+Shadow RO-Data (W)
+
+Physical Pages
+
+Shadow Code (W)
+
+Data (RW)
+
+Sandbox
+
+RO-Data (R)
+
+Code (RX)
+
+Physical Pages
+
+Figure 3: Memory layout of πCFI. “R”, “W” and “X” appearing in
+parentheses denote the Readable, Writable, and eXecutable mem-
+ory page permissions, respectively. The “RO-” preﬁx means Read-
+Only.
+
+tivates addresses for each kind of indirect branch target addresses,
+and how it is made compatible with typical software features.
+
+4.1 Secure code patching
+
+Idempotent address-activation operations allow πCFI to patch
+the operations with no-ops after their ﬁrst execution, but the patch-
+ing should be securely performed. Online code patching typically
+implies granting the writable permission to code pages, which en-
+ables code-injection attacks. To avoid such risks, we adopt the
+approach of RockJIT [20] and NaCl-JIT [3] that securely handles
+JITted code manipulation and generalize it to patching regular code
+(i.e., non-JITted code).
+
+Figure 3 shows the memory layout of an application protected
+with πCFI. The application should have been compiled and instru-
+mented by πCFI’s compilation toolchain. The application and all
+its instrumented libraries are loaded into a sandbox created by the
+πCFI runtime. The sandbox can be realized using Software-based
+Fault Isolation (SFI [30]) or some hardware support. For example,
+we can instrument all memory writes to ensure their targets always
+stay within the sandbox. Code in the sandbox cannot arbitrarily ex-
+ecute or write memory pages outside the sandbox, but has to invoke
+trampolines provided by the πCFI runtime; these trampolines allow
+the untrusted code to escape the sandbox safely. The runtime also
+maintains the invariant that no memory pages in the sandbox are
+writable and executable simultaneously, at any time. In addition,
+the runtime guarantees that read-only data, such as jump tables, are
+not writable. The πCFI runtime and the encoded SCFG/ECFG stay
+outside the sandbox. The encoded SCFG/ECFG is read-only from
+the application’s perspective, but writable by the runtime.
+
+To enable secure patching, πCFI’s runtime allocates another set
+of writable virtual memory pages, called shadow code pages, out-
+side the sandbox and maps these pages to exactly the same physi-
+cal pages as the application’s code pages inside the sandbox. The
+shadow code pages are writable by the runtime, but cannot be mod-
+iﬁed by the application since those pages are outside the sandbox.
+In this way, πCFI maintains the invariant that no memory pages in
+
+the sandbox are writable and executable at the same time. More
+importantly, the πCFI runtime can securely perform code patches
+on the shadow code pages and these changes are synchronously re-
+ﬂected in the application’s code pages since they are mapped to the
+same physical pages.
+
+Figure 3 also shows parallel mapping of the read-only data. They
+contain runtime-adjustable read-only data, especially the GOT.PLT
+data in Linux. The PLT (Procedure Linkage Table) contains a list
+of entries that contain glue code emitted by the compiler to sup-
+port dynamic linking. Code in the PLT entries uses target addresses
+stored in the GOT.PLT table (GOT is short for Global Offset Table).
+The GOT.PLT table is adjusted during runtime by the linker to dy-
+namically link modules. However, security weakness also results
+from the GOT.PLT table’s writability, as demonstrated by an at-
+tack [10]. To address this security concern, πCFI sets the GOT.PLT
+table to be always read-only inside the sandbox and creates out-
+side the sandbox a shadow GOT.PLT table, which is mapped to the
+same physical pages as the in-sandbox GOT.PLT table. All changes
+to the GOT.PLT table are therefore checked and performed by the
+πCFI runtime, which ensures that each entry’s value is the address
+of either the dynamic linker or the address of a function whose
+name is the same as the corresponding PLT entry’s name.
+
+4.2 Address activation
+
+πCFI dynamically activates indirect branch targets. When a tar-
+get address is submitted to πCFI’s runtime for activation, it consults
+the encoded SCFG to check if the address is a valid target address;
+if so, the runtime activates the address (by enabling it in the ECFG)
+so that future indirect branches can jump to it.
+
+For each target address, there is a time window during which
+that target can be activated—from the beginning of program exe-
+cution to immediately before the target is ﬁrst used in an indirect
+branch; in the case when a target is never used in a program run,
+the time window is from the beginning of program execution to in-
+ﬁnity. One way to think of conventional CFI is to view it as an
+approach that eagerly activates all target addresses at the beginning
+of program execution. πCFI, on the other hand, wants to delay ad-
+dress activation as late as possible to improve security. One natural
+approach would be to always activate a target immediately before
+its ﬁrst use. This approach, however, does not take into account
+other constraints, which are discussed as follows:
+
+• Idempotence. As we mentioned before, for efﬁciency we
+want every address-activation operation to be idempotent so
+that we can patch it to no-ops after its ﬁrst execution. This
+constraint implies that not every address activation can hap-
+pen immediately before its ﬁrst use. We previously discussed
+the indirect-call example: if we insert an address-activation
+operation for the actual target immediately before the indi-
+rect call, that operation is not idempotent because the target
+might be different next time the indirect call is invoked.
+
+• Atomic code updates.
+
+It is tricky to perform online code
+patching on modern multi-core processors.
+If some code
+update by a thread is not atomic, then it is possible for an-
+other thread to even see corrupted instructions. Therefore, a
+πCFI patch operation must be atomic, which means that any
+hardware thread should either observe the address-activation
+operation before the patch or the no-ops after the patch. For-
+tunately, x86 CPUs manufactured by both Intel and AMD
+support atomic instruction stream changes if the change is of
+eight bytes and made to an eight-byte aligned memory ad-
+dress, as conﬁrmed by Ansel et al. [3]. We take advantage
+of this hardware support to implement πCFI’s instrumenta-
+
+918tion and patching. It is important to stress that it is possi-
+ble that the code in memory has been atomically patched
+by one thread, but the code cache for a different hardware
+thread might still contain the old address-activation oper-
+ation. Consequently, the address-activation operation may
+be re-executed by the second thread. However, since all
+our address-activation operations are idempotent, their re-
+execution does not produce further effect. Once again, idem-
+potence is of critical importance.
+
+Therefore, the issue of when to activate a target address has to
+be carefully studied considering the aforementioned constraints.
+πCFI selects different design points for different kinds of target
+addresses, including return addresses, function addresses, virtual
+method addresses, and addresses associated with exception han-
+dlers. Each kind of these target addresses has different activation
+sites, which will be discussed next. Without losing generality, we
+use x86-64 Linux to discuss the technical details. As we will see,
+activation of target addresses is the result of a careful collaboration
+between πCFI’s compilation toolchain, its loader, and its runtime.
+
+4.2.1 Return addresses
+
+The most common kind of indirect-branch targets is return ad-
+dresses. A return address could be activated immediately before a
+return instruction. However, it would not be an idempotent opera-
+tion as the same return instruction may return to a different return
+address next time it is run. Instead, πCFI activates a return address
+when its preceding call instruction is executed. The activation pro-
+cedure is different between direct calls and indirect calls, which are
+discussed separately next.
+
+For a direct call, we use the example in Figure 4 to illustrate
+its activation procedure. To activate return address L following a
+direct call to foo, the following steps happen:
+
+1. Before the direct call, πCFI’s compilation toolchain inserts
+appropriate no-ops (line 3) to align L to an 8-byte aligned ad-
+dress. πCFI’s implementation is based on MCFI [19], which
+requires all target addresses are 8-byte aligned.
+
+2. When the code is loaded into memory by πCFI’s loader (part
+of its runtime), the immediate operand of the call instruction
+(line 4) is replaced with an immediate called patchstub,
+as shown in Figure 4 (b). Therefore, the call is redirected to
+patchstub, whose code is listed in Figure 5.
+
+3. When line 4 is reached after the program starts execution,
+the control transfers to patchstub. It ﬁrstly pops the re-
+turn address L from the stack (line 2 in Figure 5) to %r11,
+which can be used as a scratch register thanks to the call-
+ing convention of x86-64 Linux. It then invokes return_-
+address_activate provided by πCFI’s runtime.2
+
+4. The runtime, once entered, saves the context and activates
+L by updating the ECFG. πCFI reuses MCFI’s tables for
+encoding an SCFG. There is a table called Tary in MCFI
+that lists all valid target addresses. So activating an address
+means an update to the Tary table to enable the address; we
+will discuss the detailed address-activation method through
+the Tary table in the implementation section.
+
+5. The runtime then copies out eight bytes from [L-8, L), mod-
+iﬁes the immediate operand of the call instruction to target
+foo, and uses an 8-byte move instruction to patch the code,
+
+2The %gs segment register points to an area outside of the πCFI sandbox.
+
+loading
+
+1 // (a) before
+2 //
+3
+4
+5 L:
+
+nop
+call foo
+
+// (b) after
+//
+
+loading
+
+// (c) after
+//
+
+patching
+
+nop
+call patchstub
+
+nop
+call foo
+
+L:
+
+L:
+
+Figure 4: How πCFI activates a return address following a direct
+call instruction. L is 8-byte aligned.
+
+1 patchstub:
+2
+pop %r11
+3
+jmp %gs:return_address_activate
+
+Figure 5: The patch stub for activating return addresses.
+
+as shown in Figure 4 (c). Finally, the runtime restores the
+context and jumps to line 4 in Figure 4 (c) to execute the
+patched call instruction.
+
+A few points are worth further discussion. First, since any re-
+turn address is 8-byte aligned and any direct call instruction is 5-
+byte long, 8-byte atomic code update is always feasible and con-
+sequently all threads either call patchstub or foo. Second, the
+ECFG update should always be conducted prior to the update that
+changes patchstub to foo; otherwise another thread would be
+able to enter foo’s code and execute foo’s return instruction with-
+out L being activated.
+
+Finally, the patchstub uses the stack to pass the address to be
+activated and therefore there is a small time window between the
+call to patchstub and the stack-pop instruction in patchstub
+during which an attacker can modify the return address on the stack.
+However, the most an attacker can do is to activate a different
+valid target address because the πCFI runtime would reject any
+invalid target address according to the SCFG. More importantly,
+since there are CFI checks before return instructions, CFI will never
+get violated. If we want to guarantee that πCFI always activates the
+intended address, one simple way would be to load the return ad-
+dress to a scratch register and pass the value to patchstub via
+the scratch register. This would add extra address loading instruc-
+tions and no-ops after patching. Another way would be to have a
+dedicated patch stub for each call instruction (instead of sharing a
+patch stub among all call instructions and relying on the stack for
+passing the return address). This solution would cause roughly the
+same runtime overhead, at the cost of additional code bloat (around
+14% on average for SPECCPU2006 C/C++ benchmarks).
+
+Next we describe how πCFI activates return addresses follow-
+ing indirect calls. Only indirect calls through registers are emit-
+ted in πCFI-compiled code, as all indirect calls through memory
+are translated to indirect calls through registers. The instrumenta-
+tion is listed in Figure 6. The cfi-check at line 3 is an opera-
+tion that performs CFI checks and can be implemented using any
+conventional CFI (our implementation uses MCFI checks [19]).
+The cfi-check also contains no-ops to align L to an 8-byte
+aligned address. In addition, πCFI inserts a 5-byte no-op (line 4)
+at compile-time (Figure 6 (a)) so that at load time a direct call to
+the patchstub can be inserted (Figure 6 (b)). Note that in this
+case when patchstub gets called its stack pop instruction (line 2
+in Figure 5) does not load L to %r11, but the runtime can straight-
+forwardly calculate L by rounding %r11 to the next 8-byte aligned
+address. After the return address is activated by the runtime, the
+patchstub call is patched back to the 5-byte no-op (Figure 6 (c)).
+The patch is atomic because an indirect call instruction through a
+
+9191 // (a) before
+2 //
+3
+4
+5
+6 L:
+
+loading
+cfi-check %r8
+nop // 5-byte
+call *%r8
+
+// (b) after
+//
+
+loading
+cfi-check %r8
+call patchstub
+call *%r8
+
+// (c) after
+//
+
+patching
+
+cfi-check %r8
+nop
+call *%r8
+
+L:
+
+L:
+
+Figure 6: How πCFI activates a return address following an
+indirect-call instruction. L is 8-byte aligned.
+
+1 void foo(void) {}
+2 void bar(void) {}
+3 void (*fp) = &foo;
+4 int main() {
+5
+6
+7
+8 }
+
+void (*bp) = &bar;
+fp();
+bp();
+
+Figure 7: Example code for function address activation.
+
+register in x86-64 is encoded with either 2 or 3 bytes; therefore, the
+patched bytes will always stay within [L-8, L).
+
+4.2.2 Function addresses
+
+As discussed before, we cannot activate the target address imme-
+diately before an indirect call because of the idempotence require-
+ment. Instead, πCFI activates the address of a function at the place
+when the function’s address is taken. Consider an example shown
+in Figure 7, where foo and bar are global functions. foo’s ad-
+dress is taken at line 3, while bar’s address is taken at line 5. For
+those functions whose addresses are taken in the global scope, such
+as foo, πCFI activates their addresses at the beginning of execu-
+tion; hence no additional instrumentation and patching are required
+for these function addresses. For functions whose addresses are
+taken elsewhere, such as bar, πCFI inserts address-activation op-
+erations right before their address-taking sites. As an example, Fig-
+ure 8 presents part of the code that is compiled from the example
+in Figure 7 and the lea instruction at line 4 in Figure 8 takes the
+address of bar. Before the instruction, πCFI’s compilation inserts
+a direct call to patchstub_at (at line 2 in Figure 8 (a)), which
+is another stub similar to Figure 5 but invokes a separate runtime
+function) to activate bar’s address. However, a mechanism is re-
+quired to translate the value passed on stack into bar’s address,
+which is achieved by the label (“__picfi_bar”) inserted at line
+3. The label consists of a special preﬁx (“__picfi_”) and the
+function’s name (bar), so the runtime can look up the symbol ta-
+ble to translate the stack-passed value to the function’s name during
+execution, and then looks up the symbol table again to ﬁnd the ad-
+dress of bar. Appropriate no-ops are also inserted before line 2 so
+that the 5-byte patchstub_at call instruction ends at an 8-byte
+aligned address to enable atomic patching. The patching replaces
+the call instruction with a 5-byte no-op shown in Figure 8 (b).
+
+C++ code can also take the address of non-virtual methods. Such
+an address is activated in the same way as a function address; that
+is, it is activated at the place where the address is taken.
+
+Besides, functions’ addresses can also be explicitly taken at run-
+time by the libc function dlsym. Therefore, we changed dlsym’s
+implementation so that before dlsym returns a valid function ad-
+dress, a πCFI runtime trampoline is called to activate the function’s
+address.
+
+call patchstub_at
+
+1 // (a) after loading
+2
+3 __picfi_bar:
+4
+
+lea bar(%rip), %rcx
+
+// (b) after patching
+
+nop // 5-byte
+
+__picfi_bar:
+
+lea bar(%rip), %rcx
+
+Figure 8: πCFI’s instrumentation for activating a function address.
+
+A() {}
+virtual void foo(void) {}
+virtual void bar(void) {}
+
+B() : A() {}
+virtual void foo(void) {}
+
+public:
+
+1 class A {
+2
+public:
+3
+4
+5
+6 };
+7 class B : A {
+8
+9
+10
+11 };
+12 int main() {
+13
+14
+15
+16
+17 }
+
+B *b = new B;
+b->foo();
+A *a = new A;
+a->foo();
+
+Figure 9: Example C++ code for demonstrating virtual methods’
+address activation.
+
+4.2.3 C++ virtual method addresses
+
+πCFI activates a virtual method’s address when the ﬁrst object
+of the virtual method’s class is instantiated. Consider the code ex-
+ample in Figure 9. Methods A::bar and B::foo’s addresses are
+activated at line 13, because class B has foo declared and inherits
+the bar method from class A. Method A::foo’s address is acti-
+vated at line 15.
+
+In πCFI, the address-activation operations for virtual method ad-
+dresses are actually inserted into the corresponding classes’ con-
+structors so that, when a constructor gets ﬁrst executed, all vir-
+tual methods in its virtual table are activated. For example, sup-
+pose Figure 10 (a) shows the prologue of A’s constructor A::A,
+which is 8-byte aligned. When the code is loaded into memory,
+as shown in Figure 10 (b), πCFI’s runtime changes the prologue
+to a direct call to patchstub_vm (which is another stub similar
+to patchstub in Figure 5 but jumps to a separate runtime func-
+tion to activate virtual methods) so that, when A::A is ﬁrstly en-
+tered, the virtual method activation is carried out. Note that in this
+case when patchstub_vm is executed, its stack pop instruction
+(same as line 2 in Figure 5) does not set %r11 as the constructor’s
+address, so the runtime needs to calculate it by taking the length
+of the patchstub_vm call instruction (5 bytes) from %r11. Af-
+ter its ﬁrst execution, the runtime patches the direct call back to
+its original bytes, and executes the actual code of A::A. Only ﬁve
+bytes are modiﬁed in the patching process, and all these ﬁve bytes
+reside in an 8-byte aligned slot; therefore, the patch can be per-
+formed atomically.
+
+The above virtual method activation procedure assumes a class
+object is always created by calling one of the class’s constructors.
+Although most classes have constructors, there are exceptions. For
+example, due to optimization, some constructors might be inlined.
+We could either disable the optimization or activate the addresses
+of the associated virtual methods at the beginning of the program
+execution. πCFI chooses the latter method for simplicity and per-
+formance.
+
+920loading
+
+1 // (a) before
+2 //
+3 A::A:
+4 push %rbp
+5 mov %rsp,%rbp
+
+// (b) after
+//
+A::A:
+
+loading
+
+// (c) after
+// patching
+A::A:
+
+call patchstub_vm
+... // omitted
+
+push %rbp
+mov %rsp,%rbp
+
+Figure 10: How πCFI activates a virtual method by instrument-
+ing and patching a C++ class constructor A::A, which is 8-byte
+aligned.
+
+4.2.4 Exception handler addresses
+
+Exception handlers include code that implements C++ catch
+clauses and code that is generated by the compiler to release re-
+sources during stack unwinding3. We consider an exception han-
+dler’s address activated when the function where the exception han-
+dler resides gets executed for the ﬁrst time. Therefore, same as how
+πCFI instruments and patches C++ constructors, πCFI also instru-
+ments those functions that have exception handlers when loading
+the code into memory and patches the code back to its original
+bytes when such functions are executed for the ﬁrst time.
+
+4.3 Compatibility issues
+
+As a defense mechanism, πCFI transforms an application to in-
+sert CFI checks and code for address activation, and performs on-
+line patching. We next discuss how this process is made compatible
+with typical programming conventions, including dynamic linking,
+process forking, and signal handling.
+Dynamic linking. The ability to load/unload libraries dynamically
+is essential to modern software and makes it possible to share com-
+monly used libraries across applications. πCFI’s implementation
+is based on MCFI, designed to support modularity features such as
+dynamic linking and JIT compilation. Whenever a new library is
+dynamically loaded, MCFI builds a new Static CFG (SCFG) based
+on the original application together with the new library; the new
+SCFG will be installed and used from that point on.
+
+πCFI’s design of using address activation is also compatible with
+dynamic linking, based on the following reasoning. When an ad-
+dress, say addr, is activated, all edges with addr as the target in
+the SCFG are implicitly added to the Enforced CFG (ECFG). Now
+suppose a library is dynamically loaded. It triggers the building of a
+new SCFG, which may allow more edges to target addr, compared
+to the old SCFG. However, since addr has already been activated,
+the current ECFG allows an indirect branch to target addr through
+newly added edges. Therefore, address activation accommodates
+dynamic linking.
+
+πCFI also supports dynamic library unloading. When a library
+is unloaded, all indirect branch targets inside the library’s code are
+marked inactive. This prevents all threads from entering the li-
+brary’s code, since there should be no direct branches targeting
+the library4. However, there might be threads currently running
+or sleeping in the library’s code. Hence, it is unsafe to harvest the
+library code pages at this moment; otherwise those pages could be
+reﬁlled with newly loaded library code and the sleeping threads
+might resume and execute unintended instructions. To safely han-
+dle this situation, πCFI asynchronously waits until it observes that
+all threads have executed at least one system call or runtime tram-
+poline call; we instrumented each syscall instruction in the libc
+
+3Compilers in Linux implement exception handling following the Itanium
+C++ ABI.
+4This is generally true for libraries, but not for JITted code, in which case
+we need to check the remaining code for this condition.
+
+to increment a per-thread counter when a syscall instruction is
+executed. Then the runtime can safely reclaim the memory allo-
+cated for the library.
+Process forking. In Linux, the fork system call is used to spawn
+child processes. For example, the Nginx HTTP server forks child
+processes to handle user requests. During forking, all non-shared
+memory pages are copied from the parent process to the child pro-
+cess (typically using a copy-on-write mechanism for efﬁciency).
+As a result, the child process has its own copy of the SCFG/ECFG
+data structure. This is good for security, because the child and the
+parent processes can grow their ECFGs separately as each has its
+own private copy of the data structure.
+
+However, there is an issue with respect to the code pages. Re-
+call that, to achieve secure code patching, the actual code pages
+and the shadow code pages are mapped to the same physical pages
+(as shown in Figure 3). In Linux, this is achieved by using mmap
+with the MAP_SHARED argument. As a result, the actual code
+pages are considered shared and the fork system call would not
+make private copies of the code pages in the child process. Con-
+sequently, we would encounter the situation of having shared code
+pages and private CFG data structures between the parent and the
+child processes. This would create the following possibility: the
+parent would activate an indirect branch target address, update its
+private ECFG, and patch the code; the child would lose the op-
+portunity to patch the code and update its private ECFG, since the
+address-activation instrumentation would have been patched by the
+parent; the child’s subsequent normal execution would be falsely
+detected as CFI violation.
+
+To solve this problem, πCFI intercepts the fork system call,
+and before it is executed πCFI copies the parallel-mapped code
+pages to privately allocated memory and unmaps those pages. Then
+fork is invoked, which copies the private code pages as well. The
+runtimes in both processes next restore the parallel mapping in their
+own address spaces using the saved code bytes. This solution al-
+lows the child process to have its private code pages and CFGs. The
+same solution also applies to those parallel-mapped read-only data
+pages (shown in Figure 3). It should be pointed out that this solu-
+tion does not support fork calls issued in a multi-threaded process,
+because the unmapping would crash the program if other threads
+are running. However, to the best of our knowledge, multi-threaded
+processes rarely fork child processes due to potential thread syn-
+chronization problems. Another downside of this approach is that
+it disables code sharing among processes, which would increase
+physical memory consumption.
+Signal Handling. On Linux, signal handlers are usually not in-
+voked by any application code5, so they do not return to the ap-
+plication code. Instead, signal handlers return to a code stub set
+up by the OS kernel, which invokes the sigreturn system call.
+πCFI provides new function attributes for developers to annotate
+signal handlers in the source code and inlines the code stub into
+each signal handler during code generation. Each signal handler is
+associated with a special type signature, therefore it will never be-
+come any indirect call target. Moreover, since the signal handler is
+sandboxed in the same way as regular application code, the signal
+handling stack for each thread should be in the sandbox. Therefore,
+after a new thread is created, the libc code allocates a memory re-
+gion inside the sandbox and executes sigaltstack to switch the
+stack to the in-sandbox region, which is released when the thread
+exits. Although the signal stack is allocated in the sandbox, we
+
+5If a signal handler is invoked by application code, we can change the code
+to duplicate the handler so that the copy is never invoked.
+
+921believe it is hard for attackers to mount reliable attacks, and the
+reasons will be explained in Sec. 6.
+
+5.
+
+IMPLEMENTATION
+
+The πCFI toolchain basically has two tools: an LLVM-based
+C/C++ compiler, which is built on top of MCFI’s compiler for code
+instrumentation and generation of SCFG-related metadata; and a
+runtime that loads instrumented modules and monitors their execu-
+tion.
+
+The πCFI compiler is modiﬁed from Clang/LLVM-3.5, with a
+diff result of 4,778 lines of changes.
+In summary, the MCFI-
+speciﬁc changes to LLVM propagate metadata such as class hierar-
+chies and type information for generating the SCFG. The metadata
+are inserted into the compiled ELF as new sections. The instrumen-
+tation for indirect branches follows MCFI. For better efﬁciency, we
+applied the sandboxing method of ISBoxing [11] to instrument in-
+direct memory writes. In detail, the sandbox for running applica-
+tions is within [0, 4GB) 6, and the πCFI compiler instruments each
+indirect memory write instruction by adding a 0x67 preﬁx, which
+is the 32-bit address-override preﬁx. The preﬁx forces the CPU
+to clear all upper 32 bits after computing the target address. The
+πCFI-speciﬁc changes to LLVM identify function address-taking
+instructions and insert calls to patchstub_at before these in-
+structions (detailed in Sec. 4). In addition, each πCFI-protected
+application runs with instrumented libraries. Therefore, we also
+modiﬁed and instrumented standard C/C++ libraries, including the
+musl libc, libc++, libc++abi, and libunwind.
+
+The πCFI runtime consists of 11,002 lines of C/assembly code
+The runtime is position-independent, and is injected to an appli-
+cation’s ELF as its interpreter. When the application is launched,
+the Linux kernel loads and executes the runtime ﬁrst. The runtime
+then loads the instrumented modules into the sandbox region, cre-
+ates shadow regions, and patches the code appropriately (detailed
+before in Sec. 4). The SCFG is generated using the metadata in
+the code modules, but initially all target addresses in the SCFG are
+made inactive (this encodes an implicit empty ECFG). The details
+of how SCFG is encoded can be found in the MCFI paper. As a
+summary, the SCFG is encoded as two tables: the Bary table re-
+members the IDs of all indirect branches; the Tary table records
+the IDs of all indirect branch targets. All IDs are 8-byte long and
+stored at 8-byte aligned addresses to enable atomic updates. For
+each indirect branch, MCFI’s instrumentation retrieves its ID from
+Bary, and the intended target ID from Tary, then compares whether
+the IDs are equal to detect CFI violation. In each ID, there are sev-
+eral validity bits at ﬁxed positions and with special values; invalid
+IDs do not have those bit values at those positions. As a result,
+to mark a target address inactive, πCFI simply changes the val-
+ues of those validity bits to wrong values in the target’s relevant
+Tary ID. During an address-activation operation, the πCFI runtime
+atomically marks the address active (if it is a valid target address)
+by changing the values of the validity bits back and patches the
+address-activation operation to no-ops.
+
+6. SECURITY ANALYSIS
+
+πCFI can mitigate both code injection and code reuse attacks.
+For code-injection attacks, πCFI enforces DEP (Data Execution
+Prevention) at all times; its runtime enforces this by intercepting
+and checking all systems calls that may change memory protec-
+tion, including mmap, mprotect and munmap. Therefore, code
+
+6The maximum sandbox size can be extended to 64TB on x86-64 if the
+sandboxing technique in PittSFIeld [16] is used or the πCFI runtime is im-
+plemented as a kernel module.
+
+injection attacks are impossible for programs that do not generate
+code at runtime. For programs that generate code on-the-ﬂy (i.e.,
+JIT compilers), their JITted code manipulation is performed by the
+trusted runtime following the work of RockJIT. Attackers may still
+inject code into the JITted code, but the injected code never vio-
+lates CFI due to online code veriﬁcation. For example, the injected
+code should never contain any system call instruction. Further, JIT
+spraying [5] attacks are also prevented, because CFI never allows
+indirect branches to target the middle of instructions.
+
+For code-reuse attacks (e.g., ROP), πCFI mitigates them by en-
+forcing a ﬁne-grained per-input CFG, which provides multiple se-
+curity beneﬁts. First of all, when there is dead code in a program,
+its ECFG makes dead code unreachable. For instance, if a libc
+function is never called in an application’s source code (including
+libraries), then it is unreachable at runtime. This property makes
+remote exploits nearly impossible for programs that never invoke
+critical system functions (e.g., execve) as most attacks rely on
+invoking such functions to cause damage. Examples of such pro-
+grams include compression tools (e.g., gzip), bind (a widely-used
+DNS server), and memcached etc.; they do not invoke execve-
+like functions.
+
+Second, by reducing indirect branch targets/edges, πCFI makes
+it hard for attackers to redirect the control ﬂow from the ﬁrst in-
+struction they can control (e.g., an indirect branch) to their tar-
+geted sensitive function. Using MCFI’s CFG as the baseline, we
+next present experiments that measure πCFI’s indirect branch tar-
+get/edge reduction.
+
+On a machine running x86-64 Linux, we compiled and instru-
+mented all 19 SPECCPU2006 C/C++ benchmark programs with
+the O3 optimization. We then measured the statistics of the en-
+forced CFGs using the reference data sets that are included in the
+benchmarks. If a benchmark program has multiple reference data
+sets, we chose the one that triggered the most address-activation
+operations (i.e., the worst case). The results are shown in Table 1.
+The “RAA” column shows the percentage of return addresses that
+are activated at the end of the program over the return addresses in
+MCFI’s CFG; the “FAA” column shows the percentage of activated
+function addresses over function addresses in MCFI’s CFG (note
+that not all functions are indirect-branch targets in MCFI’s CFG; if
+a function’s address is never taken, then MCFI does not allow the
+function to be called via an indirect branch); the “VMA” column
+shows the percentage of activated virtual method addresses; the
+“EHA” column shows the percentage of activated exception han-
+dlers. Finally, “IBTA” column shows the percentage of all activated
+indirect branch target addresses, and the “IBEA” column shows the
+percentage of indirect-branch edges in πCFI’s ECFG at the end of
+the program over the indirect-branch edges in MCFI’s CFG. Those
+C programs (i.e., those above 444.namd in the table) do not have
+virtual methods or exception handlers; therefore, VMA and EHA
+measurements are not applicable to them.
+
+As can be seen in the table, only a small percentage (10.4% on
+average) of indirect branch edges are activated in the ECFG. Most
+programs activate less than 20% of indirect branch edges, which
+severely limits attackers’ capability of redirecting control ﬂow. The
+low percentage of edge activation is mostly attributed to the low
+percentage of return address activation as return addresses are the
+most common kind of indirect-branch targets. Function addresses
+are activated in higher percentages. The reason is that C programs
+tend to take addresses of functions early in the program and store
+them in function-pointer tables. From the perspective of security
+engineering, it would be better to refactor such programs to dynam-
+ically take function addresses, following the principle of least priv-
+ilege. In addition, to simulate real attack scenarios when attackers
+
+922Benchmark
+400.perlbench
+401.bzip2
+403.gcc
+429.mcf
+433.milc
+445.gobmk
+456.hmmer
+458.sjeng
+462.libquantum
+464.h264ref
+470.lbm
+482.sphinx
+444.namd
+447.dealII
+450.soplex
+453.povray
+471.omnetpp
+473.astar
+483.xalancbmk
+
+5.6%
+
+IBTA
+
+EHA
+IBEA
+VMA
+RAA
+FAA
+N/A 22.5% 15.4%
+N/A
+19.9% 83.2%
+N/A
+6.1%
+N/A
+5.0% 41.9%
+N/A 28.6% 20.3%
+N/A
+27.0% 91.7%
+7.4%
+N/A
+6.1%
+N/A
+5.5% 45.0%
+N/A 13.9%
+9.6%
+N/A
+13.6% 41.9%
+N/A 43.4% 64.4%
+N/A
+35.4% 98.1%
+9.4%
+N/A
+9.4%
+N/A
+9.2% 32.9%
+N/A 10.3%
+8.3%
+N/A
+9.8% 46.3%
+N/A
+8.3%
+7.7%
+N/A
+7.2% 39.3%
+N/A 20.0% 20.6%
+N/A
+19.5% 49.5%
+N/A
+7.4%
+N/A
+4.5% 40.0%
+N/A 19.1% 14.8%
+18.9% 44.8%
+N/A
+3.5%
+3.2%
+5.3% 84.3% 61.5%
+8.9%
+5.5%
+7.1% 95.5% 32.2% 13.0% 10.7%
+7.6%
+8.9% 87.7% 69.8% 19.5% 14.2%
+12.9% 92.1% 62.9%
+9.6%
+5.3% 16.1%
+19.1% 94.8% 55.4% 37.7% 25.3% 13.9%
+5.3% 87.4% 61.2%
+6.4%
+14.3% 94.5% 56.6% 27.9% 21.4% 13.5%
+
+2.2%
+
+5.1%
+
+8.9%
+
+RAA: Return Address Activation; FAA: Function Address Activation; VMA:
+Virtual Method Activation; EHA: Exception Handler Activation; IBTA: Indi-
+rect Branch Target Activation; IBEA: Indirect Branch Edge Activation.
+
+Table 1: ECFG statistics of SPECCPU2006 C/C++ programs.
+
+25%
+
+20%
+
+15%
+
+10%
+
+5%
+
+0%
+
+10s 20s 30s 40s 50s 60s 70s 80s 90s 100s 110s 120s 130s 140s
+
+checkspam
+
+Figure 11: Growth of activated target addresses for 400.perlbench.
+
+can feed multiple different inputs to a given program to trigger as
+many indirect branch targets as possible, we calculated the cumula-
+tive total indirect branch targets for 400.perlbench and 403.gcc by
+merging the activated addresses of each input ﬁle in both the test
+and reference data sets. For 400.perlbench, about 31.9% of indi-
+rect branch targets are cumulatively activated; for 403.gcc, around
+34.9%. These numbers indicate that it might be hard to activate all
+indirect branches even with multiple inputs.
+
+In our experiments, we were also interested in learning how the
+ECFG grows over time. For each benchmark, we measured the
+number of activated indirect branch targets over time. For most
+benchmarks (18 out of 19), most address activation happens at the
+beginning of execution and grows slowly (and stabilizes in most
+cases). For example, Figure 11 shows the target activation of the
+400.perlbench program when tested on its longest-running data set
+checkspam. The X-axis is the execution time and the Y-axis is
+the proportion of activated indirect branch targets. However, we
+also observed an outlier, 403.gcc when tested over the g23 data
+set, whose address activation curve is drawn in Figure 12. As can
+be seen, the address activation shows steep growth even at the end;
+on the other hand, it does not activate more target addresses com-
+pared to other input data sets, which trigger similar ECFG growth
+as 400.perlbench.
+
+We also built and instrumented the Google V8 JavaScript engine
+as a standalone executable. We ran V8 on three benchmark suites:
+Sunspider 1.0.2, Kraken 1.1, and Octane 2. We collected ECFG
+statistics for those benchmark suites in Table 2. The ﬁrst “No in-
+put” row shows the statistics when no input is fed to V8. Note that
+the benchmarks, especially Octane 2 (around 373K lines of Java-
+Script code) does not activate signiﬁcantly more targets than the no-
+
+30%
+
+25%
+
+20%
+
+15%
+
+10%
+
+5%
+
+0%
+
+8s
+
+16s
+
+24s
+
+32s
+
+40s
+
+48s
+
+g23
+
+Figure 12: Growth of activated target addresses for 403.gcc.
+
+Benchmark
+No input
+Sunspider 1.0.2
+Kraken 1.1
+Octane 2
+
+FAA
+
+VMA EHA
+
+RAA
+IBEA
+15.6% 86.5% 41.4% 2.2% 18.5% 17.8%
+23.1% 86.8% 56.2% 2.2% 26.1% 24.9%
+21.8% 86.9% 53.9% 2.2% 24.8% 23.2%
+26.6% 87.0% 59.2% 2.2% 29.5% 28.6%
+
+IBTA
+
+Table 2: ECFG statistics of the Google V8 JavaScript engine.
+
+input case. When we merge all benchmarks’ results, about 30% of
+indirect branch targets are activated in total, slightly more than the
+result triggered by Octane 2. Therefore, given the size and diversity
+of benchmarks, we hypothesize that other JavaScript programs will
+not activate signiﬁcantly more addresses than those benchmarks.
+The ECFG growth curve of V8 when tested over Octane 2 is shown
+in Figure 13, from which we can see that the number of target acti-
+vation grows very slowly after the initial burst, similar to what we
+observed on SPEC benchmarks.
+
+One security concern about πCFI is that a long running program
+that keeps taking user input may be able to trigger the activation
+of all target addresses. For evaluation, we used πCFI to protect an
+Nginx server and used the sever to host a WordPress site. Then one
+of the authors used almost all features of WordPress for a session of
+about 20 minutes. Table 3 shows the address activation results. We
+conﬁgured Nginx to use two processes: the master process was re-
+sponsible for initialization and handling administrators’ commands
+while a worker process created by the master processed all user
+inputs. πCFI’s design allows the master and worker to have differ-
+ent ECFGs; therefore their address activation results are different.
+Figure 14 shows the target activation growth curve for the worker
+process. Similar to other tested programs, the percentage quickly
+stabilized. This preliminary experiment shows that πCFI provides
+security beneﬁts even for long running programs. As discussed be-
+fore, we believe this is because programs have a large amount of
+unused code for a particular input, including exception-handling
+code, library code, and code for handling different conﬁgurations.
+Next we brieﬂy discuss how recently proposed attacks are miti-
+
+gated by πCFI.
+COOP attacks. Counterfeit Object-Oriented Programming (COOP
+[25]) attacks construct counterfeit C++ objects with forged virtual
+table pointers and carefully chain virtual calls to achieve Turing-
+complete computation, even in applications protected with coarse-
+grained CFI. However, as mentioned by the authors of COOP, CFI
+solutions that generate ﬁne-grained CFGs based on class hierar-
+chies tend to be immune to COOP. Since πCFI builds static CFGs
+using class hierarchies (similar to SafeDispatch) and performs on-
+line activation of virtual methods, COOP is made harder on πCFI-
+protected C++ applications.
+CFB attacks. Control-Flow Bending (CFB, [7]) is a recently pro-
+posed general methodology for attacking conventional CFI systems
+that statically generate CFGs. At a high level, CFB abuses certain
+functions (called dispatchers) whose execution may change their
+own return addresses to "bend" the control ﬂow. These dispatchers
+are often common libc routines (e.g., memcpy, printf, etc.) that
+
+92330%
+
+25%
+
+20%
+
+15%
+
+10%
+
+5%
+
+0%
+
+3s
+
+6s
+
+9s
+
+12s
+
+15s
+
+18s
+
+21s
+
+24s
+
+27s
+
+Octane2
+33s
+
+30s
+
+20%
+
+15%
+
+10%
+
+5%
+
+0%
+
+120s
+
+240s
+
+360s
+
+480s
+
+600s
+
+720s
+
+840s
+
+960s
+
+1080s
+
+Figure 13: Growth of activated target addresses for V8.
+
+Figure 14: Growth of activated target addresses for Nginx.
+
+Benchmark
+Master
+Worker
+
+FAA
+
+IBEA
+RAA
+IBTA
+9.3% 67.1% 13.3%
+8.6%
+14.9% 73.5% 19.0% 13.2%
+
+Table 3: ECFG statistics of the Nginx HTTP server’s master and
+worker processes.
+
+12%
+
+9%
+
+6%
+
+3%
+
+0%
+
+-3%
+
+πCFI
+MCFI
+
+are invoked in many places of the program to increase the possi-
+bility of bending the control ﬂow to critical system call sites. Dif-
+ferent dispatchers can be chained to achieve more ﬂexibility. For
+example, the authors show that memcpy and ngx_snprintf in
+Nginx can be used as dispatchers to alter the normal control ﬂow to
+another site where execve is reachable.
+
+πCFI mitigates CFB attacks by reducing the number of return
+addresses of dispatchers. For example, the same exploit to attack
+Nginx in the CFB paper would fail in πCFI-protected Nginx, be-
+cause the dispatcher chain will be cut off due to inactive return ad-
+dresses in the worker process. (Speciﬁcally, ngx_exec_new_-
+binary is not executed in the worker process, so all return ad-
+dresses inside it won’t be activated.) The xpdf exploit in the CFB
+paper can also be prevented since it does not use execve-like
+functions, which makes those functions unreachable. To attack
+πCFI, attackers may ﬁrstly need to steer the control ﬂow to acti-
+vate return addresses of their interest.
+
+On top of πCFI, we can further mitigate CFB attacks by dis-
+abling certain dispatchers. For example, in our implementation,
+memcpy is changed so that its return address is stored in a dedi-
+cated register once it is entered. When memcpy returns, the value
+stored in the register is used. Similar changes are also made to other
+strcat-like libc functions. With these changes, the attackers can
+no longer directly use those functions as dispatchers, although they
+can still use the callers of those functions. As long as those func-
+tion’s callers do not have as many call sites as those functions, what
+the attackers can do becomes more restricted.
+SROP attacks. SROP [6] attacks exploit the Linux signal han-
+dling mechanism to mount attacks. Speciﬁcally, when a signal
+is delivered to a thread, the Linux kernel suspends the thread and
+saves its context (e.g., program counter and stack pointer) onto the
+thread’s signal handling stack in user space and invokes the signal
+handler. After the signal handler ﬁnishes execution, it returns to a
+kernel-inserted stub calling sigreturn, which restores the saved
+thread context. Therefore, it is possible that attackers may change
+the saved context or fake one and redirect the control ﬂow to a
+sigreturn system call and restore the context to execute arbi-
+trary code. πCFI mitigates SROP attacks by inlining sigreturn
+system calls into each signal handler, which is unreachable from
+other application code. As a result, attackers need to trigger real
+signals to execute the sigreturn system call. To corrupt the
+saved thread context, the attackers have to either exploit a buggy
+signal handler, or use other threads to concurrently and reliably
+modify the signal handling thread’s saved context, neither of which
+we believe is easy since signal handlers rarely have complex code
+and usually do not run for an extended period of time.
+
+G e o M e a n (All)
+G e o M e a n (C + +)
+G e o M e a n (F P)
+G e o M e a n (C)
+G e o M e a n (IN T)
+4 8 3.xala ncb m k
+4 7 3.astar
+4 8 2.sp hinx
+4 7 0.lb m
+4 7 1.o m n etp p
+4 6 2.lib q u a ntu m
+m er
+4 6 4.h 2 6 4ref
+4 5 8.sje n g
+4 4 7.d e alII
+4 3 3.milc
+4 5 3.p ovray
+4 4 5.g o b m k
+4 5 0.so plex
+4 4 4.n a m d
+4 2 9.m cf
+4 0 3.gcc
+4 0 1.bzip 2
+4 0 0.p erlb e nch
+4 5 6.h m
+
+Figure 15: πCFI and MCFI runtime overhead on SPECCPU2006
+C/C++ benchmarks.
+
+7. PERFORMANCE EVALUATION
+
+As a security mechanism, πCFI’s performance overhead should
+be small to have a chance of being adopted in practice. πCFI’s de-
+sign is geared toward having a small runtime overhead, including
+the use of idempotent operations and online code patching. Next
+we report our experiment results of the performance overhead of
+πCFI, including runtime and space overhead. Of the two, having a
+small runtime overhead is much more important. All performance
+numbers were measured on a system with an Intel Xeon E3-1245
+v3 processor, 16GB memory, and 64-bit Ubuntu 14.04.2. For com-
+parison, we also measured MCFI’s performance overhead using the
+same machine and compilation conﬁguration.
+SPECCPU2006. The SPECCPU2006 benchmark suite consists of
+19 C/C++ benchmarks. We compiled all of them at the O3 opti-
+mization level using the πCFI compilation toolchain and measured
+their execution time increase compared to their counterparts that
+were compiled with a native Clang/LLVM compiler. Each bench-
+mark was executed three times over its own reference data sets with
+a less than 1% standard deviation. The runtime-overhead results are
+presented in Figure 15. On average, πCFI incurs 3.9% overhead on
+integer benchmarks and 3.2% overhead over all benchmarks (in-
+cluding both integer and ﬂoating-point benchmarks). In compari-
+son, MCFI incurs 3.7% and 2.9% on the same benchmark sets. We
+note that the original MCFI paper [19] reports around 5% runtime
+overhead. The major difference is because we changed its way of
+sandboxing indirect memory writes to use a more efﬁcient tech-
+nique (following [11]). Compared to MCFI, πCFI causes a small
+increase of runtime overhead, due to address-activation operations
+and execution of no-ops after patching.
+
+The ﬁgure also shows that there are a few benchmarks (e.g.,
+450.soplex) that have slight speedups after πCFI’s protection. To
+investigate the phenomenon, we replaced the instrumentation with
+no-ops and still observed speedups; so they should be resulted from
+extra alignments added during compilation (the same speedup phe-
+nomenon has been observed by other work in the SFI/CFI litera-
+ture). Another note is that the runtime overhead is positively corre-
+lated with the frequency of indirect branches executed in a run. We
+measured the correlation using the Pearson correlation coefﬁcient
+and got the result of 0.74, which indicates strong correlation.
+
+924πCFI
+MCFI
+
+port both, but it would be interesting to explore other CPU archi-
+tectures such as ARM and MIPS.
+
+60%
+
+50%
+
+40%
+
+30%
+
+20%
+
+10%
+
+0%
+
+Rich ards
+
+D elta Blu e
+
+E arley B oyer
+R ayTrace
+R e g E xp
+Crypto
+
+S playL ate ncy
+N avierStokes
+S play
+
+M a n dre elL ate ncy
+M a n dre el
+G a m e b oy
+P dfJ S
+
+C o d e L o a d
+
+B ox2 D
+
+zlib
+
+G e o M e a n (O cta n e 2)
+G e o M e a n (O cta n e)
+T yp escript
+
+Figure 16: πCFI and MCFI runtime overhead on Octane 2 bench-
+marks with Google V8.
+
+Due to instrumentation, the code size for benchmarks is enlarged
+by 5.6% to 67.4%, with an average of 21.2%. Code size of C++
+programs increases more than C programs, due to a higher density
+of indirect branches.
+V8. Following the RockJIT approach [20], we instrumented the
+V8 JavaScript engine (version 3.29.88.19 on x86-64) using πCFI’s
+compiler with the release mode, and measured the performance
+overhead on the Octane 2 benchmarks. Figure 16 shows the runtime-
+overhead results. On average, 11.8% runtime overhead is incurred
+by πCFI, while 10.7% by MCFI. As analyzed before, πCFI still
+costs a bit more time than MCFI due to online address activa-
+tion and patched no-ops. Also, we separately calculated runtime-
+overhead results for the subset of benchmarks that were included in
+Octane 1 (the predecessor of Octane 2) since past work used Oc-
+tane 1 for evaluation. πCFI incurs only 3.1% overhead over them
+on average, which is slightly higher than MCFI (or RockJIT). Com-
+pared to other JIT-compiler hardening work, such as NaCl-JIT [3],
+librando [14], and SDCG [28], πCFI incurs less overhead and pro-
+vides better security. In terms of code bloat, the code size of V8
+increases by around 35.7% after the πCFI instrumentation.
+Nginx. We compiled nginx-1.4.0 with the O2 optimization and
+measured its throughput. Using the ab command, we found that the
+binary hardened by πCFI had about the same maximum throughput
+as the native version. The code size increases by about 22.3%.
+
+8. FUTURE WORK
+
+In πCFI, the ECFG grows monotonically if no code is unloaded.
+A larger ECFG decreases the strength of the CFI protection. As
+a result, a potential future direction is to study when to deactivate
+addresses safely. In general, an address of an application can be
+deactivated at a speciﬁc moment if no future execution of the ap-
+plication’s code will reach that address. This notion is very similar
+to garbage data as deﬁned in a garbage collector, except it is for
+code instead of data. Therefore, one idea is to design specialized
+garbage collectors for code to automatically compute what code is
+garbage and use that information to deactivate addresses in garbage
+code. Another way of address deactivation is to expose APIs to
+applications to deactivate addresses and ask developers to decide
+when and where to invoke these APIs. This is in general unsafe
+(similar to manual memory management in C/C++). However, it is
+still useful in situations when developers know exactly what code
+is inactive at a speciﬁc point.
+
+We would also like to investigate how πCFI can be implemented
+in other architectures. Its design relies on the following hardware-
+provided mechanisms: (1) virtual memory, based on which the se-
+cure code patching is implemented; (2) atomic instruction-stream
+modiﬁcation, which prevents hardware threads from executing cor-
+rupted instructions during patching. x86-32 and x86-64 CPUs sup-
+
+9. CONCLUSIONS
+
+We have presented πCFI, a new CFI technique that is able to
+generate and enforce per-input CFGs. πCFI builds on top of con-
+ventional CFI (speciﬁcally, MCFI in our implementation) with ex-
+tra instrumentation inserted to the target program. It takes advan-
+tage of MCFI’s CFG generation to compute a ﬁne-grained static
+CFG for the program. During execution, πCFI dynamically ac-
+tivates target addresses lazily before the addresses are needed by
+later execution. Our evaluation shows that πCFI can effectively re-
+duce available indirect branch edges by a large percentage, while
+incurring low overhead.
+
+10. ACKNOWLEDGMENTS
+
+We thank anonymous reviewers for their insightful comments.
+We also thank Michael Spear and Stephen McCamant for useful
+discussions. This research is supported by US NSF grants CNS-
+1408826, CCF-1217710, CCF-1149211, and a research award from
+Google.
+
+11. REFERENCES
+[1] ABADI, M., BUDIU, M., ERLINGSSON, Ú., AND LIGATTI,
+
+J. Control-Flow Integrity. In 12th ACM Conference on
+Computer and Communications Security (CCS) (2005),
+pp. 340–353.
+
+[2] AKRITIDIS, P., CADAR, C., RAICIU, C., COSTA, M., AND
+CASTRO, M. Preventing Memory Error Exploits with WIT.
+In Security and Privacy, 2008. SP 2008. IEEE Symposium on
+(May 2008), pp. 263–277.
+
+[3] ANSEL, J., MARCHENKO, P., ERLINGSSON, Ú., TAYLOR,
+
+E., CHEN, B., SCHUFF, D., SEHR, D., BIFFLE, C., AND
+YEE, B. Language-Independent Sandboxing of Just-In-Time
+Compilation and Self-Modifying Code. In ACM Conference
+on Programming Language Design and Implementation
+(PLDI) (2011), pp. 355–366.
+
+[4] ARIAS, O., DAVI, L., HANREICH, M., JIN, Y., KOEBERL,
+
+P., PAUL, D., SADEGHI, A.-R., AND SULLIVAN, D.
+HAFIX: Hardware-Assisted Flow Integrity Extension. In
+52nd Design Automation Conference (DAC) (June 2015).
+[5] BLAZAKIS, D. Interpreter Exploitation. In Proceedings of
+
+the 4th USENIX Conference on Offensive Technologies
+(2010), WOOT’10, USENIX Association, pp. 1–9.
+
+[6] BOSMAN, E., AND BOS, H. Framing signals - a return to
+
+portable shellcode. In Security and Privacy (SP), 2014 IEEE
+Symposium on (May 2014), pp. 243–258.
+
+[7] CARLINI, N., BARRESI, A., PAYER, M., WAGNER, D.,
+
+AND GROSS, T. R. Control-ﬂow bending: On the
+effectiveness of control-ﬂow integrity. In 24th USENIX
+Security Symposium (USENIX Security 15) (Washington,
+D.C., Aug. 2015), USENIX Association.
+
+[8] CARLINI, N., AND WAGNER, D. ROP is Still Dangerous:
+
+Breaking Modern Defenses. In 23rd USENIX Security
+Symposium (USENIX Security 14) (Aug. 2014), USENIX
+Association.
+
+[9] DAVI, L., DMITRIENKO, R., EGELE, M., FISCHER, T.,
+
+HOLZ, T., HUND, R., NURNBERGER, S., AND SADEGHI,
+A. MoCFI: A Framework to Mitigate Control-Flow Attacks
+on Smartphones. In Network and Distributed System Security
+Symposium (NDSS) (2012).
+
+925[10] DAVI, L., LEHMANN, D., SADEGHI, A., AND MONROSE,
+
+[23] PEWNY, J., AND HOLZ, T. Control-Flow Restrictor:
+
+F. Stitching the Gadgets: On the Ineffectiveness of
+Coarse-Grained Control-Flow Integrity Protection. In 23rd
+USENIX Security Symposium (USENIX Security 14) (Aug.
+2014), USENIX Association.
+
+[11] DENG, L., ZENG, Q., AND LIU, Y. ISboxing: An
+
+Instruction Substitution Based Data Sandboxing for x86
+Untrusted Libraries. In ICT Systems Security and Privacy
+Protection, H. Federrath and D. Gollmann, Eds., vol. 455 of
+IFIP Advances in Information and Communication
+Technology. Springer International Publishing, 2015,
+pp. 386–400.
+
+[12] ERLINGSSON, Ú., ABADI, M., VRABLE, M., BUDIU, M.,
+
+AND NECULA, G. XFI: Software Guards for System
+Address Spaces. In USENIX Symposium on Operating
+Systems Design and Implementation (OSDI) (2006),
+pp. 75–88.
+
+[13] GOKTAS, E., ATHANASOPOULOS, E., BOS, H., AND
+
+PORTOKALIDIS, G. Out Of Control: Overcoming
+Control-Flow Integrity. In Security and Privacy (SP), 2014
+IEEE Symposium on (May 2014).
+
+[14] HOMESCU, A., BRUNTHALER, S., LARSEN, P., AND
+
+FRANZ, M. Librando: Transparent Code Randomization for
+Just-In-Time Compilers. In Proceedings of the 2013 ACM
+SIGSAC conference on Computer & Communications
+Security (2013), CCS ’13, ACM, pp. 993–1004.
+
+[15] KUZNETSOV, V., SZEKERES, L., PAYER, M., CANDEA,
+
+G., SEKAR, R., AND SONG, D. Code-Pointer Integrity. In
+USENIX Symposium on Operating Systems Design and
+Implementation (OSDI) (2014), pp. 147–163.
+
+[16] MCCAMANT, S., AND MORRISETT, G. Evaluating SFI for a
+
+CISC Architecture. In Proceedings of the 15th Conference
+on USENIX Security Symposium - Volume 15 (2006),
+USENIX-SS’06, USENIX Association.
+
+Compiler-based CFI for iOS. In ACSAC ’13: Proceedings of
+the 2013 Annual Computer Security Applications Conference
+(2013).
+
+[24] SAHA, S., LOZI, J.-P., THOMAS, G., LAWALL, J., AND
+
+MULLER, G. Hector: Detecting Resource-Release Omission
+Faults in Error-Handling Code for Systems . In Dependable
+Systems and Networks (DSN), 2013 43rd Annual IEEE/IFIP
+International Conference on (June 2013), pp. 1–12.
+
+[25] SCHUSTER, F., TENDYCK, T., LIEBCHEN, C., DAVI, L.,
+
+SADEGHI, A.-R., AND HOLZ, T. Counterfeit
+Object-oriented Programming: On the Difﬁculty of
+Preventing Code Reuse Attacks in C++ Applications. In 36th
+IEEE Symposium on Security and Privacy (Oakland) (May
+2015).
+
+[26] SEHR, D., MUTH, R., BIFFLE, C., KHIMENKO, V.,
+PASKO, E., SCHIMPF, K., YEE, B., AND CHEN, B.
+Adapting Software Fault Isolation to Contemporary CPU
+Architectures. In 19th Usenix Security Symposium (2010),
+pp. 1–12.
+
+[27] SHACHAM, H. The Geometry of Innocent Flesh on the
+
+Bone: Return-into-libc without Function Calls (on the x86).
+In 14th ACM Conference on Computer and Communications
+Security (CCS) (2007), pp. 552–561.
+
+[28] SONG, C., ZHANG, C., WANG, T., LEE, W., AND MELSKI,
+
+D. Exploiting and Protecting Dynamic Code Generation. In
+22nd Annual Network and Distributed System Security
+Symposium, NDSS 2015, San Diego, California, USA,
+February 8-11, 2014 (2015).
+
+[29] TICE, C., ROEDER, T., COLLINGBOURNE, P.,
+
+CHECKOWAY, S., ERLINGSSON, Ú., LOZANO, L., AND
+PIKE, G. Enforcing Forward-Edge Control-Flow Integrity in
+GCC & LLVM. In 23rd USENIX Security Symposium
+(USENIX Security 14) (Aug. 2014), USENIX Association.
+
+[17] MOHAN, V., LARSEN, P., BRUNTHALER, S., HAMLEN,
+
+[30] WAHBE, R., LUCCO, S., ANDERSON, T. E., AND
+
+K. W., AND FRANZ, M. Opaque Control-Flow Integrity. In
+Proceedings of the 22nd Network and Distributed System
+Security Symposium (NDSS) (San Diego, California,
+February 2015).
+
+[18] NIU, B., AND TAN, G. Monitor Integrity Protection with
+
+Space Efﬁciency and Separate Compilation. In Proceedings
+of the 2013 ACM SIGSAC Conference on Computer &
+Communications Security (2013), CCS ’13, ACM,
+pp. 199–210.
+
+[19] NIU, B., AND TAN, G. Modular Control-Flow Integrity. In
+
+Proceedings of the 35th ACM SIGPLAN Conference on
+Programming Language Design and Implementation (2014),
+PLDI ’14, ACM, pp. 577–587.
+
+[20] NIU, B., AND TAN, G. RockJIT: Securing Just-In-Time
+Compilation Using Modular Control-Flow Integrity. In
+Proceedings of the 2014 ACM SIGSAC Conference on
+Computer and Communications Security (New York, NY,
+USA, 2014), CCS ’14, ACM, pp. 1317–1328.
+
+[21] PAPPAS, V., POLYCHRONAKIS, M., AND KEROMYTIS,
+
+A. D. Transparent ROP Exploit Mitigation Using Indirect
+Branch Tracing. In 22nd Usenix Security Symposium (2013).
+
+[22] PAYER, M., BARRESI, A., AND GROSS., T. R.
+
+Fine-Grained Control-Flow Integrity through Binary
+Hardening. In Proceedings of the 12th Conference on
+Detection of Intrusions and Malware and Vulnerability
+Assessment (DIMVA) (Milano, Italy, July 2015).
+
+GRAHAM, S. L. Efﬁcient Software-based Fault Isolation. In
+Proceedings of the Fourteenth ACM Symposium on
+Operating Systems Principles (1993), SOSP ’93, ACM,
+pp. 203–216.
+
+[31] WANG, Z., AND JIANG, X. HyperSafe: A Lightweight
+Approach to Provide Lifetime Hypervisor Control-Flow
+Integrity. In Security and Privacy (SP), 2010 IEEE
+Symposium on (May 2010), pp. 380–395.
+
+[32] YEE, B., SEHR, D., DARDYK, G., CHEN, J., MUTH, R.,
+
+ORMANDY, T., OKASAKA, S., NARULA, N., AND
+FULLAGAR, N. Native Client: A Sandbox for Portable,
+Untrusted x86 Native Code. In Security and Privacy, 2009
+IEEE Symposium on (May 2009), pp. 79–93.
+
+[33] ZENG, B., TAN, G., AND MORRISETT, G. Combining
+
+Control-ﬂow Integrity and Static Analysis for Efﬁcient and
+Validated Data Sandboxing. In 18th ACM Conference on
+Computer and Communications Security (CCS) (2011),
+pp. 29–40.
+
+[34] ZHANG, C., WEI, T., CHEN, Z., DUAN, L., SZEKERES,
+L., MCCAMANT, S., SONG, D., AND ZOU, W. Practical
+Control Flow Integrity and Randomization for Binary
+Executables. In Security and Privacy (SP), 2013 IEEE
+Symposium on (May 2013), pp. 559–573.
+
+[35] ZHANG, M., AND SEKAR, R. Control Flow Integrity for
+
+COTS Binaries. In Proceedings of the 22Nd USENIX
+Conference on Security (2013), SEC’13.
+
+926

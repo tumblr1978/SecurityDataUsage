@@ -1,0 +1,1995 @@
+Android ION Hazard: the Curse of Customizable Memory
+
+Management System
+
+Hang Zhang, Dongdong She, Zhiyun Qian
+
+University of California, Riverside
+
+hang@cs.ucr.edu, dshe002@ucr.edu, zhiyunq@cs.ucr.edu
+
+ABSTRACT
+ION is a uniﬁed memory management interface for Android
+that is widely used on virtually all ARM based Android de-
+vices. ION attempts to achieve several ambitious goals that
+have not been simultaneously achieved before (not even on
+Linux). Diﬀerent from managing regular memory in the
+system, ION is designed to share and manage memory with
+special constraints, e.g., physically contiguous memory. De-
+spite the great ﬂexibility and performance beneﬁts oﬀered,
+such a critical subsystem, as we discover, unfortunately has
+ﬂawed security assumptions and designs.
+
+In this paper, we systematically analyze ION related vul-
+nerabilities from conceptual root causes to detailed imple-
+mentation decisions. Since ION is often customized heavily
+for diﬀerent Android devices, the speciﬁc vulnerabilities of-
+ten manifest themselves diﬀerently. By conducting a range
+of runtime testing as well as static analysis, we are able to
+uncover a large number of serious vulnerabilities on the lat-
+est Android devices (e.g., Nexus 6P running Android 6.0 and
+7.0 preview) such as denial-of-service and dumping memo-
+ry from the system and arbitrary applications (e.g., email
+content, passwords). Finally, we oﬀer suggestions on how to
+redesign the ION subsystem to eliminate these ﬂaws. We
+believe that the lessons learned can help guide the future
+design of similar memory management subsystems.
+
+1.
+
+INTRODUCTION
+
+Android operating system has gained tremendous pop-
+ularity in the past few years thanks to the huge vendor
+support behind it. Unlike iOS that runs on only Apple-
+assembled hardware, Android is open source and encourages
+other vendors to build smartphones using it. This model
+works well as vendors do not need to build a new OS from
+scratch, and they can still heavily customize the phones to
+diﬀerentiate themselves on the market. The customization
+happens at all layers including hardware, OS, and applica-
+tions. Major vendors such as Samsung, HTC, and Huawei
+all perform customizations to attract customers with fea-
+
+Permission to make digital or hard copies of all or part of this work for personal or
+classroom use is granted without fee provided that copies are not made or distributed
+for proﬁt or commercial advantage and that copies bear this notice and the full cita-
+tion on the ﬁrst page. Copyrights for components of this work owned by others than
+ACM must be honored. Abstracting with credit is permitted. To copy otherwise, or re-
+publish, to post on servers or to redistribute to lists, requires prior speciﬁc permission
+and/or a fee. Request permissions from permissions@acm.org.
+CCS’16, October 24-28, 2016, Vienna, Austria
+c(cid:2) 2016 ACM. ISBN 978-1-4503-4139-4/16/10. . . $15.00
+DOI: http://dx.doi.org/10.1145/2976749.2978320
+
+tures like better screens, audio, and even security [29]. While
+such customization itself is encouraged, it has been shown
+that the process of customization at the software layer often
+introduces security vulnerabilities [28, 29, 27].
+
+In this study, we investigate an important OS subsystem,
+called ION, that is commonly customized to satisfy diﬀerent
+requirements from the underlying hardware devices. ION [8]
+is a uniﬁed memory management interface widely used on
+ARM based Android platforms. First introduced by Google
+in Android 4.0, it was initially designed to replace previ-
+ous fragmented interfaces originated from System-on-Chip
+(SoC) vendors [8]. Its main goal is to support the special
+requirements set by hardware devices such as the GPU and
+camera. For instance, some devices require physically con-
+tiguous memory to operate and some require certain cache
+coherency protocol for DMA to function correctly. To sat-
+isfy such requirements, on a given Android phone, ION is
+customized with a set of pre-conﬁgured memory heaps for
+the underlying hardware devices. Even though AOSP pro-
+vides a set of pre-deﬁned heap types and implementations
+of heap allocation and management, customization is com-
+monplace for performance tuning and other purposes (as we
+will show in the paper). In addition, for hardware devices
+not covered by AOSP, vendors often need to deﬁne new heap
+types as well as provide their own implementations of heap
+allocation and management.
+
+Unfortunately, the framework for supporting such cus-
+tomization is not well thought out regarding its security
+implications. For instance, we discover that the lack of ﬁne-
+grained access control to individual memory heaps can eas-
+ily cause denial-of-service of speciﬁc system services or the
+entire OS. Moreover, its buﬀer sharing capability exposes
+diﬀerent types of kernel memory to user space without be-
+ing screened carefully for security consequences. To demon-
+strate the seriousness of the identiﬁed vulnerabilities, attack
+demos and analysis can be found on our project website [1].
+In this paper, we make three main contributions:
+• We systematically analyze the security properties from
+the design and implementation of ION, and reveal two
+major security ﬂaws that lead to many vulnerabilitis and
+corresponding exploits, which are already reported to and
+conﬁrmed by Google.
+• To detect speciﬁc vulnerability instances, we develop both
+a runtime testing procedure and a novel static taint anal-
+ysis tool that help uncover vulnerabilities on newest ﬂag-
+ship models like Nexus 6P and Samsung S7 running An-
+droid 6.0 and 7.0 preview (latest at the time of writing).
+• By analyzing the root causes of the problem, we propose
+
+1663Page source
+
+Is contiguous
+
+Instance
+
+Nexus 6P:system
+Nexus 6P:kmalloc
+Samsung S7:camera
+
+Nexus 6P:qsecom
+
+Nexus 6P:mm
+
+N/A
+N/A
+
+alloc pages() of buddy allocator
+
+alloc pages() of buddy allocator or kmalloc()
+
+preserved memory region, not reusable
+
+preserved memory region, reusable
+preserved memory region, reusable
+
+preserved memory region, not reusable
+preserved memory region, not reusable
+
+n
+y
+y
+y
+y
+y
+y
+n
+y
+y
+
+Types
+
+SYSTEM
+
+SYSTEM CONTIG
+
+CARVEOUT
+
+CMA
+
+SECURE CMA
+
+CHUNK
+
+REMOVED
+
+EXYNOS
+
+CPUDRAW
+
+EXYNOS CONTIG
+
+Samsung S4:exynos contig heap
+
+preserved memory region, reusable
+
+Samsung S4:exynos noncontig heap
+
+alloc pages() of buddy allocator
+
+1 N/A means that we have not observed actual instances of the heap type
+2 Even the same type can have diﬀerent implementations on diﬀerent devices
+
+Huawei Mate8:cpudraw heap
+
+preserved memory region, not reusable
+
+Table 1: ION heap types and instances
+
+alternative designs that preserve the ION functionality
+while eliminating its security ﬂaws. We believe the lessons
+learned can shed light on future designs of customizable
+and extensible memory management system.
+The remaining part of the paper will be organized as fol-
+§2 will brieﬂy introduce some ION-related back-
+lowing:
+ground knowledge, §3 will give a thorough analysis of ION
+§4 will detail our methodology to
+related vulnerabilities,
+systematically identify the vulnerabilities on a wide range
+§5 will summarize the vulnerabilities
+of Android devices,
+we ﬁnd on various devices and evaluate the eﬀectiveness of
+our methodology, §6 will demonstrate our actual exploita-
+tions against ION related vulnerabilities on some represen-
+tative devices. In §7, we discuss possible defense against
+the vulnerabilities. §8 discusses the related works and §9
+will conclude the paper.
+
+2. BACKGROUND
+
+As brieﬂy described, ION is designed to achieve two main
+goals. First, it aims to support hardware devices with di-
+verse memory requirements. Prior to ION, diﬀerent SoC
+vendors achieve this through proprietary and mutually in-
+compatible interfaces such as PMEM for Qualcomm, N-
+VMAP for Nvidia, and CMEM for TI [8]. System and ap-
+plication developers have to customize their code heavily for
+all such interfaces to ensure that the code can work across
+all diﬀerent platforms. This problem is greatly alleviated
+since the introduction of ION that deﬁnes a common in-
+terface irrespective of SoC manufacturers. The underlying
+implementation in the form of a driver can be customized by
+SoC and smartphone vendors to guarantee that they return
+the correct type of memory asked by the user space.
+
+As with most interfaces exposed to user space, the uniﬁed
+ION interface is exposed through the /dev/ion ﬁle, which
+can be manipulated through open() and ioctl() system
+calls. The speciﬁc set of supported operations include “al-
+loc” and “free”. The user space code needs to specify a heap
+id from which the memory should be allocated. As shown in
+Figure 1, each ION heap has an assigned name, id, and more
+importantly, an associated heap type that is pre-deﬁned for
+a particular Android device. Table 1 illustrates the set of
+AOSP-deﬁned heap types, along with a selected subset of
+customized heap types we encounter in the studied Android
+devices. Even though incomplete, it illustrates the complexi-
+ty of ION with heaps of diﬀerent types and properties. Some
+
+,21,QWHUIDFH
+
++alloc()
++free()
+…
++mmap()
+
+7<3(
+
+7<3(
+
+««
+
+7<3(1
+
++($3
+
+«
+
++($3Q
+
++($3
+
+«
+
++($3Q
+
++($3
+
+«
+
++($3Q
+
+Figure 1: ION Architecture
+
+heap types may appear to have similar properties: CMA and
+SECURE CMA. However, they actually serve diﬀerent pur-
+poses. CMA is accessible by third-party apps and system
+services. However, SECURE CMA is usually intended to
+be used by trusted world (See TrustZone [4]), thus inacces-
+sible from user space. Also, we omit another dimension,
+cache coherency, which is not the focus of this study.
+
+Generally the heaps fall into two categories: 1) Unre-
+served. The most representative one is the SYSTEM heap,
+whose memory provider is the low-level buddy allocator ac-
+cording to our analysis , the same as memory allocated
+through malloc(). 2) Reserved. This includes CARVEOUT
+and CMA heaps that involve memory set aside at boot time
+so as to combat memory fragmentation at runtime [23].
+
+The second goal of ION is to allow eﬃcient sharing of
+memory between user space, kernel space, and the hardware
+devices. This is achieved by sharing memory pages directly
+to avoid copying. Speciﬁcally, following the ION interface
+explained earlier, once memory is allocated successfully from
+a heap, a ﬁle descriptor is returned to user space which can
+be subsequently used to invoke mmap() to map the allocated
+pages into user space. This feature can be handy in many
+scenarios. For instance, in the case where both software
+and hardware rendering are needed for graphics processing,
+libraries such as OpenGL can manipulate the memory in
+user space easily and a GPU can also populate the same
+piece of physical memory with zero copying.
+
+3. VULNERABILITY ANALYSIS
+
+So far, we have explained the design philosophy of ION
+including 1) uniﬁed memory management interface for ease
+
+1664of use and 2) memory sharing support between user and
+kernel space. Interestingly, each one introduces a new class
+of vulnerabilities.
+In this section, we will unveil the root
+causes of the security ﬂaws.
+3.1 Problems Introduced by Uniﬁed Interface
+As mentioned in §2, ION uses a uniﬁed interface /dev/ion
+for all types and instances of memory heaps it manages. Un-
+like the general memory allocated through malloc() in user
+space, ION heaps come with diﬀerent sizes and purposes,
+which require a diﬀerent security design than the one for
+general memory.
+In Android, an application can allocate
+“unlimited” amount of general memory through malloc().
+Because it is general memory, applications may have legiti-
+mate reasons to allocate and use a large amount of memory
+(e.g., 3D gaming apps). The only time when memory allo-
+cation fails is when the system is running out of memory.
+
+Unfortunately, ION inherited the security design for gen-
+eral memory. There does not exist any limit on how much
+memory one can consume in ION heaps, causing poten-
+tial DoS attacks. Even worse, due to the fact that third-
+party apps have legitimate reasons to allocate memory from
+at least one heap type (for graphic buﬀers), the uniﬁed
+/dev/ion interface needs to have a relaxed permission that
+allows anyone in user space to have access to potentially all
+ION heaps. Indeed, on all 17 phones we studied, the ﬁle per-
+mission of /dev/ion is always world-readable 1. There exists
+no other security mechanisms (e.g., access control) beyond
+the ﬁle permission and therefore any app can allocate any
+amount of memory from any ION heaps (but no more than
+the max available of a certain heap). Due to characteristics
+of diﬀerent heap types, such a capability can lead to two
+diﬀerent DoS attacks:
+
+For ﬁxed size heaps. Certain ION heap types such as
+CARVEOUT and CMA have a pre-determined size and re-
+gion from which users can allocate memory from. These
+heaps are typically used for various system functionalities,
+e.g., “audio” heap is used by “mediaserver” on Nexus 6P to
+perform audio playback. As mentioned in §1, during the An-
+droid device customization process, the available heap types
+and instances are tailored to satisfy the need of hardware de-
+vices. In the above example, the “audio” heap is designed to
+work with a speciﬁc audio chip. As long as a user exhausts
+all free space of a certain heap, related system functionalities
+will stop working due to the failure to get required memory
+from the speciﬁc heap, e.g., sound/music playback on Nexus
+6P will be disabled if “audio” heap is occupied by a malicious
+app. In some cases, critical service failure can even cause the
+whole system to crash as shown in §6.
+
+For unlimited size heaps. Some heap types, such as
+SYSTEM, have no pre-reserved memory regions. Accord-
+ing to our analysis, memory allocated from the SYSTEM
+heap is not correctly accounted for as part of the memory
+usage of the calling process. Thus, from SYSTEM heap a
+process can request as much memory as the current system
+can supply. When a user process drains too much memory
+from such heaps, the performance of the whole system will
+be aﬀected. Besides, due to the existence of Android low
+memory killer [2], other innocent processes may get killed
+to release more memory in such a situation. More detailed
+analysis is given in §6.
+1Readable on /dev/ion in fact allows both memory alloca-
+tion and memory mapping to user space [8].
+
+One may argue that the above problems can be solved
+by integrating a general access control or quota limitation
+mechanism into current ION interface, however, this may
+not be an easy solution as will be discussed in §7.
+3.2 Problems Introduced by Buffer Sharing
+
+As mentioned earlier, the zero-copy buﬀer sharing among
+user space, kernel space, and hardware devices is one of the
+main goals of ION. While some speciﬁc heap types such as
+SECURE CMA may deny any access from user space, there
+is no general restriction in the ION framework; therefore
+users can allocate memory from most heaps and map them
+into user space for read and write operations. This can lead
+to two diﬀerent security problems:
+
+System crash due to hardware protection. Some
+heaps’ memory regions can be protected by hardware secu-
+rity mechanisms like TrustZone [4] so that any access from
+untrusted world will cause a protection exception which usu-
+ally leads to a system crash or reboot. Unfortunately ION
+buﬀer sharing unexpectedly makes such protected heaps ac-
+cessible to untrusted world apps, as will be shown in §6.
+
+Sensitive information leakage.
+
+ION memory are
+drawn from various memory heaps, whose allocation func-
+tions correspond to low-level kernel functions such as kmal-
+loc() and dma_alloc_*(). By default, many of them do
+not zero the newly allocated pages for performance reason-
+s. The original assumption was that such pages will never
+get mapped to user space directly and hence safe to use in
+kernel. Unfortunately it is no longer correct with the intro-
+duction of ION that exports such heaps to user space for
+buﬀer sharing. We conﬁrm that it is far from rare cases
+that buﬀers allocated from ION heaps contain dirty pages.
+A large number of Android devices, including the newest
+models like Nexus 6P, have one or more ION heaps failing
+to clear allocated buﬀers before handing them to user space,
+which eventually enables any third-party app to access sen-
+sitive information leaked from kernel, system services, and
+user applications.
+
+3.2.1 Root Cause Analysis of Unzeroed Pages
+After careful investigation, we summarize two main rea-
+
+sons for unzeroed pages:
+Customization. ION by design has good extendability
+and supports customization, as described in §1. Diﬀerent
+vendors can have their own choices about which heap types
+to use and how they will be implemented. They can also
+implement new heap types by themselves as shown in Ta-
+ble 1. Thus, even though all the default heap types have
+zeroed their allocated buﬀers in AOSP common branch k-
+ernels since 3.10, in practice, almost all Android devices are
+shipped with customized ION implementation which do have
+the dirty page problem.
+
+Kernel memory allocation functions with compli-
+cated behaviours regarding buﬀer zeroing. Unlike
+the relatively simple and limited interfaces for user-space
+memory allocation like malloc(), there exist many diﬀerent
+memory allocation interfaces in kernel space, which will be
+directly used by various ION heap types. malloc() typical-
+ly involves the system call brk() and mmap() where virtual
+pages are returned ﬁrst. Upon accessing such pages by the
+program, a page fault occurs which triggers the OS to lo-
+cate a physical page and map the accessed virtual page to
+it. Due to the obvious security risks, the OS always zeroes
+
+1665the physical page before mapping it to user space (unless it
+is a page recycled from the same process).
+
+In contrast, other kernel memory allocation functions are
+largely undocumented, and not well understood.
+
+diverse,
+They generally fall into three categories:
+
+1) Guaranteed zeroing. Interfaces like kzalloc() are guar-
+anteed to zero the allocated memory, which do not pose any
+threats even when exposed to user space through ION.
+
+2) Expected to zero but actually may not. Some func-
+tions will decide whether to zero the memory based on
+some function parameters like GFP ZERO ﬂag used in
+alloc_pages() of buddy allocator. However, there is
+no guarantee that the zero operation will be performed.
+In our analysis, we found that some functions,
+like ar-
+m64_swiotlb_alloc_coherent(), do accept a parameter de-
+ciding whether to zero the allocated buﬀer, but the function
+implementation simply does not honor such a parameter at
+all. A similar issue was reported previously in [9].
+
+3) Undecidable and undocumented zeroing behaviour.
+There also exist other functions where it is not ob-
+vious whether
+zeroed.
+gen_pool_alloc_aligned() is one such function that is usu-
+ally used by CARVEOUT heaps.
+
+returned pages will be
+
+the
+
+The confusing behaviors of various kernel memory allo-
+cation functions makes it diﬃcult for developers to decide
+whether they should zero the buﬀer after invoking any k-
+ernel memory allocation function. On one hand, failure to
+zero the buﬀer may cause information leakage, while on the
+other hand, repeated zeroing operations may aﬀect the over-
+all performance, especially on embedded platforms. As an
+example, some buﬀer zeroing logic is surprisingly comment-
+ed out intentionally for several ION heap types according to
+the kernel source code for Huawei Mate 8, a popular device
+running Android 6.0. We suspect that developers are trying
+to avoid the extra performance penalty, but the end result
+is a severe security ﬂaw as will be demonstrated in §6.
+
+4. METHODOLOGY
+
+In this section, we will present our methodology to sys-
+tematically test and discover the vulnerabilities uncovered
+in §3.
+4.1 Problems Introduced by Uniﬁed Interface
+The goal is to test whether a third-party app can indeed
+occupy memory from diﬀerent heaps entirely to cause DoS
+attacks. Further, we want to understand what speciﬁc sys-
+tem functionalities can be targeted using which heaps. To
+this end, we design a simple runtime testing procedure as fol-
+lows: given an Android device, we ﬁrst enumerate all avail-
+able ION heaps (declared through the Device Tree ﬁle [5]),
+identify their type and size information; we then try to al-
+locate buﬀers from them with an ION memory probing app
+we develop. Once we ﬁnd a heap able to provide memory to
+our app, we will further try to exhaust all available memory
+resources remained in the heap. This can be automatical-
+ly done by our probe program, which will try to allocate a
+buﬀer as large as possible in each iteration of a loop and ter-
+minate the loop if no more memory can be allocated. The
+largest available buﬀer size in each iteration is decided by
+an eﬃcient binary-search style probing. For unlimited sized
+SYSTEM heaps, we will also try to allocate as much mem-
+ory as we can, until exceptions occur, such as our process
+getting killed by low memory killer.
+
+As soon as an ION heap is exhausted, we will monitor
+system behaviors to see whether there will be any anoma-
+lies. Usually the heap name will give a good indication about
+what system behaviors to watch, for example, the name “au-
+dio” suggests that the heap should be used for audio data
+processing, then we will focus on the issues such as whether
+the system can still play sound normally. For SYSTEM
+heaps, we mainly focus on questions like whether the sys-
+tem performance will be aﬀected or whether there are other
+processes get killed by low memory killer. If kernel and plat-
+form source code for the target device is available, we will
+also try to take a reference of it to ﬁgure out how the ded-
+icated ION heaps will be used, which can help us ﬁnd the
+potential DoS problems more eﬃciently and precisely.
+4.2 Problems Introduced by Buffer Sharing
+
+If a heap not only allows our app to allocate memory
+from it but also enables it to access the allocated buﬀers,
+then we will ﬁrst attempt to access the buﬀers.
+In some
+cases, a simple memory read operation can already cause a
+system crash as described in §3. If the buﬀer can be accessed
+without causing exceptions, we will then determine whether
+the buﬀers from the current heap may contain dirty pages.
+This can be done in two ways:
+
+Blackbox testing. We can simply exhaust the free s-
+pace of a certain heap and read the allocated buﬀers to see
+whether they contain any non-zero bytes. To avoid the cases
+where the heap may not be populated by other services yet,
+e.g., camera has not been used yet and therefore no data
+has been stored in the heap, we could write to the heap ﬁrst
+and later on read from it again from another app to see if
+the data remain. The challenge with such a blackbox test-
+ing approach is that the behaviors can be dependent on the
+system state and the parameters we pass through the ION
+interface, which may not be easy to determine; this can lead
+to inaccurate assessments. In addition, blackbox testing also
+requires access to actual devices.
+
+Program analysis. Alternatively, if the kernel source
+code for an Android device is available, which usually is
+the case due to open source licensing requirements, we can
+in fact accurately determine this via static analysis on the
+source code. As discussed before in §3.2, since the behav-
+iors of kernel memory allocation functions are complex and
+in many cases not well documented, program analysis can
+automate the process and greatly reduce the manual eﬀort.
+
+Static Taint Analysis on Buffer Zeroing
+
+4.2.1
+To fulﬁll this task, we design and implement a novel static
+taint analysis tool to analyze the zeroing behaviors of mem-
+ory allocation functions. Our design is based on three key
+observations:
+
+(1) Most, if not all, memory allocation functions will take
+a parameter indicating the size of the requested memory.
+We consider such “size” parameters as taint source.
+
+(2) Usually the zeroing operations will be performed
+through some common utility functions such as memset(),
+which will be considered the taint sink.
+
+(3) When buﬀer zeroing operations occur in memory al-
+location functions, the amount of memory zeroed should be
+dependent on the “size” taint source.
+In other words, the
+taint source should propagate to the sink to indicate a true
+buﬀer zero operation.
+
+The lack of an information ﬂow from the source (“size”) to
+
+16661 allocate_1(…,size,...){
+2   order=log_2(size);
+3   some allocation operations;
+4   memset(addr,0,2^order);
+5 }
+
+1 allocate_2(…,size,...){
+2   some allocation operations;
+3    for(i=0;i<size;i+=4096)
+4        memset(addr+i,0,4096);
+5 }
+
+Figure 2: Data dependency
+
+Figure 3: Control dependency
+
+sink (functions such as memset()) in an ION heap allocation
+function indicates that the function does not zero the buﬀer
+before returning it to user space. It is worth noting that the
+analyzed memory allocation functions may include zeroing
+operations for some internal or temporary data structures
+other than the allocated buﬀer, in which case may cause
+confusion. Our intuition is that such data structures will
+not be dependent on the “size” taint source and therefore
+can be eliminated automatically.
+
+Design Considerations. Even though the formulated
+problem is clearly deﬁned, there are still several compli-
+cations that need to be carefully considered. First, taint
+propagation typically has two forms: data dependency (ex-
+plicit ﬂow) and control dependency (implicit ﬂow). We need
+to decide whether to track data dependency alone or both.
+Most static taint analysis tools focus on only data depen-
+dency [22, 12, 17, 26]. However, in the case of memory
+zeroing operations, the decision may not be so straightfor-
+ward. We illustrate two real world examples (simpliﬁed) we
+encounter in Figure 2 and Figure 3. allocate_1() round
+up the requested size to the nearest power of 2 before al-
+locating a buﬀer and memset()ing it. The “order” variable
+is data dependent on the “size” taint source; therefore, it is
+suﬃcient to consider data dependency only in this case. In
+contrast, allocate_2() decides to invoke memset() to zero
+the allocated buﬀer page by page. No data dependency ex-
+ists from “size” to the parameter of memset().
+Instead, a
+tainted control dependency exists from “size” to memset()
+as the loop condition is dependent on “size”. In this case, we
+will need to follow all function calls after meeting a taint-
+ed control dependency so as to not miss any sink functions
+(e.g., memset()). However, such strategies can incur false
+positives, as we will show in §5.3. We acknowledge that it is
+an inherently diﬃcult problem to propagate taint through
+control dependencies, as is recognized in prior work [13].
+As an alternative solution, manual intervention can be used
+to determine the propagation rules upon each tainted con-
+trol dependency. We give a complete walkthrough of the
+methodology in §5.3.
+
+Second, it is possible that the ION memory allocation
+function may internally invoke diﬀerent low-level kernel
+memory allocation functions (e.g., fall back to a diﬀerent
+function if a previous one fails). Therefore, even if there
+exists an information ﬂow from source to sink (for certain
+program paths), it does not rule out the possibility that an-
+other program path does not zero the buﬀer. To address
+this issue, our tool will output the unique call chains as-
+sociated with the taint paths and guide the developer to
+look for other low-level memory allocation functions; our
+assumption here is that there must exist a diﬀerent mem-
+ory allocation function for each type of low-level memory
+allocator. Depending on the system state, or the result of
+an earlier memory allocator, ION may choose to invoke a
+diﬀerent memory allocator (again, in the form of a separate
+function). With this assumption, the tool can output the
+
+Kernel source code
+
+Pre-process
+
+Intermediate files
+
+Filtering
+
+Related functions to
+the target function
+
+Summary based
+taint analysis
+
+Un-zeroed
+paths
+
+Inference
+
+TP  paths  and  call 
+chains, constraints
+
+Exclude FP results
+
+Specify target
+
+function
+
+Developers
+
+Function summary
+
+Generating paths
+
+Zeroed  paths,  call chains 
+and their consraints
+
+Figure 4: Static taint analysis tool workﬂow
+
+callees for each memory allocation function in the tainted
+call chain. If developers recognize any callee that also ap-
+pear to be a memory allocation function (and takes in a
+tainted argument), they can query the taint analysis result
+to see if the callee has encountered any zero operation down
+the line. If so, the tool simply repeats the same procedure
+to look for additional candidate callees. Otherwise, we con-
+clude that there does exist a program path that performs
+memory allocation without buﬀer zeroing. In §5.3, we use
+the SYSTEM heap on Nexus 6P as a case study to explain
+the methodology in detail.
+
+Third, theoretically buﬀer zeroing can also occur during
+memory release functions, e.g., free(). In practice, we ﬁnd
+that ION heaps always have relatively simple logic in mem-
+ory release functions and they almost never zero buﬀers in
+them. This could be due to the fact that memory alloca-
+tion functions can opportunistically skip zeroing operations
+if the pages are from the same process, e.g., memory allocat-
+ed through malloc(). Also, if the released memory is not be
+reused afterwards, the zeroing is simply wasted. Therefore,
+in our analysis, we focus on analyzing memory allocation
+functions, which are orders of magnitude more complex and
+may or may not contain zeroing operations.
+
+Implementation. We implement the static taint analy-
+sis based on STAC [7], an open source static taint analysis
+tool. The workﬂow is described in Figure 4. Given the
+kernel source code of a speciﬁc Android device, we ﬁrst per-
+form pre-processing using GCC to produce .i ﬁles with ex-
+panded macros and include ﬁles. Then we perform ﬁltering
+to exclude the functions that are never reachable from the
+ION functions. Finally, we implement a ﬂow-sensitive taint
+analysis engine that takes in the entry function, i.e., ION
+memory allocation functions, as well as the source and sink.
+When the taint engine ﬁnishes the computation, we output
+the taint paths where the source “size” can successfully prop-
+agate to sinks (e.g., memset()). Finally, we group the taint
+paths into call chains for developers to inspect and conﬁrm.
+Based on the true positives, developers can then follow the
+procedure described above to locate unzeroed paths.
+
+5. EVALUATION
+
+In this section, we will ﬁrst give the experiment setting
+and a summary of discovered vulnerability instances. Then
+we will evaluate the eﬀectiveness of the methodology to dis-
+cover two classes of vulnerabilities, including how successful
+
+1667Devices
+
+Platform Kernel
+
+A1
+
+A2
+
+A3
+
+eﬀect
+
+heap
+
+eﬀect
+
+heap
+
+eﬀect heap eﬀect
+
+A4
+
+heap
+
+Galaxy S7*
+
+exynos5 3.18.14
+
+D1
+
+T3:N7,N16
+T4:N15,N11
+T5:N17,N14,
+
+yes
+
+T1:N18
+
+no
+
+no
+
+L1
+
+T3:N7,N16
+
+Galaxy S6*
+Meizu Pro 5
+Nexus 6P*
+
+LG V10
+HTC A9
+
+yes
+yes
+
+N12,N13
+exynos5 3.10.61 D1,D4,D3 T3:N5,N3
+exynos5 3.10.61 D1,D4
+T3:N5,N3
+msm8994 3.10.73 D1,D2 T4:N2,N4,N1 yes T1:N19 T2:N20 yes T4:N6 L2,L4
+msm8992 3.10.49 D1,D2 T4:N2,N4,N1 yes T1:N19 T2:N20 no
+no L2,L4
+msm8952 3.10.73 D1,D2 T4:N2,N4,N1 yes T1:N19 T2:N20 yes T4:N6 L2,L4
+T4:N2,N4,N1 yes T1:N19 T2:N20 yes T4:N6 L2,L4
+no L2,L4
+no L2,L4
+no L2,L4
+
+msm8992 3.10.73 D1,D2 T4:N2,N4,N1 yes T1:N19 T2:N20 no
+T4:N2,N4,N1 yes T1:N19 T2:N20 no
+T4:N2,N4,N1 yes T1:N19 T2:N20 no
+
+T1:N18
+T1:N18
+
+D2
+
+D2
+D2
+
+no
+no
+
+no
+no
+
+L1
+L1
+
+T3:N3,N5
+T3:N3,N5
+
+T4:N1,N4,N2
+T4:N1,N4,N2
+T4:N1,N4,N2
+T4:N1,N4,N2
+T4:N1,N4,N2
+T4:N1,N4,N2
+T4:N1,N4,N2
+
+T3:N1
+
+T3:N1
+
+T3:N1
+
+T3:N1
+
+Oppo R7sm* msm8916 3.10.49
+Nexus 5X*
+Xiaomi 4C* msm8992 3.10.49
+vivo Y927
+msm8916 3.10.28
+
+Nexus 5*
+
+msm8974
+
+3.4.0
+
+LG D950*
+
+msm8974
+
+3.4.0
+
+HTC D816
+
+msm8226
+
+3.4.0
+
+Oneplus One msm8974
+
+3.4.0
+
+D2
+
+D2
+
+D2
+
+D2
+
+Galaxy note 3 msm8974
+
+3.4.0
+
+D2,D4
+
+T4:N2,N4
+T3:N1,N6
+T4:N2,N4
+T3:N1,N6
+T4:N2,N4
+T3:N1,N6
+T4:N2,N4
+T3:N1,N6
+T4:N2,N4
+
+T3:N1,N6,N7
+
+yes T1:N21 T2:N20 no
+
+yes T1:N19 T2:N20 no
+
+yes T1:N19 T2:N20 no
+
+yes T1:N19 T2:N20 no
+
+no
+
+no
+
+no
+
+no
+
+L2
+
+L2
+
+L2
+
+L2
+
+yes T1:N19 T2:N20 no
+
+no L1,L2
+
+T3:N1,N7
+
+Huawei P9
+
+hi3650
+
+3.4.90
+
+Huawei Mate8*
+
+hi3650
+
+3.4.86
+
+D5
+
+D5
+
+T3:N8
+
+yes T1:N22 T2:N10 no
+
+T3:N8
+
+yes T1:N22 T2:N10 no
+
+no
+
+no
+
+L4
+
+L4
+
+* Devices with detailed experimentation and constructed exploits
+- “eﬀect” column shows only attack eﬀects known to us (which can be incomplete)
+[A] Vulnerabilities Classiﬁcation: A1:DoS for limited size heaps A2:DoS for unlimited size heaps
+
+A3:System crash due to protection exception A4:Information leakage
+
+T4:N9
+T2:N10
+T4:N9
+T2:N10
+
+[D] DoS Attack: D1:ﬁngerprint D2:audio D3:video D4:camera D5:system crash
+[L] Information Leakage: L1:camera L2:audio L3:video L4:general user apps
+[T] Heap Type: T1:SYSTEM T2:SYSTEM CONTIG T3:CARVEOUT T4:CMA T5:SECURE CMA
+[N] Heap Name: N1:audio N2:adsp N3:video N4:qsecom N5:secdma N6:pil N7:camera N8:carveout-heap N9:ion-dma-heap
+
+N10:system-contig-heap N11:video nfw N12:video fw N13:video scaler N14:video frame N15:crypto N16:gpu crc
+N17:gpu buﬀer N18:ion noncontig heap N19:system N20:kmalloc N21:vmalloc N22:system heap
+
+Table 2: Vulnerability summary
+
+is the static taint analysis tool in practice. Finally, we will
+use case studies to highlights important ﬁndings.
+
+Scope. We have analyzed 17 Android devices in total,
+which are listed in Table 2. They cover a wide range of
+devices such as Nexus, Samsung, to HTC. All of them are
+veriﬁed through runtime testing and source code analysis.
+Out of 17 devices, we have experimented in detail using 8
+devices, for which we have constructed exploits to conﬁrm
+the existence of vulnerabilities.
+5.1 Summary of ION related Vulnerabilities
+After applying the methodology described in §4, we re-
+port our ﬁndings in Table 2. Note that we group the tested
+devices based on their hardware platforms (SoC vendor and
+model) and kernel versions. This is because hardware de-
+vices are the most common reason for customization of ION.
+Generally speaking, devices sharing the same hardware plat-
+form will have similar conﬁgurations regarding ION heap
+types and instances.
+In addition, diﬀerent phone vendors
+and kernel versions may also have an impact.
+
+In our study, we focus on three main general hardware
+platforms: MSM (Qualcomm), Exynos (Samsung), and Hisi
+(Huawei). Each platform can also include diﬀerent models,
+e.g., Snapdragon 810 and 820 correspond to two diﬀerent
+Qualcomm SoCs, along with numerous Android and kernel
+versions. As we can see in the Table, there exist a variety of
+vulnerable ION heaps (up to 22 instances across all devices).
+In the Table, we breakdown the vulnerabilities into 4 cat-
+egories, along with their corresponding attack eﬀects and
+vulnerable heaps (types and instances). For instance, re-
+garding A1: DoS against heaps of limited size, all experi-
+mented devices are vulnerable in one form or another. On
+Huawei devices speciﬁcally, A1 attack can even cause the
+whole system to crash directly. Regarding A4: information
+leakage, all studied Android devices have unzeroed memory
+that can be leaked from diﬀerent heap types. The most sur-
+prising result is that 9 out of 17 devices have the information
+leakage vulnerabilities that allow a malicious app to obtain
+dirty pages used by other apps, which can contain sensitive
+
+1668Heap Type
+SYSTEM
+
+1158(8)
+SYSTEM CONTIG 288(6)
+
+CMA
+
+CARVEOUT
+
+4(4)
+0(0)
+
+TP*
+
+FP* FN* Un-zeroed paths? Analysis/Actual result
+
+Involved allocation function
+
+5
+0
+2
+0
+
+0
+0
+0
+0
+
+n
+n
+y
+y
+
+zeroed/zeroed
+zeroed/zeroed
+
+un-zeroed/un-zeroed
+un-zeroed/un-zeroed
+
+alloc pages()**
+alloc pages()**
+dma alloc attrs()
+
+gen pool alloc aligned()
+
+* TP, FP, and FN refer to the amount of call chains. The number in brackets indicate the number of paths.
+** The parameters passed to alloc pages() are diﬀerent for the two heap types.
+
+Table 3: Static taint analysis result on Nexus 6P
+
+information such as passwords, credit card numbers, or even
+secret keys.
+
+Although the number of Android devices we analyze is
+limited, they do cover most representative manufactures,
+hardware platforms and software versions, thus we can in-
+fer that most Android devices to date are aﬀected by ION-
+related vulnerabilities.
+Speciﬁcally, Nexus 6P, Samsung
+Galaxy S7, and Huawei Mate 8 represent the latest devices
+from each manufacturer, all of which have both DoS and
+information leakage vulnerabilities.
+5.2 Runtime Testing for DoS Vulnerabilities
+The runtime testing procedure described in §4.1 is over-
+all eﬀective for most devices; however, when applying this
+methodology, we did encounter some special cases in which
+the normal routine fails to give useful results even though
+we can successfully allocate arbitrary memory buﬀers from
+a certain heap. We describe them below.
+
+Failure to identify any DoS vulnerabilities. For cer-
+tain heaps with limited size on some devices, even after we
+occupy all of its free space, no issues can be observed. After
+looking into these cases, we conclude two main reasons for
+this: 1) Some heaps will be rarely, if not never, used by their
+host devices. For instance, we cannot observe any utiliza-
+tion of “kmalloc” heap, whose type is SYSTEM CONTIG,
+on Nexus 6P in our experiments. Besides, there exists other
+heaps that may be used in only the early stage of system
+booting, such as “pil” heaps on some devices that are used
+to load certain ﬁrmware images during the boot process.
+
+Vulnerabilities depending on proper timing.
+
+In
+some cases, we can successfully perform DoS attacks against
+certain system functionalities by exhausting speciﬁc heaps,
+but not at arbitrary points in time. In the case of Samsung
+S6’s ﬁngerprint authentication service, a CARVEOUT heap
+named “secdma” is used to fulﬁll its task. If a malicious app
+occupies the entire heap ahead of time, then ﬁngerprint ser-
+vice will stop functioning. The challenge is that the service
+itself typically occupies the heap when the screen is locked
+and releases it only when the screen is unlocked. Generally
+speaking, our testing methodology may not always be able
+to catch the correct timing; however, such vulnerabilities do
+exist and are simply harder to trigger. Manual investiga-
+tions are performed to catch these cases as reported later in
+§4.1.
+5.3 Static Taint Analysis for Dirty Pages
+Next, we evaluate the eﬀectiveness of the static taint anal-
+ysis described in §4.2.1, using Nexus 6P as a case study. The
+source code we analyze is from kernel version 3.10.73.
+In
+total, it takes about 9.5 hours for the tool to analyze the
+memory allocation functions for 4 ION heap types — SYS-
+TEM, SYSTEM CONTIG, CMA, and CARVEOUT — on a
+
+1. ion_cma_allocate
+
+2. dma_alloc_writecombine
+
+2. dma_alloc_nonconsistent
+
+3.   dma_alloc_attrs
+
+733DWK
+4.   dma_alloc_from_coherent
+5.   memset
+
+8Q]HURHGDOORFDWLRQ3DWK
+
+4.   arm64_swiotlb_alloc_coherent
+)33DWK
+...
+7.   apply_to_pud_range
+...
+11. pmd_alloc_one
+12. get_zeroed_page
+
+5.   dma_alloc_from_contiguous
+...
+
+Figure 5: Call chains of interest for CMA heap type
+
+server with Intel Xeon E5-2640 V2 CPU and 64GB physical
+memory. The analyzed LOC is over 10,000. We omit the
+remaining heap types that fall in two categories: 1) the ones
+that never have any instances, e.g., REMOVED type; 2) the
+ones that deny any mmap() requests from user space, e.g.,
+SECURE CMA, indicating that it is impossible to access
+the memory although they may contain dirty pages.
+
+We summarize the result of the tool on Nexus 6P’s kernel
+source code in Table 3. We output the number of taint paths
+as well as the corresponding unique call chains (the number
+in brackets indicates the number of unique call chains). We
+conﬁrm the true positives, false positives, and false negatives
+by manually analyzing the source code. The false positives
+are relatively easy to deal with, as a developer or researcher
+can quickly inspect the output path (or even the function
+call chain) to conﬁrm them (we will explain the FP cases of
+CMA heap later). For false negatives, it is more problematic
+as we may not even realize this and incorrectly report that
+there are no zeroing operations while in fact there are. One
+potential source of false negatives is the incomplete set of
+sink functions considered, which include the common func-
+tions such as memset() and bzero() so far. However in our
+evaluation, we found that memset() and its wrappers are the
+only used sinks.
+
+CMA heap type. We ﬁrst discuss the false positive
+taint paths in CMA heap. We group such paths into call
+chains as shown in Figure 5 (labelled “FP path”). When
+we look at the results, the taint analysis in fact correctly
+outputs the taint result according to the source and sink
+deﬁnition. Unfortunately, in some cases, the allocation of
+auxiliary data structures, such as page table entries, is also
+dependent on the size of requested buﬀer. Speciﬁcally, the
+auxiliary data here is the page table entries that are creat-
+ed and subsequently zeroed.
+In other words, the source
+(“size” parameter) indeed propagated to the sink (“zeroing”
+
+16691. ion_system_heap_allocate
+TP Path
+2. msm_ion_heap_pages_zero
+
+2. alloc_largest_available
+3. alloc_buffer_page
+...
+5. ion_page_pool_alloc_pages
+
+TP Path
+
+for (i = 0; i < num_orders; i++) {
+
+if (size < order_to_size(orders[i]))
+
+1   struct page_info *alloc_largest_available(…,size,…){
+2
+3
+4
+5
+6
+7  }
+
+page = alloc_buffer_page(…,orders[i],...);
+
+continue;
+
+}
+
+FP Path
+6. __free_pages
+
+6. msm_ion_heap_high_order_page_zero
+
+TP Path
+
+Figure 7: Key logic for alloc largest available()
+
+5 chains
+
+6. alloc_pages
+
+bad_page
+...
+dump_mem
+memset
+
+6 chains
+
+get_page_from_freelist
+...
+get_zeroed_page
+
+Figure 6: Call chains of interest for SYSTEM heap type
+
+operation); the zeroing operation is simply not applied to
+the returned buﬀer. Fortunately, by simply looking at the
+function names involved in the FP call chain in Figure 5,
+it is easy to conclude that this call chain is for allocating
+pages to hold page table entries given the term “pmd” (page
+middle directory).
+
+According to our evaluation, there do exist true posi-
+tive paths that result in zeroed buﬀers. The cases are al-
+so shown in Figure 5. Now the question is whether there
+still exist unzeroed paths other than the zeroed path. As
+stated previously in §4.2.1, we walk backwards along the
+true positive call chains and look for branches that may
+invoke other memory allocation functions that do not be-
+long to any taint call chain. As shown in Figure 5, s-
+tarting from dma_alloc_from_coherent(), we walk back-
+wards to its caller dma_alloc_attrs() and enumerate al-
+l of its callees. By looking at the names of the callees,
+we locate arm64_swiotlb_alloc_coherent(), which also
+takes in a tainted parameter “size”, and appears to be
+a memory allocation function. We then cross reference
+the function name with our taint analysis results.
+In
+this case, we found no taint call chains that involve ar-
+m64_swiotlb_alloc_coherent(), which indicates the possi-
+bility of a path where the allocated memory is unzeroed. Up-
+on reading the code, we realize that the code tries to allocate
+memory through dma_alloc_from_coherent() ﬁrst, and fall
+back to arm64_swiotlb_alloc_coherent() only when an er-
+ror is returned earlier. During our runtime testing on Nexus
+6P, dma_alloc_from_coherent() appears to be failing al-
+l the time and therefore we are able to successfully obtain
+dirty pages in CMA heap.
+
+SYSTEM heap type. SYSTEM heap is complex and
+involves many paths leading to zero operation, a simpliﬁed
+call graph is shown in Figure 6. All 5 FP call chains are
+introduced by the function __free_pages(), from which an
+error branch is eventually triggered which invokes memset().
+When we look at the issue closely, it all started from the
+function alloc_largest_available(), whose key logic is
+depicted in Figure 7. Upon close inspection, there exists a
+control dependency (implicit ﬂow) that caused the problem.
+The function essentially runs in a loop to identify the closest
+round-up of the request memory size in the power of 2, and
+use the round-up value to allocate memory. Here the con-
+stant array order[i] simply pre-deﬁnes all possible round-up
+values. Note that the size parameter (taint source) is com-
+
+pared against the round-up value orders[i], which results
+in a control dependency. The variable order[i] itself is not
+tainted as it is a read-only constant. When it is passed over
+to alloc_buffer_page(), we lose track of the taint. In reali-
+ty, order[i] is semantically derived from the taint source size
+(round-up of size), however, traditional taint propagation
+rules are unable to catch this case. Therefore, we have to
+record all function invocations after the control dependency
+and report whenever a sink (e.g., memset()) is encountered,
+regardless of whether its parameters are tainted (we had to
+implicitly assume that all parameters of the sink is tainted).
+Of course, in practice, such a coarse-grained control taint
+propagation rule is likely going to introduce false positives.
+It is inherently a challenge to deal with control taint propa-
+gation, as widely acknowledged in previous studies [13]. As
+an alternative solution, a developer can resolve the control
+taint manually. In this case, since we know orders[i] is es-
+sentially derived from the taint source size, one can simply
+taint orders[i] directly to avoid the false positives.
+
+Aside from the false positives, we wish to point out
+an interesting observation. Figure 6 appears to suggest
+that there are multiple paths to zero the allocated buﬀer
+and there exists only one path that actually allocates
+memory.
+Speciﬁcally, both msm_ion_heap_pages_zero()
+and msm_ion_heap_high_order_page_zero() are simply ze-
+roing a buﬀer without allocating any memory.
+On-
+ly alloc_pages() is allocating memory (as well as ze-
+roing the buﬀer afterwards). Therefore, one may think
+whether the buﬀer is zeroed for more than one time.
+However, upon a closer look, we realize that two of
+the sinks are not really performing the zeroing opera-
+tions. Both msm_ion_heap_high_order_page_zero() and
+alloc_pages() depend on a ﬂag “GFP ZERO”. Only if it is
+set will they zero the buﬀer. In this particular case, the ﬂag
+is not set for either function to avoid repeated zeroing that
+can waste CPU cycles. It is interesting to see how complex
+the memory allocation can be and how hard the developers
+need to try to ensure security as well as performance. This
+once again shows the beneﬁt of a program analysis tool to
+help developers make correct implementation decisions.
+6. CASE STUDY
+
+In this section, we will demonstrate our exploitation of
+ION related vulnerabilities on a few latest and representa-
+tive Android devices including ﬂagship models from main-
+stream manufactures with newest Android system and ker-
+nel. It is worth noting that although the vulnerabilities usu-
+ally manifest themselves diﬀerently on various devices due
+to customization, the underlying cause stems from the same
+design and implementation of ION as we outlined earlier.
+6.1 DoS against Heaps of Fixed Size
+
+Disable ﬁngerprint authentication service on (mul-
+tiple devices). On Nexus 6P, if one occupies enough free
+
+1670space of “qsecom” heap, which is of CMA type, the de-
+vice’s ﬁngerprint authentication functionality will be eﬀec-
+tively disabled. When a user tries to unlock the device with
+his/her ﬁnger, the system will show an error message “ﬁn-
+gerprint hardware is unavailable”. Similar attacks can also
+be performed on all Android devices using MSM platform,
+including Samsung Galaxy S7 and S6.
+
+Disable audio service (multiple devices). On many
+MSM platform Android devices there exists an “audio” heap,
+with either CARVEOUT type or CMA type. If we exhaust
+this heap’s free memory, the system will be unable to pro-
+duce any sound, including ringtones. Aﬀected devices, such
+as Nexus 6P and OPPO R7s, will be unable to notify users
+or play any music under this attack. The sound playback
+is the responsibility of a system service named “mediaserv-
+er”, which heavily depends on the “audio” heap as its buﬀer
+provider on MSM-based Android devices.
+
+System crash on Huawei Mate 8. Huawei Mate 8 is
+shipped with a CARVEOUT heap named “carveout-heap”.
+We can request memory buﬀers from it and when we claim
+and keep a big enough buﬀer, the device will crash directly.
+This CARVEOUT heap has only a ﬁxed size, and is used by
+the critical system framebuﬀer service that is responsible for
+the screen display and refresh. When we occupy too much
+resource in the heap, the critical system service will fail to
+work and eventually cause the whole system to crash.
+6.2 DoS against Heaps of Unlimited Size
+
+System level DoS (multiple devices). On virtually all
+devices, there is a SYSTEM heap usually named “system”.
+If we allocate a large enough memory buﬀer (usually around
+or more than 1GB) from there, the system will freeze and
+many running background services will be killed at the same
+time, including music playback service and push notiﬁcation
+service.
+As mentioned previously in §3.1, SYSTEM heaps will re-
+quest new pages from the basic buddy allocator when need-
+ed, so the available memory for them is equal to that of
+the whole system. Surprisingly, there is one important dif-
+ference between allocating memory from the “system” heap
+and simply using functions like malloc(): the memory from
+the latter will be considered “owned” by the calling process,
+whereas the buﬀers from the former is actually allocated and
+“owned” by the ION driver; what the requesting process get-
+s is only a handle to the buﬀer. Since Android is equipped
+with a low memory killer
+[2] which is responsible for re-
+leasing memory by killing processes when it detects that the
+system is currently low on memory, when a process allocates
+too much memory via interfaces like malloc(), it will gain a
+high priority in the “killing list” since the killer thinks that
+it owns too much, the result is that it will be killed soon
+and the system will thus recover quickly. However, when al-
+locating a large amount of memory from the “system” heap,
+the killer will not consider our process as a main memory
+holder; instead, it will try to kill other innocent processes
+such as the push notiﬁcation service.
+6.3 DoS via Protected Memory Access
+
+System crash (multiple MSM platform devices).
+There is a CMA heap named “pil” on Nexus 6P and many
+other Android devices that use MSM platforms, from which
+a program can request memory buﬀers. By trying to ac-
+cess the allocated buﬀer, the whole Android operating sys-
+
+tem will crash and the device will reboot immediately. The
+name “pil” is short for “peripheral loader”; it is used to load
+peripheral devices’ ﬁrmware images when kernel boots. S-
+ince it is important to guarantee ﬁrmware images’ integrity,
+the memory region of this heap will be protected by Trust-
+Zone, which is an SoC security extension providing Trusted
+Execution Environment (TEE) for sensitive operations with
+physically isolated memory and CPU mode [4]. Thus, any
+access to this protected memory region from normal world
+will cause the system to raise a protection exception, which
+usually leads to a system reboot.
+
+The problem here is that a user can allocate buﬀers from
+“pil” heap even though it is never supposed to be exposed to
+user space. Unfortunately, as we highlight, the uniﬁed inter-
+face of ION grants a program access to virtually all heaps.
+In addition, the buﬀer sharing capability allows a program
+to further access the allocated buﬀer. Either reset the pro-
+tection before the user can access the allocated buﬀers or
+simply deny users’ memory requests for “pil” heap can solve
+the problem; however, neither is done on the devices.
+
+6.4
+
+Information Leakage
+
+According to our analysis, there exist three diﬀerent type-
+s of information leakage vulnerabilities, classiﬁed based on
+ION heap types. They are CARVEOUT, CMA and SYS-
+TEM CONTIG respectively, all of which do not zero the
+buﬀers before returning them to user space. This series of
+vulnerabilities can cause sensitive information leakage from
+both system and user applications, enabling an attacker to
+easily breach user privacy such as getting access to email
+content, bank accounts, and passwords.
+
+Camera data leakage on Samsung Galaxy S7.
+There exists a CARVEOUT heap named “camera” in Sam-
+sung’s newest ﬂagship phone model S7. We can obtain image
+data captured by the phone’s camera without any permis-
+sion with the following steps:
+
+(1) Open the system “camera” application, or third-party
+camera applications which also need to use the system cam-
+era hardware. Then capture some images with the applica-
+tion, note that it is unnecessary to actually take a picture
+— simply seeing the preview on the screen is enough.
+
+(2) Close the camera application and then dump the whole
+“camera” heap by having any app allocating buﬀers from
+it and read their content, which contains the image data
+captured by the system camera, including the previews. We
+conﬁrm this by byte-to-byte comparison between the picture
+(taken by the camera) and the memory content of the ION
+buﬀers.
+
+As shown in Table 1, a CARVEOUT heap will manage a
+ﬁxed physically contiguous memory region which is reserved
+by kernel at boot time for special purposes (e.g., to sat-
+isfy the requirement of certain hardware devices). On S7,
+“camera” is such a heap that serves as a data buﬀer used by
+the system camera service. The camera device must have
+the requirement of physically continuous memory in order
+to perform DMA (and possibly other) operations. When
+users are running a camera app, the camera device should
+be populating the image data into the buﬀer allocated from
+the “camera” heap, which will then be released when users
+exit the app. Thus, an attacker can now re-allocate buﬀers
+from the “camera” heap to obtain the dirty buﬀer.
+
+In our research, this kind of problems for CARVEOUT
+heaps widely exist on multiple Android devices, enabling
+
+1671attackers to steal sensitive data from various system services.
+For example, the audio data can be leaked via “audio” heap
+on Nexus 6P and many other MSM-based Android devices
+in the same way.
+
+Live memory dump of running apps (multiple de-
+vices). “Qsecom” heap on Nexus 6P is of CMA type, which
+is used mainly by TrustZone related services on MSM plat-
+forms. Diﬀerent from CARVEOUT heaps that are used ex-
+clusively by certain system services, with the CMA heap we
+can obtain various kinds of sensitive information, including
+but not limited to Gmail contents, Chase bank transactions
+and wi-ﬁ passwords, from “live memory” of running apps.
+This is achieved by the following three steps:
+
+(1) Drain free system memory by allocating as much mem-
+ory as we can from either normal user space interfaces like
+malloc() or ION SYSTEM heaps as shown in §1. Note that
+the buﬀer allocation should not cause observable slowdown
+to the system to avoid alerting the users.
+
+(2) Run any victim app (e.g., Gmail) normally which will
+
+naturally produce sensitive data in memory.
+
+(3) Dump the content of “qsecom” heap, which will contain
+
+sensitive information as mentioned above.
+
+The root cause is as follows: while both CARVEOUT
+heaps and CMA heaps manage some pre-reserved contigu-
+ous memory regions dedicated for certain system services,
+a major diﬀerence is that CARVEOUT memory regions are
+set aside at system boot time and invisible to kernel memo-
+ry manager after the system boots; thus no other processes
+can reuse these regions — even when they are free — using
+normal memory allocation interfaces (e.g., malloc()) oth-
+er than ION. Eﬀectively, the CARVEOUT memory is stolen
+from the system, which guarantees the availability of memo-
+ry buﬀers to the corresponding system service and hardware
+device (e.g., camera) In contrast, CMA heaps expose their
+reserved memory regions to kernel memory manager (e.g.,
+Linux buddy allocator) and thus allow other processes to u-
+tilize these regions through standard interfaces such as mal-
+loc(), when there is no suﬃcient memory that can be found
+elsewhere (attack step 1 ensures this condition). However,
+to allow system services to function, the memory allocated
+from CMA heap can be reclaimed on demand as soon as the
+system service asks for them (which is how attack step 3
+can successfully dump live memory of other running apps).
+Prior to the memory being reclaimed, the data generated
+on the CMA heap will be copied elsewhere and page tables
+will be updated to reﬂect the change. As we can see, the
+design of CMA heap allows a better utilization of memory
+resources at the cost of a potentially longer latency when
+memory is allocated from CMA heap [23].
+
+The CMA attack is considered extremely dangerous since
+it eﬀectively allows a malicious app to dump the live memory
+of any other apps. Equipped with the capability of know-
+ing which apps run in the foreground (through attacks such
+as [14]), it can eﬀectively be tailored to reliably extract any
+app-speciﬁc information. One may even be able to recon-
+struct the app GUIs by taking multiple snapshots of the
+memory dumps; This very attack was recently achieved by
+forensically dumping the entire physical memory [24]. Final-
+ly, even though we have not attempted, there is no reason
+to believe that it is impossible to extract crypto keys used
+by apps and the system.
+
+System-wide information leakage on Mate 8 The
+“system-contig” heap on Huawei Mate 8 is assigned the type
+
+“SYSTEM CONTIG”. With this heap we can get various
+sensitive information similar to what we can get with CMA
+heap; they include Gmail content, Chrome browsing history
+and html data of previously loaded web pages. Besides data
+leaked from user applications, it is also possible to learn
+information from the kernel with such a heap type. The
+attack process is sketched as below:
+
+(1) Open arbitrary apps and operate normally, then exit
+
+(which means that memory will be released by the apps).
+
+(2) Allocate as much memory as possible from “system-
+contig” heap and record their content, which will include
+signiﬁcant sensitive information.
+
+Since SYSTEM CONTIG heap draws pages directly from
+the basic system memory manager (i.e., buddy allocator),
+whoever returns pages to the system without zeroing them
+can leak data to the attacker. This includes any application
+or kernel data such as passwords, credit cards, and secret
+keys. This vulnerability is very much similar to the one in
+CMA heap except that the opportunity arises only when the
+memory is freed by other applications.
+
+7. DEFENSE DISCUSSION
+
+The fundamental problems with ION stem from its two
+design goals, uniﬁed interface and buﬀer sharing across lay-
+ers, as we highlight throughout the paper. Since they are
+not really simple implementation errors, they require a more
+systematic investigation. One may consider the vulnerabili-
+ty of unzeroed buﬀers simply a glaring error; we argue that
+it actually is a much more complex problem than what it
+appears. As shown in §3.2.1 and §5, the unzeroed buﬀers
+are introduced due to several complex reasons:
+
+1) Kernel memory allocation functions have complex be-
+haviors. Many of them never need to be exposed to user
+space prior to ION’s cross-layer buﬀer sharing capability. It
+is hard to make the correct assumption on whether a par-
+ticular function will zero the returned buﬀer or not.
+
+2) Customization of ION can lead to a drastically diﬀerent
+implementation from the common branch in AOSP. In our
+analysis of Nexus 6P, we ﬁnd that its ION implementation
+follows the one customized by Qualcomm (due to the fact
+that Nexus 6P uses the Qualcomm SoC). Interestingly, we
+note that the Qualcomm kernel source was forked prior to
+AOSP common branch ﬁxing the vulnerability of unzeroed
+buﬀers in CMA heap. Unfortunately, once the Qualcomm
+source tree is forked, it no longer merges the patches applied
+to AOSP common branch. This is demonstrated by the fact
+that even the Android 7.0 preview on Nexus 6P still has
+unzeroed buﬀer vulnerabilities.
+
+Therefore, we believe the static taint analysis tool can
+be eﬀective in assisting developers with the insight into the
+buﬀer zeroing behaviors and help them navigate the complex
+kernel functions.
+
+However, even when the buﬀer zeroing problem is re-
+solved. The DoS vulnerabilities introduced by ION’s uniﬁed
+interface design still remain. Fundamentally, the uniﬁed in-
+terface hurts security as it supports only coarse-grained ac-
+cess control (through ﬁle permission of /dev/ion) — a user
+has access to either all heaps or none. A ﬁne-grained access
+control is necessary to solve the problem. For instance, a
+third-party app should not be able to access the heap used
+by ﬁngerprint service; we have not seen a case where such
+heaps are accessed by any other process. Due to the fact
+that ION is a complex system and the entire software stack
+
+1672is involved (from applications, system services, and kernel
+drivers), it is important that the changes minimize side ef-
+fects such as backward compatibility and performance hit.
+In addition, we should avoid adding new security mecha-
+nisms to the kernel and instead try to piggyback on existing
+mechanisms oﬀered by Android and Linux if possible.
+
+One straightforward solution can be adding the ﬁne-
+grained access control to the kernel to govern how much
+memory each user can allocate (based on uid/gid). This
+solution maintains backward-compatibility to existing ap-
+plications and system services (and can be implemented ef-
+ﬁciently). However, the downside is that the kernel need-
+s to maintain an access control list for all (uid, ion heap)
+pairs that does not ﬁt in any existing Android or Linux
+security mechanism. Even SeAndroid/SeLinux cannot ex-
+press such a security policy, as it will need to be able to
+interpret the argument struct ion_allocation_data * of
+ioctl() to extract the heap information. Furthermore, the
+additional access control list needs to be changed every time
+when customization occurs as heap types and instances may
+change.
+
+Alternatively, one can place the access control enforce-
+ment at the user space. This requires revoking direct access
+to /dev/ion from third-party apps and allowing access to
+only system services. The idea is that apps will need to go
+through system services to allocate memory from ION heap-
+s, in which case the system services can enforce the access
+control policy. For instance, if the policy says that a regular
+app can allocate memory from SYSTEM heap for graphics
+processing of up to 20MB, it will have to send the request
+to “mediaserver” (or whichever process that is responsible
+for managing graphics buﬀers). The “meidaserver” can then
+check if the requested memory is indeed in SYSTEM heap
+(not any other heap). Further, it will keep track of how much
+memory has been used by the user. This solution requires
+grouping all system service uids (e.g., media) into an “ion”
+group so that the ﬁle permission of /dev/ion can be changed
+to 660 (rw-rw----) where the user owner is system and
+group owner is ion. Now an app needs to go through system
+services for memory allocation in ION heaps. Since most
+apps only need to request memory for graphics buﬀers, the
+changes should involve only the app-side libraries that are
+responsible for allocating graphics buﬀers (that previously
+interacts with /dev/ion directly) and a single system service
+(e.g., “mediaserver”). Other heaps are automatically inac-
+cessible to third-party apps. This does introduce the over-
+head of an additional IPC round trip for each ION memory
+allocation. Note that even though the memory allocation
+goes through system services, the returned memory pages
+still need to be zeroed. With this extra layer of indirection,
+the zero operation can in fact be performed by the system
+service itself before sending the ﬁle descriptor over to the
+app that requested the memory.
+
+the
+
+challenge
+
+Besides
+
+in maintaining
+
+backward-
+compatibility, another downside of the alternative design
+is that once a process capable of accessing /dev/ion is
+compromised, it can still launch the DoS attacks against
+other services. That is because of the access control
+not ﬁne-grained enough to diﬀerentiate diﬀerent system
+services. To truly achieve ﬁne-grained access control, each
+system service needs to run with a diﬀerent uid which the
+kernel can use to enforce the access control properly (as is
+done in the ﬁrst solution).
+
+In summary, we show two potential solutions that have
+diﬀerent tradeoﬀs in the following aspects:
+backward-
+compatibility, performance, and avoid introducing new se-
+curity mechanisms in the kernel.
+
+8. RELATED WORK
+
+Android customization and related security issues.
+Android customization is known to introduce new security
+vulnerabilities across layers. At the application layer, pre-
+loaded apps have been shown to require more permissions
+than needed [27]. At the framework layer, customized sys-
+tem services have been shown to have missing permission
+checks [25]. At the system layer, devices ﬁles are shown to
+have weak permissions that allow third-party apps to direct-
+ly manipulate device drivers and perform privileged opera-
+tions [29]. In addition, devices drivers also introduce vulner-
+abilities that can directly cause root exploits [28]. A recent
+study has shown that by analyzing conﬁguration diﬀerences
+across customized Android ROMs, many security ﬂaws can
+be reveled in all these layers [10]. Our study is a systematic
+analysis of an overlooked system component, Android ION,
+that is customizable by SoC and smartphone vendors.
+
+Android DoS vulnerabilities. DoS attacks (e.g., soft
+reboot) against the Android system services have been
+demonstrated using diﬀerent techniques, e.g., by issuing tar-
+geted and repeated requests to the system services [19], or
+forking an unlimited number of processes exploiting a weak
+local socket permission of the Zygote process [11]. In addi-
+tion, a number of other vulnerabilities such as Null pointer
+and integer overﬂow have been reported recently [6, 3]. All
+of the DoS attacks can cause only the entire Android frame-
+work or system to reboot. Our DoS attacks exploit a new
+class of vulnerabilities that exist due to the lack of access
+control and memory usage limit in various ION heaps. Any
+services or apps that require memory from ION can be tar-
+geted. Due to the fact that some heaps are mostly used by
+one or two services, the DoS impact can be controlled to
+aﬀect only those services; this has not been reported before.
+Unzeroed/Dirty memory. Dirty memory can leak crit-
+ical data to a malicious application, and there are diﬀerent
+underlying causes. For instance, recently it has been shown
+that newly allocated GPU memory pages are not zeroed,
+and may contain data rendered by other applications [20].
+In Linux, memory obtained by malloc() will automatically
+be zeroed by the underlying OS if a physical page has been
+previously used by a diﬀerent process [15]. However, ker-
+nel memory allocation functions like kmalloc() do not get
+zeroed as they are intended for kernel-space use only; this
+has obvious performance beneﬁts. Unfortunately, the intro-
+duction of ION and its user-space and kernel-space buﬀer
+sharing capability eﬀectively breaks the assumption.
+
+Static analysis tools on Android. Static taint analysis
+is one of the most popular techniques used to analyze and vet
+Android apps [22, 21, 12, 16, 17, 26]. For instance, Chex [22]
+can statically analyze the byte code of Android apps for
+component hijacking vulnerabilities. AAPL [21] compares
+the the produced information ﬂows for apps in similar cate-
+gories (e.g., news) to identify suspicious apps with excessive
+information ﬂows compared to others. Besides taint anal-
+ysis, many other static analysis tools are built to discover
+vulnerabilities. Woodpecker [18] analyzes apps to look for
+capability leaks (e.g., through Intent) that allow confused-
+deputy attacks. At the system layer, Kratos [25] analyzes
+
+1673Android framework and look for inconsistent security policy
+enforcements. Even though static taint analysis has been
+used widely to analyze apps, it is rarely used to analyze the
+Android/Linux kernel. Our work applies static taint anal-
+ysis in a novel setting to identify unzeroed memory pages
+allocated and returned to user space through ION.
+
+9. CONCLUSION
+
+In this paper, we report multiple vulnerabilities of the ION
+memory management system that can lead to either DoS or
+sensitive information leakage on virtually all Android de-
+vices to date. We build a novel static taint analysis tool
+to uncover the unzeroed ION heap vulnerabilities systemat-
+ically. To demonstrate the seriousness of the vulnerabilities,
+we build exploits against several latest Android devices run-
+ning latest Android operating systems, including Nexus 6P,
+Samsung Galaxy S7, and Huawei Mate 8 that run Android
+6.0 and even 7.0 preview. In addition, we analyze and digest
+the root causes of the vulnerabilities in depth. Finally, we
+outline the defense strategies that have diﬀerent tradeoﬀs
+which can shed light on future design of such a large and
+complex memory management system.
+
+10. REFERENCES
+[1] https://sites.google.com/a/androidionhackdemo.net/
+
+androidionhackdemo/.
+
+[2] Android Low Memory Killer. https://android.
+
+googlesource.com/kernel/common.git/+/android-3.4/
+drivers/staging/android/lowmemorykiller.c.
+
+[3] Android MediaServer Bug Traps Phones in Endless
+
+Reboots. http://blog.trendmicro.com/
+trendlabs-security-intelligence/
+android-mediaserver-bug-traps-phones-in-endless-reboots/.
+
+[4] Arm TrustZone Technology. http://www.arm.com/
+
+products/processors/technologies/trustzone/.
+
+[5] Device Tree. https://www.kernel.org/doc/
+
+Documentation/devicetree/usage-model.txt.
+
+[6] Integer Overﬂow leading to Heap Corruption while
+
+Unﬂattening GraphicBuﬀer.
+http://seclists.org/fulldisclosure/2015/Mar/63.
+
+[7] STAC - Static Taint Analysis for C.
+
+http://code.google.com/p/tanalysis/.
+[8] The Android ION memory allocator.
+
+https://lwn.net/Articles/480055/, 2012.
+
+[9] Patch: sparc32: dma alloc coherent must honour
+
+GFP ZERO.
+https://patchwork.ozlabs.org/patch/386217/, 2014.
+
+[13] L. Cavallaro, P. Saxena, and R. Sekar. On the Limits
+of Information Flow Techniques for Malware Analysis
+and Containment. In DIMVA, 2008.
+
+[14] Q. A. Chen, Z. Qian, and Z. M. Mao. Peeking into
+
+Your App Without Actually Seeing It: UI State
+Inference and Novel Android Attacks. In Proc. of
+USENIX Security, 2014.
+
+[15] N. Douglas. User Mode Memory Page Allocation: A
+
+Silver Bullet For Memory Allocation? Technical
+report, 2011.
+
+[16] C. Gibler, J. Crussell, J. Erickson, and H. Chen.
+
+AndroidLeaks: Automatically Detecting Potential
+Privacy Leaks in Android Applications on a Large
+Scale. In TRUST, 2012.
+
+[17] M. I. Gordon, D. Kim, J. Perkins, L. Gilham,
+
+N. Nguyen, and M. Rinard. Information-ﬂow Analysis
+of Android Applications in DroidSafe. In NDSS, 2015.
+
+[18] M. Grace, Y. Zhou, Z. Wang, and X. Jiang.
+
+Systematic Detection of Capability Leaks in Stock
+Android Smartphones. In NDSS, 2012.
+
+[19] H. Huang, S. Zhu, K. Chen, and P. Liu. From System
+
+Services Freezing to System Server Shutdown in
+Android: All You Need Is a Loop in an App. In CCS,
+2015.
+
+[20] S. Lee, Y. Kim, J. Kim, and J. Kim. Stealing
+
+Webpages Rendered on Your Browser by Exploiting
+GPU Vulnerabilities. In Oakland, 2014.
+
+[21] K. Lu, Z. Li, V. Kemerlis, Z. Wu, L. Lu, C. Zheng,
+Z. Qian, W. Lee, and G. Jiang. Checking More and
+Alerting Less: Detecting Privacy Leakages via
+Enhanced Data-ﬂow Analysis and Peer Voting. In
+NDSS, 2015.
+
+[22] L. Lu, Z. Li, Z. Wu, W. Lee, and G. Jiang. CHEX:
+
+Statically Vetting Android Apps for Component
+Hijacking Vulnerabilities. In CCS, 2012.
+[23] M. Nazarewicz. A Deep Dive into CMA.
+
+https://lwn.net/Articles/486301/.
+
+[24] B. Saltaformaggio, R. Bhatia, Z. Gu, X. Zhang, and
+
+D. Xu. GUITAR: Piecing Together Android App GUIs
+from Memory Images. In CCS, 2015.
+
+[25] Y. Shao, J. Ott, Q. A. Chen, Z. Qian, and Z. M. Mao.
+
+Kratos: Discovering Inconsistent Security Policy
+Enforcement in the Android Framework. In NDSS,
+2016.
+
+[26] F. Wei, S. Roy, X. Ou, et al. Amandroid: A Precise
+
+and General Inter-Component Data Flow Analysis
+Framework for Security Vetting of Android Apps. In
+CCS, 2014.
+
+[10] Y. Aafer, X. Zhang, and W. Du. Harvesting
+
+[27] L. Wu, M. Grace, Y. Zhou, C. Wu, and X. Jiang. The
+
+Inconsistent Security Conﬁgurations in Custom
+Android ROMs via Diﬀerential Analysis. In USENIX
+SECURITY, 2016.
+
+[11] A. ARMANDO, A. MERLO, M. MIGLIARDI, , and
+
+L. VERDERAME. Would You Mind Forking this
+Process? A Denial of Service Attack on Android (and
+Some Countermeasures). In Information S&P
+Research, 2016.
+
+[12] S. Arzt, S. Rasthofer, C. Fritz, E. Bodden, A. Bartel,
+
+J. Klein, Y. Le Traon, D. Octeau, and P. McDaniel.
+Flowdroid: Precise Context, Flow, Field,
+Object-Sensitive and Lifecycle-Aware Taint Analysis
+for Android Apps. In PLDI, 2014.
+
+Impact of Vendor Customizations on Android
+Security. In CCS, 2013.
+
+[28] H. Zhang, D. She, and Z. Qian. Android Root and Its
+
+Providers: A Double-Edged Sword. In CCS, 2015.
+
+[29] X. Zhou, Y. Lee, N. Zhang, M. Naveed, and X. Wang.
+
+The Peril of Fragmentation: Security Hazards in
+Android Device Driver Customizations. In Oakland,
+2014.
+
+1674

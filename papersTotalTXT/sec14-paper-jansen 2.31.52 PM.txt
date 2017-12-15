@@ -1,0 +1,2909 @@
+Never Been KIST: Tor’s Congestion Management 
+Blossoms with Kernel-Informed Socket Transport
+Rob Jansen, U.S. Naval Research Laboratory; John Geddes, University of Minnesota;  
+
+Chris Wacek and Micah Sherr, Georgetown University;  
+
+Paul Syverson, U.S. Naval Research Laboratory
+
+https://www.usenix.org/conference/usenixsecurity14/technical-sessions/presentation/jansen
+
+This paper is included in the Proceedings of the 23rd USENIX Security Symposium.August 20–22, 2014 • San Diego, CAISBN 978-1-931971-15-7Open access to the Proceedings of  the 23rd USENIX Security Symposium is sponsored by USENIXNever Been KIST: Tor’s Congestion Management Blossoms with
+
+Kernel-Informed Socket Transport
+
+Rob Jansen†
+
+John Geddes‡
+
+Chris Wacek∗
+
+Micah Sherr∗
+
+Paul Syverson†
+
+† U.S. Naval Research Laboratory
+
+{rob.g.jansen, paul.syverson}@nrl.navy.mil
+
+‡ University of Minnesota
+
+geddes@cs.umn.edu
+
+∗ Georgetown University
+
+{cwacek, msherr}@cs.georgetown.edu
+
+Abstract
+
+Tor’s growing popularity and user diversity has re-
+sulted in network performance problems that are not
+well understood. A large body of work has attempted
+to solve these problems without a complete understand-
+ing of where congestion occurs in Tor.
+In this paper,
+we ﬁrst study congestion in Tor at individual relays as
+well as along the entire end-to-end Tor path and ﬁnd
+that congestion occurs almost exclusively in egress ker-
+nel socket buffers. We then analyze Tor’s socket interac-
+tions and discover two major issues affecting congestion:
+Tor writes sockets sequentially, and Tor writes as much
+as possible to each socket. We thus design, implement,
+and test KIST: a new socket management algorithm that
+uses real-time kernel information to dynamically com-
+pute the amount to write to each socket while consider-
+ing all writable circuits when scheduling new cells. We
+ﬁnd that, in the medians, KIST reduces circuit conges-
+tion by over 30 percent, reduces network latency by 18
+percent, and increases network throughput by nearly 10
+percent. We analyze the security of KIST and ﬁnd an ac-
+ceptable performance and security trade-off, as it does
+not signiﬁcantly affect the outcome of well-known la-
+tency and throughput attacks. While our focus is Tor,
+our techniques and observations should help analyze and
+improve overlay and application performance, both for
+security applications and in general.
+
+1
+
+Introduction
+
+Tor [21] is the most popular overlay network for com-
+municating anonymously online. Tor serves millions of
+users daily by transferring their trafﬁc through a source-
+routed circuit of three volunteer relays, and encrypts the
+trafﬁc in such a way that no one relay learns both its
+source and intended destination. Tor is also used to resist
+online censorship, and its support for hidden services,
+network bridges, and protocol obfuscation has helped at-
+tract a large and diverse set of users.
+
+While Tor’s growing popularity, variety of use cases,
+and diversity of users have provided a larger anonymity
+set, they have also led to performance issues [23]. For
+example, it has been shown that roughly half of Tor’s
+trafﬁc can be attributed to BitTorrent [18, 43], while the
+more recent use of Tor by a botnet [29] has further in-
+creased concern about Tor’s ability to utilize volunteer
+resources to handle a growing user base [20, 36, 37, 45].
+Numerous proposals have been made to battle Tor’s
+performance problems, some of which modify the
+mechanisms used for path selection [13, 59, 60], client
+throttling [14, 38, 45], circuit scheduling [57], and
+ﬂow/congestion control [15]. While some of this work
+has or will be incorporated into the Tor software, none of
+it has provided a comprehensive understanding of where
+the most signiﬁcant source of congestion occurs in a
+complete Tor deployment. This lack of understanding
+has led to the design of uninformed algorithms and spec-
+ulative solutions.
+In this paper, we seek a more thor-
+ough understanding of congestion in Tor and its effect on
+Tor’s security. We explore an answer to the fundamental
+question—“Where is Tor slow?”—and design informed
+solutions that not only decrease congestion, but also im-
+prove Tor’s ability to manage it as Tor continues to grow.
+Congestion in Tor: We use a multifaceted approach to
+exploring congestion. First, we develop a shared library
+and Tor software patch for measuring congestion local to
+relays running in the public Tor network, and use them
+to measure congestion from three live relays under our
+control. Second, we develop software patches for Tor
+and the open-source Shadow simulator [7], and use them
+to measure congestion along the full end-to-end path in
+the largest known, at-scale, private Shadow-Tor deploy-
+ment. Our Shadow patches ensure that our congestion
+measurements are accurate and realistic; we show how
+they signiﬁcantly improve Shadow’s TCP implementa-
+tion, network topology, and Tor models.1
+
+1We have contributed our patches to the Shadow project [7] and
+
+they have been integrated as of Shadow release 1.9.0.
+
+USENIX Association  
+
+23rd USENIX Security Symposium  127
+
+To the best of our knowledge, we are the ﬁrst to con-
+sider such a comprehensive range of congestion infor-
+mation that spans from individual application instances
+to full network sessions for the entire distributed system.
+Our analysis indicates that congestion occurs almost
+exclusively inside of the kernel egress socket buffers,
+dwarﬁng the Tor and the kernel ingress buffer times. This
+ﬁnding is consistent among all three public Tor relays we
+measured, and among relays in every circuit position in
+our private Shadow-Tor deployment. This result is sig-
+niﬁcant, as Tor does not currently prevent, detect, or oth-
+erwise manage kernel congestion.
+Mismanaged Socket Output: Using this new under-
+standing of where congestion occurs, we analyze Tor’s
+socket output mechanisms and ﬁnd two signiﬁcant and
+fundamental design issues: Tor sequentially writes to
+sockets while ignoring the state of all sockets other than
+the one that is currently being written; and Tor writes as
+much as possible to each socket.
+
+By writing to sockets sequentially, Tor’s circuit sched-
+uler considers only a small subset of the circuits with
+writable data. We show how this leads to improper uti-
+lization of circuit priority mechanisms, which causes Tor
+to send lower priority data from one socket before higher
+priority data from another. This ﬁnding conﬁrms evi-
+dence from previous work indicating the ineffectiveness
+of circuit priority algorithms [35].
+
+By writing as much as possible to each socket, Tor is
+often delivering to the kernel more data than it is capable
+of sending due to either physical bandwidth limitations
+or throttling by the TCP congestion control protocol. Not
+only does writing too much increase data queuing de-
+lays in the kernel, it also further reduces the effectiveness
+of Tor’s circuit priority mechanisms because Tor relin-
+quishes control over the priority of data after it is deliv-
+ered to the kernel.2 This kernel overload is exacerbated
+by the fact that a Tor relay may have thousands of sock-
+ets open at any time in order to facilitate data transfer
+between other relays, a problem that may signiﬁcantly
+worsen if Tor adopts recent proposals [16, 26] that sug-
+gest increasing the number of sockets between relays.
+KIST: Kernel-Informed Socket Transport: To solve
+the socket management problems outlined above, we de-
+sign KIST: a Kernel-Informed Socket Transport algo-
+rithm. KIST has two features that work together to sig-
+niﬁcantly improve Tor’s control over network conges-
+tion. First, KIST changes Tor’s circuit level scheduler so
+that it chooses from all circuits with writable data rather
+than just those belonging to a single TCP socket. Second,
+to complement this global scheduling approach, KIST
+also dynamically manages the amount of data written to
+each socket based on real-time kernel and TCP state in-
+
+2To the best of our knowledge, the Linux kernel uses a variant of
+
+the ﬁrst-come ﬁrst-serve queuing discipline among sockets.
+
+formation. In this way, KIST attempts to minimize the
+amount of data that exists in the kernel that cannot be
+sent, and to maximize the amount of time that Tor has
+control over data priority.
+
+We perform in-depth experiments in our at-scale pri-
+vate Shadow-Tor network, and we show how KIST can
+be used to relocate congestion from the kernel into Tor,
+where it can be properly managed. We also show how
+KIST allows Tor to correctly utilize its circuit priority
+scheduler, reducing download latency by over 660 mil-
+liseconds, or 23.5 percent, for interactive trafﬁc streams
+typically generated by web browsing behaviors.
+
+We analyze the security of KIST, showing how it af-
+fects well-known latency and throughput attacks. In par-
+ticular, we show the extent to which the latency improve-
+ments reduce the number of round-trip time measure-
+ments needed to conduct a successful latency attack [31].
+We also show how KIST does not signiﬁcantly affect an
+adversary’s ability to collect accurate measurements re-
+quired for the throughput correlation attack [44] when
+compared to vanilla Tor.
+Outline of Major Contributions: We outline our major
+contributions as follows:
+– in Section 3 we discuss improvements to the open-
+source Shadow simulator that signiﬁcantly enhance
+its accuracy, including experiments with the largest
+known private Tor network of 3,600 relays and
+13,800 clients running real Tor software;
+
+– in Section 4 we discuss a library we developed to
+measure congestion in Tor, and results from the ﬁrst
+known end-to-end Tor circuit congestion analysis;
+
+– in Section 5 we show how Tor’s current management
+of sockets results in ineffective circuit priority, detail
+the KIST design and prototype, and show how it im-
+proves Tor’s ability to manage congestion through a
+comprehensive and full-network evaluation; and
+
+– in Section 6 we analyze Tor’s security with KIST by
+showing how our performance improvements affect
+well-known latency and throughput attacks.
+
+2 Background and Related Work
+
+Tor [21] is a volunteer-operated anonymity service
+used by an estimated hundreds of thousands of daily
+users [28]. Tor assumes an adversary who can monitor
+a portion of the underlying Internet and/or operate Tor
+relays. People primarily use Tor to prevent an adversary
+from discovering the endpoints of their communications,
+or disrupting access to information.
+Tor Trafﬁc Handling: Tor provides anonymity by form-
+ing source-routed paths called circuits that consist of
+(usually) three relays on an overlay network. Clients
+transfer TCP-based application trafﬁc within these cir-
+cuits; encrypted application-layer headers and payloads
+
+128  23rd USENIX Security Symposium 
+
+USENIX Association
+
+Kernel socket
+input buﬀers
+
+Tor input
+buﬀers
+
+Tor circuit
+queues
+
+Tor output
+buﬀers
+
+Kernel socket
+output buﬀers
+
+(a)
+
+(b)
+
+(c)
+
+(d)
+
+(e)
+
+(f)
+
+Figure 1: Internals of cell processing within in a Tor relay.
+Dashed lines denote TCP connections. Transitions between
+buffers—both within the kernel (side boxes) and within Tor
+(center box)—are shown with solid arrows.
+
+make it more difﬁcult for an adversary to discern an inter-
+cepted communication’s endpoints or learn its plaintext.
+A given circuit may carry several Tor streams, which
+are logical connections between clients and destinations.
+For example, a HTTP request to usenix.org may result
+in several Tor streams (i.e., to fetch embedded objects);
+these streams may all be transported over a single circuit.
+Circuits are themselves multiplexed over TLS connec-
+tions between relays whenever their paths share an edge;
+that is, all concurrent circuits between relays u and v will
+be transferred over the same TLS connection between the
+two relays, irrespective of the circuits’ endpoints.
+
+The unit of transfer in Tor is a 512-byte cell. Figure 1
+depicts the internals of cell processing within a Tor re-
+lay. In this example, the relay maintains two TLS con-
+nections with other relays. Incoming packets from the
+two TCP streams are ﬁrst demultiplexed and placed into
+kernel socket input buffers by the underlying OS (Fig-
+ure 1a)3. The OS processes the packets, usually in FIFO
+order, delivering them to Tor where they are reassem-
+bled into TLS-encrypted cells using dedicated Tor in-
+put buffers (Figure 1b). Upon receipt of an entire TLS
+datagram, the TLS layer is removed, the cell is onion-
+crypted,4 and then transferred and enqueued in the ap-
+propriate Tor circuit queue (Figure 1c). Each relay main-
+tains a queue for each circuit that it is currently serving.
+Cells from the same Tor input buffer may be enqueued in
+different circuit queues, since a single TCP connection
+between two relays may carry multiple circuits.
+
+Tor uses a priority-based circuit scheduling approach
+that attempts to prioritize interactive web clients over
+bulk downloaders [57]. The circuit scheduler selects a
+cell from a circuit queue to process based on this prioriti-
+zation, onion-crypts the cell, and stores it in a Tor output
+buffer (Figure 1d). Once the Tor output buffer contains
+sufﬁcient data to form a TLS packet, the data is written
+to the kernel for transport (Figure 1f).
+Improving Tor Performance: There is a large body
+of work that attempts to improve Tor’s network perfor-
+
+3For simplicity, we consider only relays that run Linux since such
+relays represent 75% of all Tor relays and contribute 91% of the band-
+width of the live Tor network [58].
+
+4Encrypted or decrypted, depending on circuit direction.
+
+mance, e.g., by reﬁning Tor’s relay selection strategy
+[11,55,56] or providing incentives to users to operate Tor
+relays [36, 37, 45]. These approaches are orthogonal and
+can be applied in concert with our work, which focuses
+on improving Tor’s congestion management.
+
+Most closely related to this paper are approaches
+that modify Tor’s circuit scheduling, ﬂow control, or
+transport mechanisms. Reardon and Goldberg suggest
+replacing Tor’s TCP-based transport mechanism with
+UDP-based DTLS [54], while Mathewson explores us-
+ing SCTP [40]. Murdoch [47] explains that the UDP
+approach is promising, but there are challenges that
+have thus far prevented the approach from being de-
+ployed:
+there is limited kernel support for SCTP; and
+the lack of hop-by-hop reliability from UDP-based trans-
+ports causes increased load at Tor’s exit relays. Our work
+allows Tor to best utilize the existing TCP transport in the
+short term while work toward a long term UDP deploy-
+ment strategy continues.
+
+Tang and Goldberg propose the use of the exponential
+weighted moving average (EWMA) to characterize cir-
+cuits’ recent levels of activity, with bursty circuits given
+greater priority than busy circuits [57] (to favor interac-
+tive web users over bulk downloaders). Unfortunately,
+although Tor has adopted EWMA, the network has not
+signiﬁcantly beneﬁtted from its use [35]. In our study of
+where Tor is slow, we show that EWMA is made ineffec-
+tive by Tor’s current management of sockets, and can be
+made effective through our proposed modiﬁcations.
+
+AlSabah et al. propose an ATM-like congestion and
+ﬂow control system for Tor called N23 [15]. Their ap-
+proach causes pushback effects to previous nodes, reduc-
+ing congestion in the entire circuit. Our KIST strategy is
+complementary to N23, focusing instead on local tech-
+niques to remove kernel-level congestion at Tor relays.
+
+Torchestra [26] uses separate TCP connections to
+carry interactive and bulk trafﬁc, isolating the effects of
+congestion between the two trafﬁc classes. Conceptually,
+Torchestra moves circuit-selection logic to the kernel,
+where the OS schedules packets for the two connections.
+Relatedly, AlSabah and Goldberg introduce PCTCP [16],
+a transport mechanism for Tor in which each circuit is as-
+signed its own IPsec tunnel. In this paper, we argue that
+overloading the kernel with additional sockets reduces
+the effectiveness of circuit priority mechanisms since the
+kernel has no information regarding the priority of data.
+In contrast, we aim to move congestion management to
+Tor, where priority scheduling can be most effective.
+
+Nowlan et al. [50] propose the use of uTCP and
+uTLS [49] to tackle the “head-of-line” blocking problem
+in Tor. Here, they bypass TCP’s in-order delivery mech-
+anism to peek at trafﬁc that has arrived but is not ready
+to be delivered by the TCP stack (e.g., because an earlier
+packet was dropped). Since Tor multiplexes multiple cir-
+
+USENIX Association  
+
+23rd USENIX Security Symposium  129
+
+cuits over a single TCP connection, their technique offers
+signiﬁcant latency improvements when connections are
+lossy, since already-arrived trafﬁc can be immediately
+processed. Our technique can be viewed as a form of
+application-layer head-of-line countermeasure since we
+move scheduling decisions from the TCP stack to within
+Tor. In contrast to Nowlan et al.’s approach, we do not re-
+quire any kernel-level modiﬁcations or changes to Tor’s
+transport mechanism.
+
+3 Enhanced Network Experimentation
+
+After
+
+To increase conﬁdence in our experiments, we introduce
+three signiﬁcant enhancements to the Shadow Tor simu-
+lator [35] and its existing models [33]: a more realistic
+simulated kernel and TCP network stack, an updated In-
+ternet topology model, and the largest known deployed
+private Tor network. The enhancements in this section
+represent a large and determined engineering effort; we
+will show how Tor experimental accuracy has signiﬁ-
+cantly beneﬁted as a result of these improvements. We
+remark that our improvements to Shadow will have an
+immediate impact beyond this work to the various re-
+search groups around the world that use the simulator.
+Shadow TCP Enhancements:
+reviewing
+Shadow [7], we ﬁrst discovered that it was missing
+many important TCP features, causing it to be less
+accurate than desired. We enhanced Shadow by adding
+the following: retransmission timers [52], fast retrans-
+mit/recovery [12], selective acknowledgments [42], and
+forward acknowledgments [41]. Second, we discovered
+that Shadow was using a very primitive version of the
+basic additive-increase multiplicative-decrease (AIMD)
+congestion control algorithm. We implemented a much
+more complete version of the CUBIC algorithm [27], the
+default congestion control algorithm used in the Linux
+kernel since version 2.6.19. CUBIC is an important algo-
+rithm for properly adjusting the congestion window. We
+will show how our implementation of these algorithms
+greatly enhance Shadow’s accuracy, which is paramount
+to the remainder of this paper. See Appendix A.1 [34]
+for more details about our modiﬁcations.
+
+We verify the accuracy of Shadow’s new TCP imple-
+mentation to ensure that it is adequately handling packet
+loss and properly growing the congestion window by
+comparing its behavior to ns [51], a popular network sim-
+ulator, because of the ease at which ns is able to model
+packet loss rates. In our ﬁrst experiment, both Shadow
+and ns have two nodes connected by a 10 MiB/s link
+with a 10 ms round trip time. One node then down-
+loads a 100 MiB ﬁle 10 times for each tested packet loss
+rate. Figure 2a shows that the average download time in
+Shadow matches well with ns over varying packet loss
+rates. Although not presented here, we similarly vali-
+
+dated Shadow with our changes against a real network
+link using the bandwidth and packet loss rate that was
+achieved over our switch; the results did not signiﬁcantly
+deviate from those presented in Figure 2a.
+
+For our second experiment, we check that the growth
+of the congestion window using CUBIC is accurate.
+We ﬁrst transfer a 100 MiB ﬁle over a 100 Mbit/s link
+between two physical Ubuntu 12.04 machines running
+the 3.2.0 Linux kernel. We record the cwnd (con-
+gestion window) and ssthresh (slow start threshold)
+values from the getsockopt function call using the
+TCP_INFO option. We then run an identical experiment
+in Shadow, setting the slow start threshold to what we
+observed from Linux and ensuring that packet loss hap-
+pens at roughly the same rate. Figure 2b shows the value
+of cwnd in both Shadow and Linux over time, and we
+see almost identical growth patterns. The slight varia-
+tion in the saw-tooth pattern is due to unpredictable vari-
+ation in the physical link that was not reproduced by
+Shadow. As a result, Shadow’s cwnd grew slightly faster
+than Linux’s because Shadow was able to send one ex-
+tra packet. We believe this is an artifact of our particular
+physical conﬁguration and do not believe it signiﬁcantly
+affects simulation accuracy in general: more importantly,
+the overall saw-tooth pattern matches well.
+
+The two experiments discussed above give us high
+conﬁdence that our TCP implementation is accurate,
+both in responding to packet loss and in operation of the
+CUBIC congestion control algorithm.
+Shadow Topology Enhancements: To ensure that we
+are causing the most realistic performance and con-
+gestion effects possible during simulation, we enhance
+Shadow using techniques from recent research in mod-
+eling Tor topologies [39, 59],
+traceroute data from
+CAIDA [2], and client/server data from the Tor Metrics
+Portal [8] and Alexa [1]. This data-driven Internet map
+is more realistic than the one Shadow provides, and in-
+cludes 699,029 vertices and 1,338,590 edges. For space
+reasons, we provide more details in Appendix A.2 [34].
+Tor Model: Using Shadow with the improvements dis-
+cussed above, we build a Tor model that reﬂects the real
+Tor network as it existed in July 2013, using the then-
+latest stable Tor version 0.2.3.25. (We use this model
+for all experiments in this paper.) Using data from the
+Tor Metrics Portal [8], we conﬁgure a complete, private
+Tor network following Tor modeling best practices [33],
+and attach every node to the closest network location in
+our topology map. The resulting Tor network conﬁg-
+uration includes 10 directory authorities, 3,600 relays,
+13,800 clients, and 4,000 ﬁle servers—the largest known
+working private experimental Tor network, and the ﬁrst
+to run at scale to the best of our knowledge.
+
+The 13,800 clients in our model provide background
+trafﬁc and load on the network. 10,800 of our clients
+
+130  23rd USENIX Security Symposium 
+
+USENIX Association
+
+i
+
+)
+s
+(
+e
+m
+T
+d
+a
+o
+n
+w
+o
+D
+
+l
+
+3000
+
+2500
+
+2000
+
+1500
+
+1000
+
+500
+
+0
+
+0
+
+5
+
+100
+
+80
+
+60
+
+40
+
+20
+
+d
+n
+w
+c
+
+Shadow
+NS
+
+Shadow
+Linux
+
+1.0
+
+0.8
+
+0.6
+
+0.4
+
+0.2
+
+torperf 50KiB
+shadow 50KiB
+torperf 1MiB
+shadow 1MiB
+torperf 5MiB
+shadow 5MiB
+
+n
+o
+
+i
+t
+c
+a
+r
+F
+e
+v
+i
+t
+
+l
+
+a
+u
+m
+u
+C
+
+10
+
+15
+
+Packet Loss (%)
+
+20
+
+0
+
+0
+
+1
+
+2
+
+3
+
+4
+
+5
+
+Time (s)
+
+6
+
+7
+
+8
+
+9
+
+0.0
+
+0
+
+20
+
+40
+
+60
+
+80
+
+100
+
+120
+
+Time to Last Byte (s)
+
+(a) Download Time, Shadow vs. ns
+
+(b) Congestion Window, Shadow vs. Linux
+
+(c) Download Time, Shadow-Tor vs. Tor
+
+Figure 2: Figure 2a compares Shadow to ns download times. Figure 2b compares congestion window over time when Shadow and
+Linux have the same link properties. Figure 2c compares Shadow-Tor to live Tor measurements collected from Tor Metrics [8].
+
+download 320 KiB ﬁles (the median size of a web page
+according to the most recent web statistics published by
+a Google engineer [53]) and then wait for a time cho-
+sen uniformly at random from the range [1, 60 000] mil-
+liseconds after each completed download. 1,200 of our
+clients repeatedly download 5 MiB ﬁles with no pauses
+between completing a download and starting the next.
+The ratio of these client behaviors was chosen accord-
+ing to the latest known measurements of client trafﬁc
+on Tor [18, 43]. Shadow also contains 1,800 TorPerf [9]
+clients that download a ﬁle over a fresh circuit and pause
+for 60 seconds after each successful download. (TorPerf
+is a tool for measuring Tor performance.) 600 of the Tor-
+Perf clients download 50 KiB ﬁles, 600 download 1 MiB
+ﬁles, and 600 download 5 MiB ﬁles. Our simulations run
+for one virtual hour during each experiment.
+
+Figure 2c shows a comparison of publicly available
+TorPerf measurements collected on the live Tor net-
+work [8] to those collected in our private Shadow-Tor
+network. As shown in Figure 2c, our full size Shadow-
+Tor network is extremely accurate in terms of time to
+complete downloads for all ﬁle sizes. These results give
+us conﬁdence that our at-scale Shadow-Tor network is
+strongly representative of the deployed Tor network.
+
+4 Congestion Analysis
+
+In this section, we explore where congestion happens in
+Tor through a large scale congestion analysis. We take a
+multifaceted approach by measuring congestion as it oc-
+curs in both the live, public Tor network, and in an exper-
+imental, private Tor network running in Shadow. By an-
+alyzing relays in the public Tor network, we get the most
+realistic and accurate view of what is happening at our
+measured relays. We supplement the data from a rela-
+tively small public relay sample with measurements from
+a much larger set of private relays, collecting a larger and
+more complete view of Tor congestion.
+
+To understand congestion, we are interested in mea-
+suring the time that data spends inside of Tor as well as
+inside of kernel sockets in both the incoming and outgo-
+ing directions. We will discuss our ﬁndings in both envi-
+ronments after describing the techniques that we used to
+collect the time spent in these locations.
+
+4.1 Congestion in the Live Tor Network
+Relays running in the operational network provide the
+most accurate source of congestion data, as these relays
+are serving real clients and transferring real trafﬁc. As
+mentioned above, we are interested in measuring queu-
+ing times inside of the Tor application as well as inside
+of the kernel, and so we developed techniques for both in
+the local context of a public Tor relay.
+Tor Congestion: Measuring Tor queuing times requires
+some straightforward modiﬁcations to the Tor software.
+As soon as a relay reads the entire cell, it internally cre-
+ates a cell structure that holds the cell’s circuit ID, com-
+mand, and payload. We add a new unique cell ID value.
+Whenever a cell enters Tor and the cell structure is cre-
+ated, we log a message containing the current time and
+the cell’s unique ID. The cell is then switched to the out-
+going circuit. After it’s sent to the kernel we log another
+message containing the time and ID. The difference be-
+tween these times represents Tor application congestion.
+Kernel Congestion: Measuring kernel queuing times
+is much more complicated since Tor does not have di-
+rect access to the kernel internals.
+In order to log the
+times when a piece of data enters and leaves the ker-
+nel in both the incoming and outgoing directions, we
+developed a new, modular, application-agnostic, multi-
+threaded library, called libkqtime.5 libkqtime
+uses libpcap [6] to determine when data crosses the
+host/network boundary, and function interposition on
+
+5libkqtime was written in 770 LOC, and is available for down-
+
+load as open source software [5].
+
+USENIX Association  
+
+23rd USENIX Security Symposium  131
+
+1.0
+
+0.9
+
+0.8
+
+0.7
+
+0.6
+
+n
+o
+i
+t
+c
+a
+r
+F
+e
+v
+i
+t
+a
+u
+m
+u
+C
+
+l
+
+0.5
+10−1
+
+1.0
+
+0.9
+
+0.8
+
+0.7
+
+0.6
+
+n
+o
+i
+t
+c
+a
+r
+F
+e
+v
+i
+t
+a
+u
+m
+u
+C
+
+l
+
+kernel in
+tor
+kernel out
+
+102
+
+103
+
+0.5
+10−1
+
+1.0
+
+0.9
+
+0.8
+
+0.7
+
+0.6
+
+n
+o
+i
+t
+c
+a
+r
+F
+e
+v
+i
+t
+a
+u
+m
+u
+C
+
+l
+
+kernel in
+tor
+kernel out
+
+102
+
+103
+
+0.5
+10−1
+
+100
+
+101
+
+Time (ms)
+(b) curiosity2
+
+kernel in
+tor
+kernel out
+
+102
+
+103
+
+100
+
+101
+
+Time (ms)
+(c) curiosity3
+
+100
+
+101
+
+Time (ms)
+(a) curiosity1
+
+Figure 3: The distribution of congestion inside Tor and the kernel on our 3 relays running in the public Tor network, as measured
+between 2014-01-20 and 2014-01-28. Most congestion occurred in the outbound kernel queues on all three relays.
+
+the write(), send(), read(), and recv() func-
+tions to determine when it crosses the application/kernel
+boundary. The library copies a 16 byte tag as data enters
+the kernel from either end, and then searches for the tag
+as data leaves the kernel on the opposite end. This pro-
+cess works in both directions, and the timestamps col-
+lected by the library allow us to measure both inbound
+and outbound kernel congestion. Appendix B [34] gives
+a more detailed description of libkqtime.
+Results: To collect congestion information in Tor, we
+ﬁrst ran three live relays (curiosity1, curiosity2, and
+curiosity3) using an unmodiﬁed copy of Tor release
+0.2.3.25 for several months to allow them to stabi-
+lize. We conﬁgured them as non-exit nodes and used a
+network appliance to rate limit curiosity1 at 1 Mbit/s, cu-
+riosity2 at 10 Mbit/s, and curiosity3 at 50 Mbit/s. Only
+curiosity2 had the guard ﬂag (could be chosen as en-
+try relay for a circuit) during our data collection. On
+2014-01-20, we swapped the Tor binary with a version
+linked to libkqtime and modiﬁed as discussed in Sec-
+tion 4.1. We collected Tor and kernel congestion for 190
+hours (just under 8 days) ending on 2014-01-28, and then
+replaced the vanilla Tor binary.
+
+The distributions of congestion as measured on each
+relay during the collection period are shown in Figure 3
+with logarithmic x-axes. Our measurements indicate that
+most congestion, when present, occurs in the kernel out-
+bound queues, while kernel inbound and Tor congestion
+are both less than 1 millisecond for over 95 percent of our
+measurements. This ﬁnding is consistent across all three
+relays we measured. Kernel outbound congestion in-
+creases from curiosity1 to curiosity2, and again slightly
+from curiosity2 to curiosity3, indicating that congestion
+is a function of relay capacity or load. We leave it to fu-
+ture work to analyze the strength of this correlation, as
+that is outside the scope of this paper.
+Ethical Considerations: We took careful protections to
+ensure that our live data collection did not breach users’
+anonymity.
+In particular, we captured only buffered
+
+data timing information; no network addresses were ever
+recorded. We discussed our experimental methodology
+with Tor Project maintainers, who raised no objections.
+Finally, we contacted the IRB of our relay host institu-
+tion. The IRB decided that no review was warranted
+since our measurements did not, in their opinion, con-
+stitute human subjects research.
+
+4.2 Congestion in a Shadow-Tor Network
+While congestion data from real live relays is the most
+accurate, it only gives us a limited view of congestion
+local to our relays. The congestion measured at our re-
+lays may or may not be representative of congestion at
+other relays in the network. Therefore, we use our pri-
+vate Shadow-Tor network to supplement our congestion
+data and enhance our analysis. Using Shadow provides
+many advantages over live Tor: it’s technically simpler;
+we are able to measure congestion at all relays in our pri-
+vate network; we can track the congestion of every cell
+across the entire circuit because we do not have privacy
+concerns with Shadow; and we can analyze how conges-
+tion changes with varying network conﬁgurations.
+Tor and Kernel Congestion: The process for collect-
+ing congestion in Shadow is simpler than in live Tor,
+since we have direct access to Shadow’s virtual kernel.
+In our modiﬁed Tor, each cell again contains a unique ID
+as in Section 4.1. However, when running in Shadow,
+we also add a 16 byte magic token and include both the
+unique ID and the magic token when sending cells out to
+the network. The unique ID is forwarded with the cell
+as it travels through the circuit. Since Shadow prevents
+Tor from encrypting cell contents for efﬁciency reasons,
+the Shadow kernel can search outgoing packets for the
+unencrypted magic token immediately before they leave
+the virtual network interface. When found, it logs the
+unique cell ID with a timestamp. It performs an anal-
+ogous procedure for incoming packets immediately af-
+ter they arrive on the virtual network interface. These
+
+132  23rd USENIX Security Symposium 
+
+USENIX Association
+
+1.0
+
+0.8
+
+0.6
+
+0.4
+
+0.2
+
+n
+o
+i
+t
+c
+a
+r
+F
+e
+v
+i
+t
+a
+u
+m
+u
+C
+
+l
+
+1.0
+
+0.8
+
+0.6
+
+0.4
+
+0.2
+
+n
+o
+i
+t
+c
+a
+r
+F
+e
+v
+i
+t
+a
+u
+m
+u
+C
+
+l
+
+kernel in
+tor
+kernel out
+
+1.0
+
+0.8
+
+0.6
+
+0.4
+
+0.2
+
+n
+o
+i
+t
+c
+a
+r
+F
+e
+v
+i
+t
+a
+u
+m
+u
+C
+
+l
+
+kernel in
+tor
+kernel out
+
+0.0
+10−1
+
+100
+
+101
+102
+Time (ms)
+
+103
+
+104
+
+0.0
+10−1
+
+100
+
+101
+102
+Time (ms)
+
+103
+
+104
+
+0.0
+10−1
+
+100
+
+101
+102
+Time (ms)
+
+kernel in
+tor
+kernel out
+
+103
+
+104
+
+(a) Relays in Entry Position
+
+(b) Relays in Middle Position
+
+(c) Relays in Exit Position
+
+Figure 4: Relay congestion by circuit position in our Shadow-Tor network, measured on on circuits using end-to-end cells from
+1,200 clients selected uniformly at random. Most congestion occurred in the outbound kernel queues, independent of relay position.
+
+Shadow timestamps are combined with the timestamps
+logged when a cell enters and leaves Tor to compute both
+Tor and kernel congestion.
+Results: We use our model of Tor as described in Sec-
+tion 3, with the addition of the cell tracking information
+discussed above. Since tracking every cell would con-
+sume an extremely large amount of disk space, we sam-
+ple congestion as follows: we select 10 percent of the
+non-TorPerf clients (1,200 total) in our network chosen
+uniformly, and track 1 of every 100 cells traveling over
+circuits they initiate. The tracking timestamps from these
+cells are then used to attribute congestion to the relays
+through which the cells are traveling.
+
+It is important to understand that our method does not
+sample relay congestion uniformly: the congestion mea-
+surements will be biased towards relays that are cho-
+sen more often by clients, according to Tor’s bandwidth-
+weighted path selection algorithm. This means that our
+results will represent the congestion that a typical client
+will experience when using Tor. We believe that these
+results are more meaningful than those we could obtain
+by uniformly sampling congestion at each relay indepen-
+dently (as we did in Section 4.1), because ultimately we
+are interested in improving clients’ experience.
+
+The distributions of congestion measured in Shadow
+for each circuit position are shown in Figure 4. We again
+ﬁnd that congestion occurs most signiﬁcantly in the ker-
+nel outbound queues, regardless of a relay’s circuit po-
+sition. Our Shadow experiments indicate higher conges-
+tion than in live Tor, which we attribute to our client-
+oriented sampling method described above.
+
+5 Kernel-Informed Socket Transport
+
+Our large scale congestion analysis from Section 4 re-
+vealed that the most signiﬁcant delay in Tor occurs in
+outbound kernel queues. In this section, we ﬁrst explore
+how this problem adversely affects Tor’s trafﬁc manage-
+ment by disrupting existing scheduling mechanisms to
+
+the extent that they become ineffective. We then describe
+the KIST algorithm and experimental results.
+
+5.1 Mismanaged Socket Output
+As described in Section 2, each Tor relay creates and
+maintains a single TCP connection to every relay to
+which it is connected. All communication between two
+relays occurs through this single TCP connection chan-
+nel.
+In particular, this channel multiplexes all circuits
+that are established between its relay endpoints. TCP
+provides Tor a reliable and in-order data transport.
+Sequential Socket Writes: Tor uses the asynchronous
+event library libevent [4] to assist with sending and
+receiving data to and from the kernel (i.e. network). Each
+TCP connection is represented as a socket in the kernel,
+and is identiﬁed by a unique socket descriptor. Tor reg-
+isters each socket descriptor with libevent, which itself
+manages kernel polling and triggers an asynchronous no-
+tiﬁcation to Tor via a callback function of the readability
+and writability of that socket. When Tor receives this
+notiﬁcation, it chooses to read or write as appropriate.
+
+An important aspect of these libevent notiﬁcations is
+that they happen for one socket at a time, regardless of
+the number of socket descriptors that Tor has registered.
+Tor attempts to send or receive data from that one socket
+without considering the state of any of the other sock-
+ets. This is particularly troublesome when writing, as
+Tor will only be able to choose from the non-empty cir-
+cuits belonging to the currently triggered socket and no
+other. Therefore, Tor’s circuit scheduler may schedule a
+circuit with worse priority than it would have if it could
+choose from all sockets that are able to be triggered at
+that time. Since the kernel schedules with a ﬁrst-come
+ﬁrst-serve (FCFS) discipline, Tor may actually be send-
+ing data out of priority order simply due to the order in
+which the socket notiﬁcations are delivered by libevent.
+Bloated Socket Buffers:
+Linux uses TCP auto-
+tuning to dynamically and monotonically increase each
+
+USENIX Association  
+
+23rd USENIX Security Symposium  133
+
+134  23rd USENIX Security Symposium 
+
+USENIX Association
+
+(a)SocketSharingScenarios0.00.20.40.60.81.0Throughput(KiB/s)0.00.20.40.60.81.0CumulativeFraction4060801001201401600.00.20.40.60.81.0DETERpri+rrpri-0.00.20.40.60.81.0Shadow(b)ThroughputwithSharedSocket0.00.20.40.60.81.0Throughput(KiB/s)0.00.20.40.60.81.0CumulativeFraction1601802002202400.00.20.40.60.81.0DETERpri+rrpri-0.00.20.40.60.81.0Shadow(c)ThroughputwithUnsharedSocketsFigure5:Socketsharingaffectscircuitpriorityscheduling.socketbuffer’scapacityusingthesocketconnection’sbandwidth-delayproductcalculation[61].TCPauto-tuningincreasestheamountofdatathekernelwillacceptfromtheapplicationinordertoensurethatthesocketisabletofullyutilizethenetworklink.TCPauto-tuningisanextremelyusefultechniquetomaximizethroughputforapplicationswithfewsocketsorwithoutpriorityre-quirements.However,itmaycauseproblemsformorecomplexapplicationslikeTor.WhenlibeventnotiﬁesTorthatasocketiswritable,Torwritesasmuchdataaspossibletothatsocket(i.e.,untilthekernelreturnsEWOULDBLOCK).Althoughthisimprovesutilizationwhenonlyafewauto-tunedsocketsareinuse,consideraTorrelaythatwritestothousandsofauto-tunedsockets(acommonsituationsinceTormain-tainsasocketforeveryrelaywithwhichitcommuni-cates).Thesesocketswilleachattempttoacceptenoughdatatofullyutilizethelink.IfTorﬁllsallofthesesock-etstocapacity,thekernelwillclearlybeunabletoimme-diatelysenditalltothenetwork.Therefore,withmanyactivesocketsingeneralandforasymmetricconnectionsinparticular,thepotentialforkernelqueuingdelaysaredramatic.AswehaveshowninSection4,writingasmuchaspossibletothekernelasTorcurrentlydoesre-sultsinlargekernelqueuingdelays.Torcannolongeradjustdatapriorityonceitissenttothekernel,evenifthatdataisstillqueuedintheker-nelwhenTorreceivesdataofhigherimportancelater.Todemonstratehowthismayresultinpoorschedulingdecisions,considerarelaywithtwocircuits:onecon-tainssustained,highthroughputtrafﬁcofworseprior-ity(typicalofmanybulkdatatransfers),whiletheothercontainsbursty,lowthroughputtrafﬁcofbetterpriority(typicalofmanyinteractivedatatransfersessions).Intheabsenceofdataonthelowthroughputcircuit,thehighthroughputcircuitwillﬁlltheentirekernelsocketbufferwhetherornotthekernelisabletoimmediatelysendthatdata.Then,whenabetterprioritycellarrives,Torwillimmediatelyscheduleandwriteittothekernel.However,sincethekernelsendsdatatothenetworkinthesameorderinwhichitwasreceivedfromtheappli-cation(FCFS),thatbetterprioritycelldatamustwaitun-tilallofthepreviouslyreceivedhighthroughputdataisﬂushedtothenetwork.Thisproblemtheoreticallywors-ensasthenumberofsocketsincrease,suggestingthatrecentresearchproposingthatTorusemultiplesocketsbetweeneachpairofrelays[16,26]maybemisguided.EffectsonCircuitPriority:Tostudytheeffectsoncir-cuitpriority,wecustomizedTorasfollows.First,weaddedtheabilityforeachclienttosendaspecialcellaf-terbuildingacircuitthatcommunicatesoneoftwoprior-ityclassestothecircuit’srelays:abetterpriorityclass;oraworsepriorityclass.Second,wecustomizedthebuilt-inEWMAcircuitschedulerthatprioritizesburstytrafﬁcoverbulktrafﬁc[57]toincludeapriorityfactorF:thecircuitschedulercountsFcellsforeverycellscheduledonaworseprioritycircuit.Therefore,theEWMAoftheworsepriorityclasswilleffectivelyincreaseFtimesfasterthannormal,givingaschedulingadvantagetobet-terprioritytrafﬁc.WeexperimentwithtwoseparateprivateTornet-works:oneusingShadow[35],adiscreteeventnetworksimulatorthatrunsTorinvirtualprocesses;andtheotherusingDETER[3],acustomexperimentationtestbedthatrunsToronbare-metalhardware.WeconsidertwoclientsdownloadingfromtwoﬁleserversthroughTorinthescenariosshowninFigure5a:–sharedsocket:theclientsshareentryandmiddlere-lays,butusedifferentexitrelays–theclients’circuitseachbelongtothesamesocketconnectingthemiddletotheentry;and–unsharedsockets:theclientsshareonlythemiddlerelay–theclients’circuitseachbelongtoindepen-dentsocketsconnectingthemiddletoeachentry.Weassignedoneclient’strafﬁctothebetterpriorityclass(denotedwith“+”)andtheotherclient’strafﬁctotheworsepriorityclass(denotedwith“-”).Weconﬁg-uredallnodeswitha10Mbitsymmetricaccesslink,andapproximatedamiddlerelaybottleneckbysettingitssocketbuffersizeto32KiB.Ourconﬁgurationallowsusto focus on the socket contention that will occur at the
+middle relay, and the four cases that result when con-
+sidering whether or not the two circuits share incoming
+or outgoing TCP connections at the middle relay. Clients
+downloaded data through the circuits continuously for 10
+minutes in Shadow and 60 minutes on DETER.6
+
+The results collected during each of the scenarios are
+shown in Figure 5. Plotted is the cumulative distribu-
+tion of the throughput achieved by the better (“pri+”) and
+worse (“pri-”) priority clients using the priority sched-
+uler, as well as the combined cumulative distribution for
+both clients using Tor’s default round-robin scheduler
+(“rr”). As shown in Figure 5b, performance differenti-
+ation occurs correctly with the priority scheduler on a
+shared socket. However, as shown in Figure 5c, the pri-
+ority scheduler is unable to differentiate throughput when
+the circuits do not share a socket.
+Discussion: As outlined above, the reason for no differ-
+entiation in the case of the unshared socket is that both
+circuits are treated independently by the scheduler due to
+the sequential libevent notiﬁcations and the fact that Tor
+currently schedules circuits belonging to one socket at a
+time while ignoring the others. We used TorPS [10], a
+Tor path selection simulator, to determine how often we
+would expect unshared sockets to occur in practice. We
+used TorPS to build 10 million paths following Tor’s path
+selection algorithm, and computed the probability of two
+circuit paths belonging to each scenario. We found that
+any two paths may be classiﬁed as unshared (they share
+at least one relay but never share an outgoing socket) at
+least 99.775 percent of the time, clearly indicating that
+adjusting Tor’s socket management may have a dramatic
+effect on data priority inside of Tor.
+
+Note that the socket mismanagement problem is not
+solved simply by parallelizing the libevent notiﬁcation
+system and priority scheduling processes (which would
+require complex code), or by utilizing classful queuing
+disciplines in the kernel (which would require root priv-
+ileges); while these may improve control over trafﬁc pri-
+ority to some extent, they would still result in bloated
+buffers containing data that cannot be sent due to closed
+TCP congestion windows.
+
+5.2 The KIST Algorithm
+In order to overcome the inefﬁciencies resulting from
+Tor’s socket management, KIST chooses between all cir-
+cuits that have queued data irrespective of the socket to
+which the circuit belongs, and dynamically adjusts the
+amount written to each socket based on real-time kernel
+information. We now detail each of these approaches.
+
+6The small-scale experiments described here are meant to isolate
+Tor’s internal queuing behavior for analysis purposes, and do not fully
+represent the live Tor network, its background trafﬁc, or its load.
+
+Algorithm 1 The KIST NotifySocketWritable()
+callback, invoked by libevent for each writable socket.
+Require: sdesc,conn, T ← GlobalW riteTimeout
+1: Lp ← getPendingConnectionList()
+2: if Lp is Null then
+Lp ← newList()
+3:
+setPendingConnectionList(Lp)
+4:
+createCallback(T , NotifyGlobalWrite())
+5:
+6: end if
+7: if Lp.contains(conn) is False then
+8:
+9: end if
+10: disableNoti f y(sdesc)
+
+Lp.add(conn)
+
+Global Circuit Scheduling: Recall that libevent delivers
+write notiﬁcation events for a single socket at a time. Our
+approach with KIST is relatively straightforward: rather
+than handle the kernel write task immediately when
+libevent notiﬁes Tor that a socket is writable, we simply
+collect a set of sockets that are writable over a time inter-
+val speciﬁed by an adjustable GlobalWriteTimeout
+parameter. This allows us to increase the number of can-
+didate circuits we consider when scheduling and writ-
+ing cells to the kernel: we may select among all circuits
+which contain cells that are waiting to be written to one
+of the sockets in our writable set.
+
+The socket collection approach is outlined in Algo-
+rithm 1. The socket descriptor sdesc and a connection
+state object conn are supplied by libevent. Note that
+we disable notiﬁcation events for the socket (as shown in
+line 10) in order to prevent duplicate notiﬁcation events
+during the socket collection interval.
+
+After the GlobalWriteTimeout time interval,
+KIST begins writing cells to the sockets according to the
+circuit scheduling policy. There are two major phases
+to this process, which is outlined in Algorithm 2.
+In
+lines 4 and 8, we distinguish sockets that contain raw
+bytes ready to be written directly to the kernel (previ-
+ously scheduled cells with TLS headers attached) from
+those with additional cells ready to be converted to raw
+bytes. KIST ﬁrst writes the already scheduled raw bytes
+(lines 4-7), and then schedules and writes additional cells
+after converting them to raw bytes and adding TLS head-
+ers (lines 13-15). Note that the connections should be
+enumerated (on line 3 of Algorithm 2) in an order that
+respects the order in which cells were converted to raw
+bytes by the circuit scheduler in the previous round.
+
+The global scheduling approach does not by itself
+solve the bloated socket buffer problem. KIST also dy-
+namically computes socket write limits on line 2 of Al-
+gorithm 2 using real-time TCP, socket, and bandwidth in-
+formation, which it then uses when deciding how much
+to write to the kernel.
+
+USENIX Association  
+
+23rd USENIX Security Symposium  135
+
+Algorithm 2 The KIST NotifyGlobalWrite() call-
+back, invoked after the GlobalWriteTimeout period.
+1: Leligible ← newList()
+2: K ← collectKernelIn f o(getConnectionList())
+3: for all conn in getPendingConnectionList() do
+4:
+5:
+6:
+7:
+8:
+
+enableNoti f y(conn)
+nBytes ← writeBytesToKernel(K,conn)
+
+end if
+if hasCells(conn) is True and
+
+if hasBytesForKernel(conn) is True then
+
+getLimit(K,conn) > 0 then
+
+Leligible.add(conn)
+
+9:
+end if
+10:
+11: end for
+12: while Leligible.isEmpty() is False do
+13:
+14:
+15:
+16:
+17:
+18:
+19: end while
+
+conn ← scheduleCell(Leligible) {cell to bytes}
+enableNoti f y(conn)
+nBytes ← writeBytesToKernel(K,conn)
+if nBytes is 0 or getLimit(K,conn) is 0 then
+
+Leligible.remove(conn)
+
+end if
+
+Managing Socket Output: KIST attempts to move the
+queuing delays from the kernel outbound queue to Tor’s
+circuit queue by keeping kernel output buffers as small
+as possible, i.e., by only writing to the kernel as much
+as the kernel will actually send. By delaying the circuit
+scheduling decision until the last possible instant before
+kernel starvation occurs, Tor will ultimately improve its
+control over the priority of outgoing data. This approach
+attempts to give Tor approximately the same control over
+outbound data that it would have if it had direct access to
+the network interface. When combined with global cir-
+cuit scheduling, Tor’s inﬂuence over outgoing data prior-
+ity should improve.
+
+To compute write limits, KIST ﬁrst makes three sys-
+tem calls for each connection: getsockopt on level
+SOL SOCKET for option SO SNDBUF to get sndbufcap,
+the capacity of the send buffer; ioctl with command
+SIOCOUTQ to get sndbuﬂen, the current length of the
+send buffer; and getsockopt on level SOL TCP for
+option TCP INFO to get tcpi, a variety of TCP state in-
+formation. The TCP information used by KIST includes
+the connection’s maximum segment size mss, the con-
+gestion window cwnd, and the number of unacked pack-
+ets for which the kernel is waiting for an acknowledg-
+ment from the TCP peer. KIST then computes a write
+limit for each connection c as follows:
+
+socket spacec = sndbufcapc − sndbuﬂenc
+tcp spacec = (cwndc − unackedc)· mssc
+limitc = min(socket spacec, tcp spacec)
+
+(1)
+
+The key insight in Equation 1 is that TCP will not al-
+low the kernel to send more packets than dictated by the
+congestion window, and that the unacknowledged pack-
+ets prevent the congestion window from sliding open. By
+respecting this write limit for each connection, KIST en-
+sures that the data sent to the kernel is immediately send-
+able and reduces kernel queuing delays.
+
+If all connections are sending data in parallel, it is still
+possible to overwhelm the kernel with more data than
+it can physically send to the network. Therefore, KIST
+also computes a global write limit at the beginning of
+each GlobalWriteTimeout period:
+
+sndbuﬂen prev = sndbuﬂen
+
+sndbuﬂen = ∑ci(cid:31)sndbuﬂenci(cid:30)
+bytes sent = sndbuﬂen− sndbuﬂen prev
+limit = max(limit,bytes sent)
+
+(2)
+
+Note that Equation 2 is an attempt to measure the actual
+upstream bandwidth speed of the machine. In practice,
+this could be done in a testing phase during which writes
+are not limited, conﬁgured manually, or estimated using
+other techniques such as packet trains [32].
+
+The connection and global limits are computed at the
+beginning of a scheduling round, i.e., on line 2 of Algo-
+rithm 2; they are enforced whenever bytes are written to
+the kernel, i.e., on lines 6 and 15 of Algorithm 2. Note
+that they will be bounded above by Tor’s independently
+conﬁgured connection and global application rate limits.
+
+5.3 Experiments and Results
+We use Shadow and its models as discussed in Section 3
+to measure KIST’s effect on network performance, con-
+gestion, and throughput. We also evaluate its CPU over-
+head. See Appendix C [34] for an analysis under a more
+heavily loaded Shadow-Tor network. Note that we found
+that KIST performs as well or better under heavier load
+than under normal load as presented in this section, indi-
+cating that it can gracefully scale as Tor grows.
+Prototype: We implemented a KIST protoype as a patch
+to Tor version 0.2.3.25, and included the elements
+discussed in Section 4 necessary for measuring conges-
+tion during our experiments. We tested vanilla Tor us-
+ing the default CircuitPriorityHalflife of 30,
+the global scheduling part of KIST (without enforcing
+the write limits), and the complete KIST algorithm. We
+conﬁgured the global scheduler to use a 10 millisecond
+GlobalWriteTimeout in both the global and KIST
+experiments. Note that our KIST implementation ignores
+the connection enumeration order on line 3 of Algo-
+rithm 2, an optimization that may further improve Tor’s
+control over priority in cases where the global limit is
+reached before the algorithm reaches line 12.
+
+136  23rd USENIX Security Symposium 
+
+USENIX Association
+
+1.0
+
+0.8
+
+0.6
+
+0.4
+
+0.2
+
+n
+o
+i
+t
+c
+a
+r
+F
+e
+v
+i
+t
+a
+u
+m
+u
+C
+
+l
+
+0.0
+10−1
+
+100
+
+101
+Time (ms)
+
+102
+
+vanilla
+global
+KIST
+
+103
+
+1.0
+
+0.8
+
+0.6
+
+0.4
+
+0.2
+
+n
+o
+i
+t
+c
+a
+r
+F
+e
+v
+i
+t
+a
+u
+m
+u
+C
+
+l
+
+0.0
+10−1
+
+100
+
+101
+Time (ms)
+
+102
+
+0.8
+
+0.7
+
+0.6
+
+0.5
+
+0.4
+
+0.3
+
+n
+o
+i
+t
+c
+a
+r
+F
+e
+v
+i
+t
+a
+u
+m
+u
+C
+
+l
+
+0.2
+
+0
+
+vanilla
+global
+KIST
+
+103
+
+vanilla
+global
+KIST
+
+500
+
+1000
+
+Time (ms)
+
+1500
+
+2000
+
+(a) Kernel Out Congestion
+
+(b) Tor Congestion
+
+(c) Circuit Congestion
+
+Figure 6: Congestion for vanilla Tor, KIST, and the global scheduling part of KIST (without enforcing write limits). Figures 6a
+and 6b show the distribution of cell congestion local to each relay (with logarithmic x-axes), while Figure 6c shows the distribution
+of the end-to-end circuit congestion for all measured cells.
+
+n
+o
+
+i
+t
+c
+a
+r
+F
+e
+v
+i
+t
+
+l
+
+a
+u
+m
+u
+C
+
+1.0
+
+0.8
+
+0.6
+
+0.4
+
+0.2
+
+vanilla
+global
+KIST
+
+1.0
+
+0.8
+
+0.6
+
+1.0
+
+0.8
+
+0.6
+
+0.4
+
+0.2
+
+n
+o
+
+i
+t
+c
+a
+r
+F
+e
+v
+i
+t
+
+l
+
+a
+u
+m
+u
+C
+
+0.0
+
+0.0
+
+0.5
+
+1.0
+
+0.4
+
+0.5
+1.5
+
+1
+
+2
+
+2.0
+
+4
+2.5
+
+8
+3.0
+
+0.0
+
+0
+
+1
+
+1.0
+
+0.8
+
+0.6
+
+0.4
+
+0.2
+
+n
+o
+
+i
+t
+c
+a
+r
+F
+e
+v
+i
+t
+
+l
+
+a
+u
+m
+u
+C
+
+vanilla
+global
+KIST
+
+3
+
+2
+6
+Time to Last Byte (s)
+
+4
+
+5
+
+7
+
+8
+
+0.0
+
+0
+
+Time to First Byte (s)
+(a) All Clients
+
+(b) 320 KiB “web” clients
+
+vanilla
+global
+KIST
+
+70
+
+80
+
+50
+
+40
+
+30
+
+10
+
+20
+60
+Time to Last Byte (s)
+(c) 5 MiB “bulk” clients
+
+Figure 7: Client performance for vanilla Tor, KIST, and the global scheduling part of KIST (without enforcing write limits).
+Figure 7a shows the distribution of the time until the client receives the ﬁrst byte of the data payload, for all clients, while the inset
+graph shows the same distribution with a logarithmic x-axis. Figures 7b and 7c show the distribution of time to complete a 320 KiB
+and 5 MiB ﬁle by the “web” and “bulk” clients, respectively.
+
+Congestion: Recall that the goal of KIST is to move con-
+gestion from the kernel outbound queue to Tor where it
+can better be managed. Figure 6 shows KIST’s effective-
+ness in this regard. In particular, Figure 6a shows that
+KIST reduces kernel outbound congestion over vanilla
+Tor by one to two order of magnitude for over 40 percent
+of the sampled cells. Further, it shows that the queue
+time is less than 200 milliseconds for 99 percent of the
+cells measured, compared to over 4000 milliseconds for
+both vanilla Tor and global scheduling alone.
+
+Figure 6b shows how global scheduling and KIST in-
+crease the congestion inside of Tor. Both global schedul-
+ing and KIST result in sharp Tor queue time increases
+up to 10 milliseconds, after which the existing 10 mil-
+lisecond GlobalWriteTimeout timer event will ﬁre
+and Tor will ﬂush more data to the kernel. With global
+scheduling, most of the data queued in Tor quickly gets
+transferred to the kernel following this timeout, whereas
+data is queued inside of Tor much longer when using
+KIST. This result is an explicit feature of KIST, as it
+means Tor will have more control over data priority when
+scheduling circuits.
+
+While we have shown above how KIST is able to move
+congestion from the kernel into Tor, Figure 6c shows the
+aggregate effect on cell congestion during its complete
+existence through the entire end-to-end circuit. KIST re-
+duces aggregate circuit congestion from 1010.1 millisec-
+onds to 704.5 milliseconds in the median, a 30.3 percent
+improvement, while global scheduling reduces conges-
+tion by 13 percent to 878.8 milliseconds.
+
+The results in Figure 6 show that KIST indeed
+achieves its congestion management goals while high-
+lighting the importance of limiting kernel write amounts
+in addition to globally scheduling circuits.
+Performance: We show in Figure 7 how KIST af-
+fects client performance. Figure 7a shows how net-
+work latency is generally affected by showing the time
+until the ﬁrst byte of every download by all clients.
+Global scheduling alone is roughly indistinguishable
+from vanilla Tor, while KIST reduces latency to the ﬁrst
+byte for over 80 percent of the downloads—in the me-
+dian, KIST reduces network latency by 18.1 percent from
+0.838 seconds to 0.686 seconds. The inset graph has a
+logarithmic x-axis and shows that KIST is particularly
+
+USENIX Association  
+
+23rd USENIX Security Symposium  137
+
+n
+o
+
+i
+t
+c
+a
+r
+F
+e
+v
+i
+t
+
+l
+
+a
+u
+m
+u
+C
+
+1.0
+
+0.8
+
+0.6
+
+0.4
+
+0.2
+
+0.0
+
+650
+
+700
+
+vanilla
+global
+KIST
+
+950
+
+800
+
+750
+Throughput (MiB/s)
+
+850
+
+900
+
+i
+
+l
+
+)
+s
+(
+e
+m
+T
+d
+a
+o
+n
+w
+o
+D
+B
+M
+1
+f
+r
+e
+p
+r
+o
+T
+
+25
+
+20
+
+15
+
+10
+
+5
+
+0
+o v
+
+N
+
+Torperf Download
+Number Relays
+
+0
+
+2
+
+1
+
+e
+
+1
+
+F
+
+b
+
+0
+
+2
+
+2
+
+1
+
+M
+
+a y
+
+0
+
+2
+
+2
+
+u
+
+1
+
+A
+
+g
+
+0
+
+2
+
+2
+
+1
+
+N
+
+o v
+
+0
+
+2
+
+2
+
+e
+
+1
+
+F
+
+b
+
+0
+
+2
+
+3
+
+1
+M
+
+a y
+
+0
+
+2
+
+3
+
+u
+
+1
+
+A
+
+g
+
+0
+
+2
+
+3
+
+1
+
+N
+
+o v
+
+3
+
+1
+
+0
+
+2
+
+5500
+
+4800
+
+4100
+
+3400
+
+l
+
+R
+e
+a
+y
+s
+
+2700
+
+2000
+
+Figure 8: Aggregate relay write throughput for vanilla Tor,
+KIST, and the global scheduling part of KIST (without enforc-
+ing write limits). Both of our enhancements increase network
+throughput over vanilla Tor.
+
+beneﬁcial in the upper parts of the distribution:
+in the
+99th percentile, latency is reduced from more than 7 sec-
+onds to less than 2.7 seconds.
+
+Figures 7b and 7c show the distribution of time to
+complete each 320 KiB download for the “web” clients
+and each 5 MiB ﬁle for the “bulk” clients, respectively.
+In our experiments, the 320 KiB download times de-
+creased by over 1 second for over 40 percent of the down-
+loads, while the download times for 5 MiB ﬁles increased
+by less than 8 seconds for all downloads. These changes
+in download times are a result of Tor correctly utiliz-
+ing its circuit priority scheduler, which prioritizes trafﬁc
+with the lowest exponentially-weighted moving average
+throughput. As the “web” clients pause between down-
+loads, their trafﬁc is often prioritized ahead of “bulk”
+trafﬁc. Our results indicate that not only does KIST de-
+crease Tor network latency, it also increases Tor’s ability
+to appropriately manage its trafﬁc.
+Throughput: We show in Figure 8 KIST’s effect on
+relay throughput. Shown is the distribution of aggre-
+gate bytes written per second by all relays in the net-
+work. We found that throughput improves when using
+KIST due to a combination of the reduction in network
+latency and our client model: web clients completed their
+downloads faster in the lower latency network and there-
+fore also downloaded more ﬁles. By lowering circuit
+congestion, KIST improves utilization of existing band-
+width resources over vanilla Tor by 71.6 MiB/s, or 9.8%,
+in the median. While the best network utilization is
+achieved with global scheduling without write limits (a
+150.1 MiB/s, or 20.5%, improvement over vanilla Tor in
+the median), we have shown above that it is less effective
+than KIST at reducing kernel congestion and allowing
+Tor to correctly prioritize trafﬁc.
+Overhead: The main overhead in KIST involves the
+collection of socket and TCP information from the ker-
+nel using three separate calls to getsockopt (socket
+capacity, socket length, and TCP info). These three
+system calls are made for every connection after ev-
+
+Figure 9: Network size correlates with performance.
+
+ery GlobalWriteTimeout interval. To understand
+the overhead involved with these calls, we instrumented
+curiosity3 from Section 4 to collect timing information
+while performing the syscalls required by KIST. Our test
+ran on the live relay running an Intel Xeon x3450 CPU
+at 2.67GHz for 3 days and 14 hours, and collected a tim-
+ing sample every second for a total of 309,739 samples.
+We found that the three system calls took 0.9140 mi-
+croseconds per connection in the median, with a mean
+of 0.9204 and a standard deviation of 3.1× 10−5.
+The number of connections a relay may have is
+bounded above roughly by the number of relays in the
+network, which is currently around 5,000. Therefore, we
+expect the overhead to be less than 5 milliseconds and
+reasonable for current relays. If this overhead becomes
+problematic as Tor grows, the gathering of kernel infor-
+mation can be outsourced to a helper thread and continu-
+ously updated over time. Further, we have determined
+through discussions with Linux kernel developers that
+the netlink socket diag interface could be used to collect
+information for several sockets at once—an optimization
+that may provide signiﬁcant reductions in overhead.
+
+6 Security Analysis
+
+Performance and Security: Performance and ease of
+use affect adoption rates of any network technology.
+They have played a central role in the size and diversity
+of the Tor userbase. This can then affect the size of the
+network itself as users are more willing to run parts of the
+network or contribute ﬁnancially to its upkeep, e.g., via
+torservers.net. Growth from performance improvements
+affect the security of Tor by increasing the uncertainty for
+many types of adversaries concerning who is communi-
+cating with whom [17, 20, 22, 37]. Performance factors
+in anonymous communication systems like Tor are thus
+pertinent to security in a much more direct way than they
+typically would be for, say, a faster signature algorithm’s
+impact on the security of an authentication system.
+
+Though real and more signiﬁcant, direct effects of per-
+formance on Tor’s security from network and userbase
+growth are also hard to show, given both the variety of
+
+138  23rd USENIX Security Symposium 
+
+USENIX Association
+
+1.0
+
+0.8
+
+0.6
+
+0.4
+
+0.2
+
+n
+o
+i
+t
+c
+a
+r
+F
+e
+v
+i
+t
+a
+u
+m
+u
+C
+
+l
+
+0.0
+
+0
+
+50
+
+100
+
+150
+
+Difference (ms)
+
+1.0
+
+0.8
+
+0.6
+
+0.4
+
+0.2
+
+n
+o
+i
+t
+c
+a
+r
+F
+e
+v
+i
+t
+a
+u
+m
+u
+C
+
+l
+
+vanilla
+KIST
+
+200
+
+250
+
+0.0
+
+0
+
+vanilla
+KIST
+
+500
+
+1000
+
+Cumulative Number of Pings
+
+1500
+
+2000
+
+(a) Latency Estimate Difference
+
+(b) Cumulative Pings until Best Estimate
+
+Figure 10: Latency leaks are more pronounced (10a) and are faster (10b) with KIST.
+
+causal factors and the difﬁculty of gathering useful data
+while preserving privacy. Whatever the causal explana-
+tion, a correlation (−.62) between Tor performance im-
+provement over time (measured by the median download
+time of a 1 MB ﬁle) and network size is shown in Fig-
+ure 9. (Numbers are from the Tor Metrics Portal [8].)
+Similar results hold when number of relays is replaced
+with bandwidth metrics. Which is more relevant depends
+on the adversary’s most signiﬁcant constraints: adver-
+sary size and distribution across the underlying network
+are important considerations [39].
+
+More measurable effects can occur if a performance
+change creates a new opportunity for attack or makes an
+existing attack more effective or easier to mount. Perfor-
+mance change may also eliminate or diminish previous
+possible or actual attacks. Growth effects are potentially
+the greatest security effects of our performance changes,
+but we now focus on these more directly observable as-
+pects. They include attacks on Tor based on resource
+contention or interference [19, 24, 25, 31, 44, 46, 48] or
+simply available resource observation [44], or observ-
+ing other performance properties, such as latency [31].
+Many papers have also explored improvements to Tor
+performance via scheduling, throttling, congestion man-
+agement, etc. (see Section 2). Manipulating performance
+enhancement mechanisms can turn them into potential
+vectors of attack themselves [38]. Geddes et al. [25]
+analyzed anonymity impact of several performance en-
+hancement mechanisms for Tor.
+Latency Leak: The basic idea of a latency leak attack
+as ﬁrst set out in [30] is to measure RTT (roundtrip time)
+between a compromised exit and the client of some tar-
+get connection repeatedly and then to pick the shortest
+result as an indication of latency. Next compare this to
+the known, measured latency through all the hops in the
+circuit except client to entry relay. (Other attacks such as
+throughput measurement, discussed below, are assumed
+to have already identiﬁed the relays in the circuit.) Next,
+
+use that to determine the latency between the client of
+the target connection and its entry relay, which is in a
+known network location. This can signiﬁcantly reduce
+the range of possible network locations for the client.
+When measuring latency using our improved models and
+simulator, we discovered that this attack is generally able
+to determine latency well with vanilla Tor. While KIST
+improves the overall accuracy, the improvement is small
+when a good estimate was also found with vanilla Tor.
+
+Figure 10a shows the results of an experiment run on
+our model from Section 3 with random circuit and client
+choices, indicating the difference between the correct la-
+tency and the estimate after a few hundred pings once per
+second. Roughly 20% of circuits for both vanilla Tor and
+KIST are within 25ms of the correct latency. After this
+they diverge, but both have a median latency estimate
+of about 50ms or less. It is only for the worst 10-20%
+of estimates, which are presumably not useful anyway,
+that KIST is substantially better. While the eventual ac-
+curacy of the attack is comparable for both, the attacker
+under KIST is signiﬁcantly faster on average. Figure 10b
+shows the cumulative number of pings (seconds) until a
+best estimate is achieved. After 200 pings, nearly 40%
+of KIST circuits have achieved their best estimate while
+less than 10% have for vanilla Tor. And the median num-
+ber of pings needed for KIST is about 700 vs. 1200 for
+vanilla Tor.
+
+The accuracy of the latency attack indicated above is a
+signiﬁcant threat to network location, which from a tech-
+nical perspective is what Tor is primarily designed to pro-
+tect. It could be diminished by padding latency. Specif-
+ically any connection at the edges of the Tor network,
+at either source or destination end, could be dynamically
+padded by the entry or exit relay respectively to ideally
+make latency of all edge connections through that re-
+lay uniform—more realistically to signiﬁcantly decrease
+the network location information leaked by latency. Re-
+lays can do their own RTT measurements for any edge
+
+USENIX Association  
+
+23rd USENIX Security Symposium  139
+
+1.0
+
+0.8
+
+0.6
+
+0.4
+
+0.2
+
+n
+o
+i
+t
+c
+a
+r
+F
+e
+v
+i
+t
+a
+u
+m
+u
+C
+
+l
+
+vanilla
+KIST
+
+0.0
+−0.4−0.3−0.2−0.1 0.0 0.1 0.2 0.3 0.4 0.5
+
+Correlation Score
+
+1.0
+
+0.8
+
+0.6
+
+0.4
+
+0.2
+
+n
+o
+i
+t
+c
+a
+r
+F
+e
+v
+i
+t
+a
+u
+m
+u
+C
+
+l
+
+0.0
+
+0
+
+vanilla
+KIST
+
+400
+
+200
+Number of Guards Remaining
+
+600
+
+800 1000 1200
+
+(a) Throughput Correlation, Probe to Target Client
+
+(b) Guards Remaining in Candidate Guard Set
+
+Figure 11: While the aggregate throughput correlations of the probe to the true guard over the set of all probes (11a) are not
+signiﬁcantly affected by KIST, it is slightly easier for the adversary to eliminate candidate guards of a target client (for all clients)
+(11b) when using KIST.
+
+connection and pad accordingly. There are many issues
+around this suggestion, which we leave to future work.
+Throughput Leak: The throughput attack introduced by
+Mittal et al. [44] identiﬁes the entry relay of a target con-
+nection by setting up one-hop probe circuits from attack
+clients through all prospective entry relays and back to
+the client in order to measure throughput at those relays.
+These throughputs are compared to the throughput ob-
+served by the exit relay of the target circuit. The attack is
+directed against circuits used for bulk downloading since
+these will attempt a sustained maximum throughput, and
+will result in congestion effects on bottleneck relays that
+allow the adversary to reduce uncertainty about possible
+entry relays. Mittal et al. also looked at attacks on lower
+bandwidth interactive trafﬁc and found some success, al-
+though with much less accuracy than for bulk trafﬁc.
+
+We analyze the extent to which KIST affects the
+throughput attack. While measuring throughput at en-
+try relays, we also adopt the simpliﬁcation of Geddes et
+al. [25] of restricting observations to entry relays that are
+not used as middle or exit relays for other bulk download-
+ing circuits. This allows us the efﬁciency of making mea-
+surements for several simulated attacks simultaneously
+while minimizing interference between their probes.
+
+Figure 11a shows the cumulative distribution of scores
+for correlation of probe throughput at the correct entry
+relay with throughput at the observed exit relay under
+vanilla Tor and under KIST scheduling (on the network
+and user model given in Section 3). Throughput was
+measured every 100 ms. We found that the throughput
+correlations are not signiﬁcantly affected by KIST.
+
+To explain the correlation scores, recall from Sec-
+tion 5.2 how KIST reduces both circuit congestion and
+network latency by allowing Tor to properly prioritize
+circuits independent of the TCP connections to which
+they belong. This leads to two competing potential ef-
+
+fects on the throughput attack: (1) a less congested net-
+work will increase the sensitivity of the probes to vari-
+ations in throughput, thereby allowing stronger corre-
+lations between the throughput achieved by the probe
+client and that achieved by the target client; and (2) a cir-
+cuit’s throughput is most correlated with that of its bottle-
+neck relay, and KIST’s improved scheduling should also
+reduce the bottleneck effects of congestion in the net-
+work and allow weaker throughput correlations. Further,
+the improved priority scheduling (moving from round-
+robin over TCP connections to properly utilizing EWMA
+over circuits) will cause the throughput of each client to
+become slightly “burstier” over the short term as the pri-
+ority causes the scheduler to oscillate between the cir-
+cuits. We suspect that the similar correlation scores are
+the result of combining these effects.
+
+To further understand KIST’s affect on the throughput
+attack, we measure how the correlation of every client’s
+throughput to the true guard’s throughput compares to
+the correlation of the client’s throughput to that of every
+other candidate guard in the network. For every client,
+we start with a candidate guard set of all guards, and re-
+move those guards with a lower correlation score with
+the client than the true guard’s score. Figure 11b shows
+the distribution, over all clients, of the extent to which
+we were able to reduce the size of the candidate guard
+set using this heuristic. Although KIST reduced the un-
+certainty about the true guard used by the target client,
+we do not expect the small improvement to signiﬁcantly
+affect the ability to conduct a successful throughput at-
+tack in practice.
+
+7 Conclusion
+
+In this paper, we outlined the results of an in-depth
+congestion study using both public and private Tor net-
+
+140  23rd USENIX Security Symposium 
+
+USENIX Association
+
+works. We identiﬁed that most congestion occurs in
+outbound kernel buffers, analyzed Tor socket manage-
+ment, and designed a new socket transport mechanism
+called KIST. Through evaluation in a full-scale private
+Shadow-Tor network, we conclude that KIST is capa-
+ble of moving congestion into Tor where it can be bet-
+ter managed by application priority scheduling mecha-
+nisms. More speciﬁcally, we found that by considering
+all sockets and respecting TCP state information when
+writing data to the kernel, KIST reduces both conges-
+tion and latency while increasing utilization. Finally, we
+performed a detailed evaluation of KIST against well-
+known latency and throughput attacks. While KIST in-
+creases the speed at which true network latency can be
+calculated, it does not signiﬁcantly affect the accuracy of
+the probes required to correlate throughput.
+
+Future work should extend our simulation-based eval-
+uation and consider how KIST performs for relays in
+the live Tor network. We note that our analysis is
+based exclusively on Linux relays, as 91% of Tor’s band-
+width is provided by relays running a Linux-based dis-
+tribution [58]. Although we expect KIST to improve
+performance similarly across platforms because it pri-
+marily works by managing socket buffer levels, future
+work should consider how KIST is affected by the inter-
+operation of relays running on a diverse set of OSes. Fi-
+nally, our KIST prototype would beneﬁt from optimiza-
+tions, particularly by running the process of gathering
+kernel state information in a separate thread and/or us-
+ing the netlink socket diag interface.
+
+Acknowledgments
+
+We thank our shepherd, Rachel Greenstadt, and the
+anonymous reviewers for providing feedback that helped
+improve this work. We thank Roger Dingledine for
+discussions about measuring congestion in Tor, and
+Patrick McHardy for suggesting the use of the netlink
+socket diag interface. This work was partially supported
+by ONR, DARPA, and the National Science Founda-
+tion through grants CNS-1149832, CNS-1064986, CNS-
+1204347, CNS-1223825, and CNS-1314637. This mate-
+rial is based upon work supported by the Defense Ad-
+vanced Research Project Agency (DARPA) and Space
+and Naval Warfare Systems Center Paciﬁc under Con-
+tract No. N66001-11-C-4020. Any opinions, ﬁndings
+and conclusions or recommendations expressed in this
+material are those of the author(s) and do not necessar-
+ily reﬂect the views of the Defense Advanced Research
+Project Agency and Space and Naval Warfare Systems
+Center Paciﬁc.
+
+References
+[1] Alexa top 1 million sites. http://s3.amazonaws.com/
+alexa-static/top-1m.csv.zip. Retrieved 2012-01-31.
+
+[2] CAIDA data. http://www.caida.org/data.
+[3] DETER testbed. http://www.isi.edu/deter.
+[4] libevent event notiﬁcation library. http://libevent.org/.
+[5] libkqtime
+https://github.com/
+
+repository.
+
+code
+
+robgjansen/libkqtime.git.
+
+[6] libpcap portable C/C++ library for network trafﬁc capture.
+
+http://www.tcpdump.org/.
+
+[7] Shadow homepage and code repositories. https://shadow.
+
+github.io/, https://github.com/shadow/.
+
+[8] Tor Metrics Portal. http://metrics.torproject.org/.
+[9] TorPerf.
+https://gitweb.torproject.org/
+
+torperf.git/.
+
+[10] TorPS homepage. http://torps.github.io/.
+[11] AKHOONDI, M., YU, C., AND MADHYASTHA, H. V. LAS-
+Tor: A low-latency as-aware Tor client. In IEEE Symposium on
+Security and Privacy (Oakland) (2012).
+
+[12] ALLMAN, M., PAXSON, V., AND BLANTON, E. TCP Conges-
+
+tion Control. RFC 5681 (Draft Standard), Sept. 2009.
+
+[13] ALSABAH, M., BAUER, K., ELAHI, T., AND GOLDBERG, I.
+The path less travelled: Overcoming Tor’s bottlenecks with trafﬁc
+splitting. In Privacy Enhancing Technologies Symposium (PETS)
+(2013).
+
+[14] ALSABAH, M., BAUER, K., AND GOLDBERG, I. Enhancing
+Tor’s performance using real-time trafﬁc classiﬁcation. In ACM
+Conference on Computer and Communications Security (CCS)
+(2012).
+
+[15] ALSABAH, M., BAUER, K., GOLDBERG, I., GRUNWALD, D.,
+MCCOY, D., SAVAGE, S., AND VOELKER, G. DefenestraTor:
+Throwing out windows in Tor. In Privacy Enhancing Technolo-
+gies Symposium (PETS) (2011).
+
+[16] ALSABAH, M., AND GOLDBERG, I. PCTCP: Per-circuit tcp-
+over-ipsec transport for anonymous communication overlay net-
+works. In ACM Conference on Computer and Communications
+Security (CCS) (2013).
+
+[17] BACK, A., M ¨OLLER, U., AND STIGLIC, A. Trafﬁc analysis
+attacks and trade-offs in anonymity providing systems. In Work-
+shop on Information Hiding (IH) (2001).
+
+[18] CHAABANE, A., MANILS, P., AND KAAFAR, M. Digging into
+anonymous trafﬁc: A deep analysis of the tor anonymizing net-
+work. In IEEE Conference on Network and System Security (NSS)
+(2010).
+
+[19] CHAN-TIN, E., SHIN, J., AND YU, J. Revisiting circuit clogging
+attacks on Tor. In IEEE Conference on Availability, Reliability
+and Security (ARES) (2013).
+
+[20] DINGLEDINE, R., AND MATHEWSON, N. Anonymity loves
+company: Usability and the network effect. In Workshop on the
+Economics of Information Security (WEIS) (2006).
+
+[21] DINGLEDINE, R., MATHEWSON, N., AND SYVERSON, P. Tor:
+The second-generation onion router. In USENIX Security Sympo-
+sium (USENIX) (2004).
+
+[22] DINGLEDINE, R., MATHEWSON, N., AND SYVERSON, P. De-
+ploying low-latency anonymity: Design challenges and social
+factors. IEEE Security & Privacy 5, 5 (Sept./Oct. 2007), 83–87.
+[23] DINGLEDINE, R., AND MURDOCH, S. J. Performance improve-
+ments on Tor or, why Tor is slow and what we’re going to do
+about it. Tech. Rep. 2009-11-001, The Tor Project, 2009.
+
+[24] EVANS, N. S., DINGLEDINE, R., AND GROTHOFF, C. A prac-
+tical congestion attack on Tor using long paths. In USENIX Se-
+curity Symposium (USENIX) (2009).
+
+USENIX Association  
+
+23rd USENIX Security Symposium  141
+
+[25] GEDDES, J., JANSEN, R., AND HOPPER, N. How low can you
+go: Balancing performance with anonymity in Tor. In Privacy
+Enhancing Technologies Symposium (PETS) (2013).
+
+[26] GOPAL, D., AND HENINGER, N. Torchestra: Reducing interac-
+tive trafﬁc delays over Tor. In ACM Workshop on Privacy in the
+Electronic Society (WPES) (2012).
+
+[27] HA, S., RHEE, I., AND XU, L. CUBIC: a new TCP-friendly
+high-speed TCP variant. ACM SIGOPS Operating Systems Re-
+view 42, 5 (2008), 64–74.
+
+[28] HAHN, S., AND LOESING, K. Privacy-preserving ways to esti-
+mate the number of Tor users. Tech. Rep. 2010-11-001, The Tor
+Project, 2010.
+
+[29] HOPPER, N. Protecting Tor from botnet abuse in the long term.
+
+Tech. Rep. 2013-11-001, The Tor Project, 2013.
+
+[30] HOPPER, N., VASSERMAN, E. Y., AND CHAN-TIN, E. How
+much anonymity does network latency leak?
+In ACM Confer-
+ence on Computer and Communications Security (CCS) (2007).
+Expanded and revised version in [31].
+
+[31] HOPPER, N., VASSERMAN, E. Y., AND CHAN-TIN, E. How
+much anonymity does network latency leak? ACM Transactions
+on Information and System Security (TISSEC) 13, 2 (Feb. 2010),
+13–28.
+
+[32] JAIN, R., AND ROUTHIER, S. Packet trains–measurements and
+a new model for computer network trafﬁc. IEEE Selected Areas
+in Communications 4, 6 (1986), 986–995.
+
+[33] JANSEN, R., BAUER, K., HOPPER, N., AND DINGLEDINE, R.
+Methodically modeling the Tor network. In USENIX Workshop
+on Cyber Security Experimentation and Test (CSET) (2012).
+
+[34] JANSEN, R., GEDDES, J., WACEK, C., SHERR, M., AND
+Appendices to accompany “Never been
+SYVERSON, P.
+KIST: Tor’s congestion management blossoms with kernel-
+informed socket
+Tech. Rep. 14-012, Univ.
+of Minnesota, 2014. http://www.cs.umn.edu/tech_
+reports_upload/tr2014/14-012.pdf.
+
+transport”.
+
+[35] JANSEN, R., AND HOPPER, N. Shadow: Running Tor in a box
+for accurate and efﬁcient experimentation. In USENIX Security
+Symposium (USENIX) (2012).
+
+[36] JANSEN, R., HOPPER, N., AND KIM, Y. Recruiting new Tor re-
+lays with BRAIDS. In ACM Conference on Computer and Com-
+munications Security (CCS) (2010).
+
+[37] JANSEN, R., JOHNSON, A., AND SYVERSON, P.
+
+LIRA:
+Lightweight incentivized routing for anonymity. In Network and
+Distributed System Security Symposium (NDSS) (2013).
+
+[38] JANSEN, R., SYVERSON, P., AND HOPPER, N. Throttling Tor
+bandwidth parasites. In USENIX Security Symposium (USENIX)
+(2012).
+
+[39] JOHNSON, A., WACEK, C., JANSEN, R., SHERR, M., AND
+SYVERSON, P. Users get routed: Trafﬁc correlation on tor by
+realistic adversaries. In ACM Conference on Computer and Com-
+munications Security (CCS) (2013).
+
+[40] MATHEWSON, N.
+
+Evaluating SCTP for Tor.
+//archives.seul.org/or/dev/Sep-2004/
+msg00002.html, Sept. 2004. Listserv posting.
+
+http:
+
+[41] MATHIS, M., AND MAHDAVI, J. Forward acknowledgement:
+Reﬁning TCP congestion control. ACM SIGCOMM Computer
+Communication Review 26, 4 (1996), 281–291.
+
+[42] MATHIS, M., MAHDAVI, J., FLOYD, S., AND ROMANOW, A.
+TCP Selective Acknowledgment Options. RFC 2018 (Proposed
+Standard), Oct. 1996.
+
+[43] MCCOY, D., BAUER, K., GRUNWALD, D., KOHNO, T., AND
+SICKER, D. Shining light in dark places: Understanding the Tor
+network. In Privacy Enhancing Technologies Symposium (PETS)
+(2008).
+
+[44] MITTAL, P., KHURSHID, A., JUEN, J., CAESAR, M., AND
+BORISOV, N. Stealthy trafﬁc analysis of low-latency anonymous
+communication using throughput ﬁngerprinting. In ACM Confer-
+ence on Computer and Communications Security (CCS) (2011).
+[45] MOORE, W. B., WACEK, C., AND SHERR, M. Exploring the po-
+tential beneﬁts of expanded rate limiting in Tor: Slow and steady
+wins the race with Tortoise. In Annual Computer Security Appli-
+cations Conference (ACSAC) (2011).
+
+[46] MURDOCH, S. J. Hot or not: Revealing hidden services by their
+clock skew. In ACM Conference on Computer and Communica-
+tions Security (CCS) (2006).
+
+[47] MURDOCH, S. J. Comparison of Tor datagram designs. Tech.
+
+Rep. 2011-11-001, The Tor Project, 2011.
+
+[48] MURDOCH, S. J., AND DANEZIS, G. Low-cost trafﬁc analysis
+of Tor. In IEEE Symposium on Security and Privacy (Oakland)
+(2005).
+
+[49] NOWLAN, M. F., TIWARI, N., IYENGAR, J., AMIN, S. O., AND
+FORD, B. Fitting square pegs through round pipes. In USENIX
+Symposium on Networked Systems Design and Implementation
+(NSDI) (2012).
+
+[50] NOWLAN, M. F., WOLINSKY, D., AND FORD, B. Reducing la-
+tency in Tor circuits with unordered delivery. In USENIX Work-
+shop on Free and Open Communications on the Internet (FOCI)
+(2013).
+
+[51] The ns2 Network Simulator.
+
+nsnam/ns/.
+
+http://www.isi.edu/
+
+[52] PAXSON, V., ALLMAN, M., CHU, J., AND SARGENT, M. Com-
+puting TCP’s Retransmission Timer. RFC 6298 (Proposed Stan-
+dard), June 2011.
+
+[53] RAMACHANDRAN, S. Web metrics: Size and number of re-
+sources. https://developers.google.com/speed/
+articles/web-metrics, 2010.
+
+[54] REARDON, J., AND GOLDBERG, I. Improving Tor using a TCP-
+In USENIX Security Symposium (USENIX)
+
+over-DTLS tunnel.
+(2009).
+
+[55] SHERR, M., MAO, A., MARCZAK, W. R., ZHOU, W., LOO,
+B. T., AND BLAZE, M. A3: An Extensible Platform for
+Application-Aware Anonymity. In Network and Distributed Sys-
+tem Security Symposium (NDSS) (2010).
+
+[56] SNADER, R., AND BORISOV, N. A tune-up for Tor: Improving
+In Network and
+
+security and performance in the Tor network.
+Distributed System Security Symposium (NDSS) (2008).
+
+[57] TANG, C., AND GOLDBERG, I. An improved algorithm for Tor
+circuit scheduling. In ACM Conference on Computer and Com-
+munications Security (CCS) (2010).
+
+[58] Tor network status. http://torstatus.blutmagie.de/
+
+index.php.
+
+[59] WACEK, C., TAN, H., BAUER, K., AND SHERR, M. An em-
+pirical evaluation of relay selection in Tor. In Network and Dis-
+tributed System Security Symposium (NDSS) (2013).
+
+[60] WANG, T., BAUER, K., FORERO, C., AND GOLDBERG, I.
+Congestion-aware path selection for Tor. In Financial Cryptog-
+raphy and Data Security (FC) (2012).
+
+[61] WEIGLE, E., AND FENG, W.-C. A comparison of TCP auto-
+matic tuning techniques for distributed computing. In IEEE Sym-
+posium on High Performance Distributed Computing (HPDC)
+(2002).
+
+142  23rd USENIX Security Symposium 
+
+USENIX Association
+
+

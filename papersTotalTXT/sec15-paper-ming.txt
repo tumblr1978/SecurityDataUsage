@@ -1,0 +1,2506 @@
+TaintPipe: Pipelined Symbolic Taint Analysis
+
+Jiang Ming, Dinghao Wu, Gaoyao Xiao, Jun Wang, and Peng Liu,  
+
+The Pennsylvania State University
+
+https://www.usenix.org/conference/usenixsecurity15/technical-sessions/presentation/ming
+
+This paper is included in the Proceedings of the 24th USENIX Security SymposiumAugust 12–14, 2015 • Washington, D.C.ISBN 978-1-931971-232Open access to the Proceedings of  the 24th USENIX Security Symposium is sponsored by USENIXTaintPipe: Pipelined Symbolic Taint Analysis
+
+Jiang Ming, Dinghao Wu, Gaoyao Xiao, Jun Wang, and Peng Liu
+
+College of Information Sciences and Technology
+
+The Pennsylvania State University
+
+{jum310, dwu, gzx102, jow5222, pliu}@ist.psu.edu
+
+Abstract
+Taint analysis has a wide variety of compelling applica-
+tions in security tasks, from software attack detection to
+data lifetime analysis. Static taint analysis propagates
+taint values following all possible paths with no need
+for concrete execution, but is generally less accurate than
+dynamic analysis. Unfortunately, the high performance
+penalty incurred by dynamic taint analyses makes its de-
+ployment impractical in production systems. To amelio-
+rate this performance bottleneck, recent research efforts
+aim to decouple data ﬂow tracking logic from program
+execution. We continue this line of research in this paper
+and propose pipelined symbolic taint analysis, a novel
+technique for parallelizing and pipelining taint analy-
+sis to take advantage of ubiquitous multi-core platforms.
+We have developed a prototype system called TaintPipe.
+TaintPipe performs very lightweight runtime logging to
+produce compact control ﬂow proﬁles, and spawns mul-
+tiple threads as different stages of a pipeline to carry
+out symbolic taint analysis in parallel. Our experiments
+show that TaintPipe imposes low overhead on applica-
+tion runtime performance and accelerates taint analysis
+signiﬁcantly. Compared to a state-of-the-art inlined dy-
+namic data ﬂow tracking tool, TaintPipe achieves 2.38
+times speedup for taint analysis on SPEC 2006 and 2.43
+times for a set of common utilities, respectively. In ad-
+dition, we demonstrate the strength of TaintPipe such as
+natural support of multi-tag taint analysis with several
+security applications.
+
+1
+
+Introduction
+
+Taint analysis is a kind of program analysis that tracks
+some selected data of interest (taint seeds), e.g., data
+originated from untrusted sources, propagates them
+along program execution paths according to a cus-
+tomized policy (taint propagation policy), and then
+checks the taint status at certain critical location (taint
+
+sinks).
+It has been shown to be effective in dealing
+with a wide range of security problems, including soft-
+ware attack prevention [25, 40], information ﬂow control
+[45, 34], data leak detection [49], and malware analy-
+sis [43], to name a few.
+
+Static taint analysis [1, 36, 28] (STA) is performed
+prior to execution and therefore it has no impact on run-
+time performance. STA has the advantage of consider-
+ing multiple execution paths, but at the cost of poten-
+tial imprecision. For example, STA may result in either
+under-tainting or over-tainting [32] when merging results
+at control ﬂow conﬂuence points. Dynamic taint analysis
+(DTA) [25, 13, 27], in contrast, propagates taint as a pro-
+gram executes, which is more accurate than static taint
+analysis since it only considers the actual path taken at
+run time. However, the high runtime overhead imposed
+by dynamic taint propagation has severely limited its
+adoption in production systems. The slowdown incurred
+by conventional dynamic taint analysis tools [25, 13] can
+easily go beyond 30X times. Even with the state-of-the-
+art DTA tool based on Pin [20], typically it still intro-
+duces more than 6X slowdown.
+
+The crux of the performance penalty comes from
+the strict coupling of program execution and data ﬂow
+tracking logic. The original program instructions min-
+gle with the taint tracking instructions, and usually it
+takes 6–8 extra instructions to propagate a taint tag in
+shadow memory [11].
+In addition, the frequent “con-
+text switches” between the original program execution
+and its corresponding taint propagation lead to register
+spilling and data cache pollution, which add further pres-
+sure to runtime performance. The proliferation of multi-
+core systems has inspired researchers to decouple taint
+tracking logic onto spare cores in order to improve per-
+formance [24, 31, 26, 15, 17, 9]. Previous work can
+be classiﬁed into two categories. The ﬁrst category is
+hardware-assisted approaches. For example, Speck [26]
+needs OS level support for speculative execution and
+rollback. Ruwase et al. [31] employ a customized hard-
+
+USENIX Association  
+
+24th USENIX Security Symposium  65
+
+ware for logging a program trace and delivering it to
+other idle cores for inspection. Nagarajan et al. [24] uti-
+lize a hardware ﬁrst-in ﬁrst-out buffer to speed up com-
+munication between cores. Although they can achieve an
+appealing performance, the requirement of special hard-
+ware prevents them from being adopted using commod-
+ity hardware.
+
+The second category is software-only methods that
+work with binary executables on commodity multi-core
+hardware [15, 17, 9]. These software-only solutions rely
+on dynamic binary instrumentation (DBI) to decouple
+dynamic taint analysis from program execution. The pro-
+gram execution and parallelized taint analysis have to
+be properly synchronized to transfer the runtime values
+that are necessary for taint analysis. Although these ap-
+proaches look promising, they fail to achieve expected
+performance gains due to the large amounts of commu-
+nication data and frequent synchronizations between the
+original program execution thread (or process) and its
+corresponding taint analysis thread (or process). Recent
+work ShadowReplica [17] creates a secondary shadow
+thread from primary application thread to run DTA in
+parallel. ShadowReplica conducts an ofﬂine optimiza-
+tion to generate optimized DTA logic code, which re-
+duces the amount of information that needs to be com-
+municated, and thus dramatically improves the perfor-
+mance. However, as we will show later, the performance
+improvement achieved by this “primary & secondary”
+thread model is ﬁxed and cannot be improved further
+when more cores are available. Furthermore, in many se-
+curity related tasks (e.g., binary de-obfuscation and mal-
+ware analysis), precise static analysis for the ofﬂine opti-
+mization needed by ShadowReplica may not be feasible.
+In this paper, we exploit another style of parallelism,
+namely pipelining. We propose a novel technique, called
+TaintPipe, for parallel data ﬂow tracking using pipelined
+symbolic taint analysis.
+In principle, TaintPipe falls
+within the second category of taint decoupling work clas-
+siﬁed above. Essentially, in TaintPipe, threads form mul-
+tiple pipeline stages, working in parallel. The execution
+thread of an instrumented application acts as the source
+of pipeline, which records information needed for taint
+pipelining, including the control ﬂow data and the con-
+crete execution states when the taint seeds are ﬁrst intro-
+duced. To further reduce the online logging overhead, we
+adopt a compact proﬁle format and an N-way buffering
+thread pool. The application thread continues executing
+and ﬁlling in free buffers, while multiple worker threads
+consume full buffers asynchronously. When each logged
+data buffer becomes full, an inlined call-back function
+will be invoked to initialize a taint analysis engine, which
+conducts taint analysis on a segment of straight-line code
+concurrently with other worker threads. Symbolic mem-
+ory access addresses are determined by resolving indirect
+
+control transfer targets and approximating the ranges of
+the symbolic memory indices.
+
+To overcome the challenge of propagating taint tags
+in a segment without knowing the incoming taint state,
+TaintPipe performs segmented symbolic taint analysis.
+That is, the taint analysis engine assigned to each seg-
+ment calculates taint states symbolically. When a con-
+crete taint state arrives, TaintPipe then updates the re-
+lated taint states by replacing the relevant symbolic taint
+tags with their correct values. We call this symbolic
+taint state resolution. According to the segment order,
+TaintPipe sequentially computes the ﬁnal taint state for
+every segment, communicates to the next segment, and
+performs the actual taint checks. Optimizations such as
+function summary and taint basic block cache offer en-
+hanced performance improvements. Moreover, differ-
+ent from previous DTA tools, supporting bit-level and
+multi-tag taint analysis are straightforward for TaintPipe.
+TaintPipe does not require redesign of the structure of
+shadow memory; instead, each taint tag can be naturally
+represented as a symbolic variable and propagated with
+negligible additional overhead.
+
+We have developed a prototype of TaintPipe, a
+pipelined taint analysis tool that decouples program ex-
+ecution and taint logic, and parallelizes taint analysis on
+straight-line code segments. Our implementation is built
+on top of Pin [23], for the pipelining framework, and
+BAP [5], for symbolic taint analysis. We have evalu-
+ated TaintPipe with a variety of applications such as the
+SPEC CINT2006 benchmarks, a set of common utilities,
+a list of recent real-life software vulnerabilities, malware,
+and cryptography functions. The experiments show that
+TaintPipe imposes low overhead on application runtime
+performance. Compared with a state-of-the-art inlined
+dynamic taint analysis tool, TaintPipe achieves overall
+2.38 times speedup on SPEC CINT2006, and 2.43 times
+on a set of common utility programs, respectively. The
+efﬁcacy experiments indicate that TaintPipe is effective
+in detecting a wide range of real-life software vulnera-
+bilities, analyzing malicious programs, and speeding up
+cryptography function detection with multi-tag propa-
+gation. Such experimental evidence demonstrates that
+TaintPipe has potential to be employed by various appli-
+cations in production systems. The contributions of this
+paper are summarized as follows:
+
+• We propose a novel approach, TaintPipe, to efﬁ-
+ciently decouple conventional inlined dynamic taint
+analysis by pipelining symbolic taint analysis on
+segments of straight-line code.
+
+• Unlike previous taint decoupling work, which suf-
+fers from frequent communication and synchroniza-
+tion, we demonstrate that with very lightweight run-
+time value logging, TaintPipe rivals conventional in-
+lined dynamic taint analysis in precision.
+
+66  24th USENIX Security Symposium 
+
+USENIX Association
+
+• Our approach does not require any speciﬁc hard-
+ware support or ofﬂine preprocessing, so TaintPipe
+is able to work on commodity hardware instantly.
+• TaintPipe is naturally a multi-tag taint analysis
+method. We demonstrate this capability by detect-
+ing cryptography functions in binary with little ad-
+ditional overhead.
+
+The remainder of the paper is organized as fol-
+lows. Section 2 provides background information and an
+overview of our approach. Section 3 and Section 4 de-
+scribe the details of the system design, online logging,
+and pipelined segmented symbolic taint analysis. We
+present the evaluation and application of our approach
+in Section 5. We discuss a few limitations in Section 6.
+We then present related work in Section 7 and conclude
+our paper in Section 8.
+
+2 Background
+
+In this section, we discuss the background and context
+information of the problem that TaintPipe seeks to solve.
+We start by comparing TaintPipe with the conventional
+inlined taint analysis approaches, and we then present
+the differences between the previous “primary & sec-
+ondary” taint decoupling model and the pipelined decou-
+pling style in TaintPipe.
+
+Inlined Analysis vs. TaintPipe
+
+2.1
+Figure 1 (“Inlined DTA”) illustrates a typical dynamic
+taint analysis mechanism based on dynamic binary in-
+strumentation (DBI), in which the original program code
+and taint tracking logic code are tightly coupled. Es-
+pecially, when dynamic taint analysis runs on the same
+core, they compete for the CPU cycles, registers, and
+cache space, leading to signiﬁcant performance slow-
+down.
+For example, “context switch” happens fre-
+quently between the original program instructions and
+taint tracking instructions due to the starvation of CPU
+registers. This means there will be a couple of instruc-
+tions, mostly inserted per program instruction, to save
+and restore those register values to and from memory.
+At the same time, taint tracking instructions themselves
+(e.g., shadow memory mapping) are already complicated
+enough. One taint shadow memory lookup operation
+normally needs 6–8 extra instructions [11].
+
+Our approach, analogous to the hardware pipelin-
+ing, decouples taint logic code to multiple spare cores.
+Figure 1 (“TaintPipe”) depicts TaintPipe’s framework,
+which consists of two concurrently running parts: 1) the
+instrumented application thread performing lightweight
+online logging and acting as the source of the pipeline;
+2) multiple worker threads as different stages of the
+
+pipeline to perform symbolic taint analysis. Each hor-
+izontal bar with gray color indicates a working thread.
+We start online logging when the predeﬁned taint seeds
+are introduced to the application. The collected proﬁle
+is passed to a worker thread. Each worker thread con-
+structs a straight-line code segment and then performs
+taint analysis in parallel. In principle, fully parallelizing
+dynamic taint analysis is challenging because there are
+strong serial data dependencies between the taint logic
+code and application code [31]. To address this prob-
+lem, we propose segmented symbolic taint analysis in-
+side each worker thread whenever the explicit taint in-
+formation is not available, in which the taint state is sym-
+bolically calculated. The symbolic taint state will be up-
+dated later when the concrete data arrive. In addition to
+the control ﬂow proﬁle, the explicit execution state when
+the taint seeds are introduced is recorded as well. The
+purpose is to reduce the number of fresh symbolic taint
+variables.
+
+We use a motivating example to introduce the idea
+of segmented symbolic taint analysis. Figure 2 shows
+an example for symbolic taint analysis on a straight-
+line code segment, which is a simpliﬁed code snippet of
+the libtiff buffer overﬂow vulnerability (CVE-2013-
+4231). Assume when a worker thread starts taint anal-
+ysis on this code segment (Figure 2(a)), no taint state
+for the input data (“size” and “num” in our case) is de-
+ﬁned. Instead of waiting for the explicit information, we
+treat the unknown values as taint symbols (symbol1 for
+“size” and symbol2 for “num”, respectively) and sum-
+marize the net effect of taint propagation in the segment.
+The symbolic taint states are shown in Figure 2(b). When
+the explicit taint states are available, we resolve the sym-
+bolic taint states by replacing the taint symbols with their
+real taint tags or concrete values (Figure 2(c)). After that,
+we continue to perform concrete taint analysis like con-
+ventional DTA. Note that here we show pseudo-code for
+ease of understanding, while TaintPipe works on binary
+code.
+
+Compared with inlined DTA, the application thread
+under TaintPipe is mainly instrumented with control ﬂow
+proﬁle logging code, which is quite lightweight. There-
+fore, TaintPipe results in much lower application runtime
+overhead. On the other hand, the execution of taint logic
+code is decoupled to multiple pipeline stages running in
+parallel. The accumulated effect of TaintPipe’s pipeline
+leads to a substantial speedup on taint analysis.
+
+“Primary & Secondary” Model
+
+2.2
+Some recent work [15, 17, 9] ofﬂoads taint logic code
+from the application (primary) thread to another shadow
+(secondary) thread and runs them on separate cores. At
+the same time, the primary thread communicates with
+
+USENIX Association  
+
+24th USENIX Security Symposium  67
+
+Inlined DTA
+
+TaintPipe
+
+Taint seeds  & 
+ execution state
+
+Threads
+
+Time
+
+Application speedup
+
+Taint speedup
+
+Application
+
+DBI
+
+Control flow 
+
+profiling
+
+Concrete taint 
+
+analysis
+
+Symbolic taint 
+
+analysis
+
+Resolving symbolic 
+
+taint state
+
+Figure 1: Inlined dynamic taint analysis vs. TaintPipe.
+
+Output
+
+Taint state
+
+Output
+
+Taint state
+
+size = getc(infile); 
+A = -1;
+B = size + 1;
+C = (1 << size) - 1;
+D = num & C;
+
+A 
+B 
+C 
+D 
+
+0
+
+symbol1 + 1
+
+(1 << symbol1) – 1
+
+symbol2 & ((1 << symbol1) – 1)
+
+A 
+B 
+C 
+D 
+
+0
+
+tag1 + 1
+
+(1 << tag1) – 1
+ (1 << tag1) – 1
+
+(a) Code segment
+
+(b) Symbolic taint state
+
+(c) Resolving symbolic taint state
+
+Figure 2: An example of symbolic taint analysis on a code segment: (a) code segment; (b) symbolic taint states, the
+input value size and num are labeled as symbol1 and symbol2, respectively; (c) resolving symbolic taint states when
+size is tainted as tag1 and num is a constant value (num = 0xffffffff).
+
+the secondary thread to convey the necessary informa-
+tion (e.g., the addresses of memory operations and con-
+trol transfer targets) for performing taint analysis. How-
+ever, this model suffers from frequent communication
+between the primary and secondary thread. In principle,
+every memory address that is loaded or stored has to be
+logged and transferred. Due to the frequent synchroniza-
+tion with the primary thread and the extra instructions
+to access shadow memory, taint logic execution in the
+secondary thread is typically slower than the application
+execution. As a result, the delay for each taint operation
+could be accumulated, leading to an delay proportional
+to the original execution. ShadowReplica [17] partially
+addresses this drawback by performing advanced ofﬂine
+static optimizations on the taint logic code to reduce the
+runtime overhead. However, in many security analysis
+scenarios, precise static analysis and optimizations over
+taint logic code are not feasible, e.g., reverse engineer-
+ing and malware forensics. In such cases, program static
+features such as control ﬂow graphs are possibly obfus-
+cated.
+
+In TaintPipe, we record compact control ﬂow infor-
+mation to reconstruct straight-line code, in which all the
+
+targets of direct and indirect jumps have been resolved.
+However, we do not record or transfer the addresses of
+memory operations. Our key observation is that most
+addresses of memory operations can be inferred from
+the straight-line code. For example, if a basic block is
+ended with an indirect jump instruction jmp eax, we
+can quickly know the value of eax from the straight-line
+code. In this way, all the other memory indirect access
+calculated through eax (before it is updated) can be de-
+termined. For instance, we can infer the memory load
+address for the instruction: mov ebx, [4*eax + 16].
+Even when the index of a memory lookup is a symbol,
+with the taint states and path predicates of the straight-
+line code, we can often narrow down the symbolic mem-
+ory addresses to a small range in most cases.
+
+Since TaintPipe’s data communication is lightweight,
+TaintPipe can achieve nearly constant delay given
+enough number of worker threads. The upper limit num-
+ber of worker threads is also bounded, which equals
+roughly the ratio of the taint analysis execution time over
+the application thread execution time for each segment.
+Due to TaintPipe’s pipelining design, it is possible that
+TaintPipe may detect an attack some time after the real
+
+68  24th USENIX Security Symposium 
+
+USENIX Association
+
+attack has happened. However, this trade-off does not
+prevent TaintPipe from practically supporting a broad va-
+riety of security applications, such as attack forensic in-
+vestigation and post-fact intrusion detection, which do
+not require strict runtime security enforcement.
+It is
+worth noting that different from ShadowReplica, Taint-
+Pipe does not depend on extensive static analysis to re-
+duce data communication. Therefore, TaintPipe has a
+wider range of applications in speeding up analyzing ob-
+fuscated binaries, as static analysis of obfuscated bina-
+ries is of great challenge.
+
+3 Design
+
+3.1 Architecture
+Figure 3 illustrates the architecture of TaintPipe. We
+have built the pipelining framework on top of a dynamic
+binary instrumentation tool, enabling TaintPipe to work
+with unmodiﬁed program binaries. The steps followed
+by TaintPipe for pipelining taint analysis are:
+
+1. TaintPipe takes in a binary along with the taint seeds
+as input. The instrumented application thread starts
+execution with lightweight online logging for con-
+trol ﬂow and other information (Section 4.1.1).
+
+2. Then the instrumented program is executed together
+with a multithreaded logging tool to efﬁciently de-
+liver the logged data to memory (Section 4.1.2).
+
+3. When the proﬁle buffer becomes full, a taint analy-
+sis engine will be invoked for online pipelined taint
+analysis (Section 4.2.1).
+
+4. The generated log data are then used to construct
+straight-line code, which helps to solve many pre-
+cision loss problems in static taint analysis.
+In
+this stage, we generate a segment of executed code
+blocks for each logged data buffer. The memory
+addresses that are accessed through indirect jump
+targets are also resolved (Section 4.2.2).
+
+5. The taint analysis engine will further translate
+straight-line code to taint operations, which avoid
+precision loss and support both multi-tag and bit-
+level taint analysis (Section 4.2.3).
+
+6. With the constructed taint operations, TaintPipe per-
+forms pipelined symbolic taint analysis. When a
+thread ﬁnishes taint analysis with an explicit taint
+state, it synchronizes with its following thread to re-
+solve the symbolic taint state (Section 4.2.4).
+
+3.2 Segmented Symbolic Taint Analysis
+In this section, we analyze symbolic taint analysis from
+a theoretical point of view to justify the correctness of
+our pipelining scheme. In order to formalize segmented
+symbolic taint analysis, we use the following notations:
+
+1. Let σ denote a taint state, which maps variables to
+
+their taint tags.
+
+2. Let A (σ ,S) denote a symbolic taint analysis A on
+a straight-line code segment S, with an initial taint
+state σ. We use Aσ (S) for convenience.
+
+Note that the straight-line code segment S has no con-
+trol transfer statement. Conceptually, S only contains one
+type of statements, namely assignment statements. Of
+course, from the implementation point of view, there may
+be other types of statements, but they can all be regarded
+as assignment statements. For example, as we will show
+in Section 4.2.3, our taint operations contain assignment
+operations, laundering operations, and arithmetic opera-
+tions. The latter two operations can be derived from taint
+assignment operations.
+
+Based on the semantics of assignment statements, we
+deﬁne symbolic taint analysis for an assignment state-
+ment as follows:
+
+Aσ (x := e) =σ [x (cid:31)→ et ]
+
+(1)
+where et denotes the taint tag of e, and [·] is the taint state
+update operator.
+If x is a new variable, the taint state
+σ is extended with a new mapping from x to its taint.
+If x occurs in the taint state σ, for the variables in the
+domain of σ whose symbolic taint expressions depend
+on x, their symbolic taint expressions will be updated or
+recomputed with the new taint value of x.
+
+Assume σ1 = Aσ (i1) for a statement i, then the sym-
+bolic taint analysis for two sequential statements i1;i2 is:
+
+Aσ (i1;i2) =A σ1 (i2)
+
+(2)
+
+Assume straight-line code segment S1 = (i1;S(cid:28)1). We
+can then deduce the symbolic taint analysis on two se-
+quential segments S1;S2 as follows:
+
+Aσ (S1;S2)
+
+=Aσ ((i1;S(cid:28)1);S2)
+=Aσ (i1; (S(cid:28)1;S2))
+=···
+=AAσ (S1)(S2)
+
+(3)
+
+That is, given Aσ (S1) =σ 1 and Aε (S2) =σ 2, where ε is
+an empty taint state, Eq. 3 leads to:
+
+Aσ (S1;S2) =σ 2[σ1]
+
+(4)
+
+USENIX Association  
+
+24th USENIX Security Symposium  69
+
+Instrumented 
+
+Program 
+Execution
+
+Multithreaded 
+Logging Tool
+
+Logged 
+
+Control Flow
+
+Figure 3: Architecture.
+
+Straight-line 
+
+Code 
+
+Construciton
+
+Pipelined  
+
+Symbolic Taint 
+
+Analysis
+
+Here, we misuse the taint state update operator [·] and
+apply it to a taint state map, instead of a single taint vari-
+able update. With Eq. 4, we can perform segmented taint
+analysis in parallel or in a pipeline style. For two seg-
+ments S1;S2, assume the starting taint state is σ0. We
+start two threads, one compute Aσ0(S1) and the other
+computes Aε (S2), where ε is an empty taint state. As-
+sume the result of the ﬁrst thread analysis is σ1 and the
+result of the second is σ2. The symbolic taint analysis of
+S1;S2 is σ2[σ1], that is, the right hand side of Eq. 4. Eq. 4
+forms the foundation of our segmented taint analysis in a
+pipeline style.
+
+4
+
+Implementation
+
+To demonstrate the efﬁcacy of TaintPipe, we have devel-
+oped a prototype on top of the dynamic binary instru-
+mentation framework Pin [23] (version 2.12) and the bi-
+nary analysis platform BAP [5] (version 0.8). The on-
+line logging and pipelining framework are implemented
+as Pin tools, using about 3,100 lines of C/C++ code. The
+taint operation constructors are built on BAP IL (inter-
+mediate language). TaintPipe’s taint analysis engine is
+based on BAP’s symbolic execution module, using about
+4,400 lines of Ocaml and running concurrently with Pin
+tools. We utilize Ocaml’s functor polymorphism so that
+taint states can be instantiated in either concrete or sym-
+bolic style. All of the functionality implemented in taint
+analysis engine are wrapped as function calls. To sup-
+port communication between Pin tools and taint analysis
+engine, we develop a lightweight RPC interface so that
+each worker thread can directly call Ocaml code. The
+saving and loading of the taint cache lookup table is im-
+plemented using the Ocaml Marshal API, which encodes
+IL expressions as sequences of compact bytes and then
+stores them in a disk ﬁle.
+
+Dynamic binary instrumentation tools tend to inline
+compact and branch-less code to the ﬁnal translated
+code. For the code with conditional branches, DBI emits
+a function call instead, which introduces additional over-
+head. Therefore, we carefully design our instrumenta-
+tion code to favor DBI’s code inlining. To fully reduce
+online logging overhead, we also utilize Pin-speciﬁc
+optimizations. We leverage Pin’s fast buffering APIs
+for efﬁcient data buffering. For example, the inlined
+INS InsertFillBuffer() writes the control ﬂow pro-
+
+ﬁle directly to the given buffer; the callback function
+registered in PIN DefineTraceBuffer() processes the
+buffer when it becomes full or thread exits. Besides,
+we force Pin to use the fastcall x86 calling convention
+to avoid emitting stack-based parameter loading instruc-
+tions (i.e., push and pop). Currently Pin-tools do not sup-
+port the Pthreads library. Thus we employ Pin Thread
+API to spawn multiple worker threads. We also im-
+plement a counting semaphore based on Pin’s locking
+primitives to assist thread synchronization. Addition-
+ally, TaintPipe can be extended to support multithreaded
+applications with no difﬁculty by assigning one taint
+pipeline for each application thread.
+
+4.1 Logging
+TaintPipe’s pipeline stages consist of multiple threads.
+The thread of instrumented application (producer) serves
+as the source of pipeline, and a number of Pin inter-
+nal threads act as worker threads to perform symbolic
+taint analysis on the data collected from the applica-
+tion thread. Note that unlike application threads, worker
+threads are not JITed and therefore execute natively. One
+of the major drawbacks of previous dynamic taint anal-
+ysis decoupling approaches is the large amount of in-
+formation collected in the application thread and the
+high overhead of communication between the applica-
+tion thread and analysis thread. To address these chal-
+lenges, TaintPipe performs lightweight online logging to
+record information required for pipelined taint analysis.
+The logged data comprise control ﬂow proﬁle and the
+concrete execution state when taint seeds are ﬁrst intro-
+duced, which is the starting point of our pipelined taint
+analysis. The initial execution state, consisting of con-
+crete context of registers and memory, (e.g., CR0∼CR4,
+EFLAGS and addresses of initial taint seeds), is used to
+reduce the number of fresh symbolic taint variables.
+
+We take major two steps to reduce the application
+thread slowdown: First, we adopt a compact proﬁle
+structure so that the proﬁle buffer contains logged data
+as much as possible, and it is quite simple to recover
+the entry address of each basic block as well. Second,
+we apply the “one producer, multiple consumers” model
+and N-way buffering scheme to process full buffers asyn-
+chronously, which allows application to continue execu-
+tion while pipelined taint analysis works in parallel. We
+will discuss each step in the following sub-sections.
+
+70  24th USENIX Security Symposium 
+
+USENIX Association
+
+4.1.1 Lightweight Online Logging
+
+Besides the initial execution state when the taint seeds
+are introduced, TaintPipe collects control ﬂow informa-
+tion, which is represented as a sequence of basic blocks
+executed. Conceptually, we can use a single bit to record
+the direction of conditional jump [29], which leads to
+a much more compact proﬁle. However, reconstruction
+straight-line code from 1 bit proﬁle is more complicated
+to make it ﬁt for ofﬂine analysis. Zhao et al. [47] pro-
+posed Detailed Execution Proﬁle (DEP), a 2-byte proﬁle
+structure to represent 4-byte basic block address on x86-
+32 machine.
+In DEP, a 4-byte address is divided into
+two parts: H-tag for the 2 high bytes and L-tag for 2
+low bytes. If two successive basic blocks have the same
+H-tag, only L-tag of each basic block enters the proﬁle
+buffer; otherwise a special tag 0x0000 followed by the
+new H-tag will be logged into the buffer.
+
+We extend DEP’s scheme to support REP-preﬁx in-
+structions. A number of x86 instructions related to string
+operations (e.g., MOVS, LODS) with REP-preﬁx are exe-
+cuted repeatedly until the counter register (ecx) counts
+down to 0. Dynamic binary instrumentation tools [23, 4]
+normally treat a REP-preﬁxed instruction as an implicit
+loop and generate a single instruction basic block in each
+iteration. In our evaluation, there are several cases that
+unrolling such REP-preﬁx instructions would be a perfor-
+mance bottleneck. We address this problem by adding
+additional escape tags to represent such implicit loops.
+Figure 4 presents an example of the control ﬂow proﬁle
+we adopted. The left part shows a segment of straight-
+line code containing 1028 basic blocks, and 1024 out
+of them are due to REP-preﬁxed instruction repetitions.
+Our proﬁle (the right side of Figure 4) encodes such case
+with two consecutive escape tags (0xffff), followed by
+the number of iterations (0x0400).
+
+We note that it is usually unnecessary to turn on the
+logging all the time. For example, when application
+starts executing, many functions are only used during
+loading. At that time, no sensitive taint seed is intro-
+duced. Therefore we perform on-demand logging to
+record control ﬂow proﬁle when necessary. As applica-
+tion starts running, we only instrument limited functions
+to inspect the various input channels that taint could be
+introduced into the application (taint seeds). Such taint
+seeds include standard input, ﬁles and network I/O. Be-
+sides, users can customize other values as taint seeds,
+such as function return values or parameters. When the
+pre-deﬁned taint seeds are triggered, we turn on the con-
+trol ﬂow proﬁle logging. At the same time, we save the
+current execution state to be used in the pipelined taint
+analysis. Many well-known library functions have ex-
+plicit semantics, which facilitates us to selectively turn
+off logging inside these functions and propagate taint
+
+0x804fff0
+
+BB_1
+
+0x804fffa
+
+BB_2
+
+0x8050004
+
+BB_3
+
+0x8050016
+
+BB_4
+
+rep movsd 
+0x8050028
+rep movsd 
+
+... 
+
+rep movsd 
+0x8050030
+
+BB_1028
+
+4-byte tag 
+
+profile
+
+0xfff0
+0xfffa
+0x0000
+0x0805
+0x0004
+0x0016
+0xffff
+0xffff
+0x0400
+0x0030
+
+2-byte tag 
+
+profile
+
+Repetition 
+Count: 1024
+
+Figure 4: An example of 2-byte tag proﬁle.
+
+correspondingly at function level. We will discuss this
+issue further in Section 4.2.3.
+
+4.1.2 N-way Buffering Scheme
+
+Since TaintPipe’s online logging is lightweight, appli-
+cation (producer) thread’s execution speed is typically
+faster than the processing speed of worker threads.
+To mitigate this bottleneck, we employed “one pro-
+ducer, multiple consumers” model and N-way buffering
+scheme [46]. At the center of our design is a thread pool,
+which is subdivided into n linked buffers, and the pro-
+ducer thread and multiple worker threads work on differ-
+ent buffers simultaneously. More speciﬁcally, when the
+instrumented application thread starts running, we ﬁrst
+allocate n linked empty buffers (n > 1). At the same time,
+n Pin internal threads (worker threads) are spawned.
+Each worker thread is bound to one buffer and communi-
+cates with the application thread via semaphores. When
+a buffer becomes full, the application thread will release
+the full buffer to its corresponding worker thread and
+then continue to ﬁll in the next available empty buffer.
+Given a full proﬁle buffers, a worker thread will send it to
+a taint analysis engine to perform concrete/symbolic taint
+analysis in parallel. After that, the worker thread will re-
+lease the proﬁle buffer back to the application thread and
+wait for processing the next full buffer.
+
+It is apparent that the availability of unused worker
+
+USENIX Association  
+
+24th USENIX Security Symposium  71
+
+threads and the size of proﬁle buffer will affect over-
+all performance of TaintPipe (both application execution
+time and pipelined taint analysis) signiﬁcantly. In Sec-
+tion 5.1, we will conduct a series of experiments to ﬁnd
+the optimal values for these two factors.
+
+4.2 Symbolic Taint Analysis
+4.2.1 Taint Analysis Engine
+When the application thread releases a full proﬁle buffer,
+a worker thread is waked up to capture the proﬁle buffer
+and then communicates with a taint analysis engine for
+pipelined taint analysis. The taint analysis engine will
+ﬁrst convert the control ﬂow proﬁle to a segment of
+straight-line intermediate language (IL) code and then
+translates the IL code to even simpler taint logic oper-
+ations. The translations are cached for efﬁciency at taint
+basic block level. The key components of taint analysis
+engine are illustrated in Figure 5.
+
+The core of TaintPipe’s taint analysis engine is an ab-
+stract taint analysis processor, which simulates a segment
+of taint operations and updates the taint states accord-
+ingly. The taint state structure contains two contexts: vir-
+tual registers keeping track of symbolic taint tags for reg-
+ister, and taint symbolic memory for symbolic taint tags
+in memory. The taint symbolic memory design is like the
+two-level page table structure and each page of memory
+consists of symbolic taint formulas rather than concrete
+values. After the initialization of the symbolic taint in-
+puts, the engines perform taint analysis either concretely
+or symbolically in a pipeline style.
+
+4.2.2 Straight-line Code Construction
+Given the control ﬂow proﬁles, recovering each basic
+block’s H-tag and L-tag is quite straightforward. A basic
+block’s entry address is the concatenation of its corre-
+sponding H-tag and L-tag [47]. The taint analysis engine
+should only execute the instructions required for taint
+propagation. Otherwise, the work thread may run much
+slower than the application thread. On the other side, due
+to the cumbersome x86 ISA, precisely propagating taint
+for the complex x86 instructions is an arduous work, es-
+pecially for some instructions with side effect of condi-
+tional taint (e.g., CMOV). To achieve these two goals, we
+ﬁrst extract the x86 instructions sequence from the ap-
+plication binary and then lift them to BIL [5], a RISC-
+like intermediate language. Since we know exactly the
+execution sequence, the sequence is a straight-line code.
+We have removed all the direct and indirect control trans-
+fer instructions and substituted them with control transfer
+target assertion statements.
+
+After resolving an indirect control transfer, we go one
+step further to determine all the memory operation ad-
+
+Figure 6: A path predicate constrains symbolic memory
+access within the boundary of 7 < i < 10.
+
+dresses which depend on this indirect control transfer tar-
+get. For example, after we know the target of jmp eax,
+we continue to trace the use-def chain of eax for each
+memory load or store operation whose address is calcu-
+lated through this eax. With the initial execution state
+(containing addresses of taint seeds) and indirect control
+transfer target resolving, we are able to decide most of
+the memory operation addresses.
+
+For some applications such as word processing, a sym-
+bolic taint input may be used as a memory lookup index.
+Without any constraint, a symbolic memory index could
+point to any memory cell. Inspired by the index-based
+memory model proposed by Cha et al. [8], we attempt to
+narrow down the symbolic memory accesses to a small
+range with symbolic taint states and path predicates. We
+ﬁrst leverage value set analysis [2] to limit the range of
+a symbolic memory access and then reﬁne the range by
+querying a constraint solver. The path predicate along
+the straight-line code usually limits the scope of sym-
+bolic memory access. Figure 6 shows such an example
+where the path predicate restricts the symbolic memory
+index i within a range such that 7 < i < 10. When propa-
+gating a taint tag to the memory cell referenced by i, we
+conservatively taint all the possible memory slots, that
+is, A[8] and A[9] in Figure 6 will be tainted as tag1. In
+Section 5.3, we will demonstrate that our symbolic mem-
+ory index solution only introduces marginal side effects.
+
+4.2.3 Taint Operation Generation
+
+Based on BIL statements, we construct taint operations.
+Taint operations inside a basic block are formed as “taint
+basic block” [37], which are cached for efﬁciency. To
+make the best of cache effect, we merge the basic blocks
+with only one predecessor and one successor. Since BIL
+explicitly reveals the side effect of intricate x86 instruc-
+tions, it is easy to perform intra-block optimizations to
+get rid of redundant taint operations. Therefore, our taint
+
+72  24th USENIX Security Symposium 
+
+USENIX Association
+
+Worker threads
+
+Taint seeds + 
+abstract state
+
+Abstract taint 
+
+analysis processor 
+
+Control flow
+
+profile
+
+ Taint 
+
+operations 
+constructor
+
+Taint basic 
+block cache
+
+Taint state
+
+ Virtual registers
+Taint symbolic 
+
+memory
+
+Taint analysis engine
+
+Figure 5: The structure of taint analysis engine.
+
+operations are simple and accurate. Currently our taint
+operations mainly consist of three types of operations for
+tracking taint data:
+
+1. Assignment operations: The operations in this cate-
+gory are involved in copying values between reg-
+isters and registers/memory. We simply assign
+the taint tag of source operand to the destination
+operand.
+
+2. Laundering operations: The operations are used to
+clean the taint tag of the destination operand. For
+example, xor eax,eax will clean the taint result of
+eax. We identify all laundering operations in taint
+basic blocks and substitute them with assignment
+operations.
+
+3. Arithmetic and logic operations: This category of
+operations are the most difﬁcult to handle. We emu-
+late arithmetic and logic operations on the taint tags
+to capture their real semantics.
+
+Figure 7 presents an example of taint operations for a
+basic block. TaintPipe’s symbolic taint operations out-
+perform conventional DTA approaches in three ways.
+First and foremost, multi-tag taint analysis is straight-
+forward for TaintPipe. Each symbolic variable can nat-
+urally represent a taint tag (see Line 1 and Line 2 in
+Figure 7). Second, previous DTA tools mostly adopted
+a “short circuiting” method to handle arithmetic opera-
+tions, that is, the destination is tainted if at least one of
+the source operands is tainted regardless of the real se-
+mantics. However, in many scenarios, it will lead to
+precision loss. Check the code at Line 4 and 5 in Fig-
+ure 7, value d will always be zero since b is the nega-
+tion of a. Unfortunately, some previous work may la-
+bel d as tainted incorrectly [41]. Third, different from
+related work [20, 17], TaintPipe supports bit-level taint
+for EFLAGS register, representing whether a bit of the
+EFLAGS is tainted or not due to side effects. Recent
+work has demonstrated the value of bit-level taint in bi-
+nary code de-obfuscation [42].
+
+int a, b, c, d;
+1: a = read ();
+2: c = read ();
+3: c = c xor c;
+4: b = ~ a;
+5: d = a & b;
+
+1: Taint (a) = tag1;
+2: Taint (c) = tag2;
+3: Taint (c) = 0;
+4: Taint (b) = ~ tag1;
+5: Taint (d) = 0;
+
+(a) a basic block
+
+(b) a taint basic block
+
+Figure 7: Example: taint operations.
+
+Category
+No tainting
+
+Table 1: Function summary.
+
+Function
+
+strcmp, strncmp, memcmp, strlen, strchr,
+
+strstr, strpbrk, strcspn, qsort, rand,
+
+time, clock, ctime
+
+Function level
+
+strcat, strncat, strcpy, strncpy, memcpy,
+
+memmove, strtok, atoi, itoa, abs
+
+tolower, toupper
+
+Another major optimization we adopt is so called
+“function summary”. As many well-known library func-
+tions have explicit semantics (e.g., atoi, strlen), we gener-
+ate a summary of each function and propagate taint cor-
+respondingly at function level. Table 1 lists two types
+of function summary TaintPipe supports: 1) Functions
+within “no tainting” category do not have any side effect
+on taint state. We can safely turn off logging when exe-
+cuting them. 2) Some functions do propagate taint from
+an input parameter to output. We still turn off logging
+and update taint state correspondingly when these func-
+tions return.
+
+4.2.4 Symbolic Taint State Resolution
+In TaintPipe’s pipeline framework, a worker thread may
+perform taint analysis concretely or symbolically in par-
+allel. When a worker thread completes taint analysis with
+concrete taint tags, the ﬁnal taint state it maintains is de-
+terministic. Then it synchronizes with the subsequent
+worker thread to resolve the symbolic taint state main-
+
+USENIX Association  
+
+24th USENIX Security Symposium  73
+
+tained by the latter. Taint states are allocated in a shared
+memory area so that multiple threads can access them
+easily. Basically, given the concrete taint state at the be-
+ginning of a code segment, we replace a symbolic taint
+tag with the appropriate starting value (either a taint tag
+or a concrete value). We further update all the symbolic
+formula containing that symbolic taint tag. For example,
+the logic AND formula in Figure 2(b) will be simpliﬁed
+to a single taint tag. After that, the subsequent thread
+switches to the concrete taint analysis and continue pro-
+cessing the left segment code.
+
+In this order, the taint states of each segment will be
+resolved and updated one by one. The deﬁned taint pol-
+icy (e.g., a function return value should not be tainted)
+is checked along the concrete taint analysis as well. A
+tainted sink is identiﬁed if it contains a symbolic for-
+mula; multiple tags are determined by counting the num-
+ber of different symbols in the formula. Note that a pre-
+vious hardware-assisted approach [31] utilized a separate
+“master” processor to update each segment’s taint status
+sequentially. However, as pointed out by the paper, when
+there are more than a few “worker” processors, the mas-
+ter processor will become the bottleneck. Our approach
+amortizes the workload of the master processor to each
+worker thread.
+
+5 Experimental Evaluation
+
+We conducted experiments with several goals in mind.
+First, we wanted to choose optimal values for two factors
+that may affect TaintPipe’s performance, namely control
+ﬂow proﬁle buffer size and the number of worker threads.
+Then we studied overall runtime overhead when running
+TaintPipe on the SPEC2006 int benchmarks and a num-
+ber of common utilities. We also compared TaintPipe
+with a highly optimized inline dynamic taint analysis
+tool. At the same time, we wanted to make sure TaintPipe
+is effective in speeding up various security analysis tasks
+and can compete with conventional inlined dynamic taint
+analysis in precision. To this end, we demonstrated three
+compelling applications: 1) detecting software attacks;
+2) tracking information ﬂow in obfuscated malicious pro-
+grams; and 3) identifying cryptography functions with
+multi-tag propagation.
+
+5.1 Experiment Setup
+Our experiment platform contains two Intel Xeon E5-
+2690 processors, 128GB of memory and a 250GB solid
+state drive, running Ubuntu12.04. Each processor is
+equipped with 8 2.9GHz cores, 16 hyper threads and
+20MB L3 cache. The performance data reported in this
+section are all mean values with 5 repetitions.
+
+40
+36
+32
+28
+24
+20
+16
+12
+8
+4
+
+)
+e
+m
+
+i
+
+t
+
+n
+u
+r
+ 
+
+d
+e
+z
+
+i
+
+l
+
+a
+m
+
+r
+o
+n
+(
+ 
+
+w
+o
+d
+w
+o
+
+l
+
+S
+
+2
+
+4
+
+6
+
+#
+ 
+
+W
+
+o
+r
+k
+
+8
+10
+
+12
+
+14
+
+e
+
+r t
+
+h
+r
+e
+
+16
+
+18
+
+a
+
+d
+
+s
+
+64
+
+32
+e   ( M B )
+
+20
+
+8
+
+16
+o fil e   b
+
+u ff e
+
+r   s i z
+
+  P r
+
+Figure 8: Optimal buffer size and number of worker
+threads.
+
+TaintPipe’s performance is affected by the size of the
+proﬁle buffers and the number of worker threads. Gener-
+ally, the more worker threads and larger proﬁle buffers,
+the less possibility that an application is suspended to
+wait for a free buffer. On the other hand, our taint anal-
+ysis engine has to take longer time to process larger
+segment code. We conducted a series of tests with the
+SPEC CPU2006 int benchmarks, under different settings
+of these two variables. We dynamically adjust the num-
+ber of worker threads from 2 to 20 (2, 4, 6, 8, 12, 16 and
+20), and proﬁle size from 8MB to 64MB (8MB, 16MB,
+32MB and 64MB). Figure 8 displays the experimental
+results. Roughly, as number of worker threads and buffer
+size increase, the application slowdown reduces. That
+is mainly because large buffer sizes allow application
+thread continue to ﬁll up and worker threads spend less
+time on synchronization. After a certain point (buffer
+size ≥ 32MB and number of worker threads > 16), over-
+head increases slightly. Two factors prevent TaintPipe
+from achieving more speedup. First, taint analysis en-
+gine slows down when processing large code segment.
+Second, more worker threads introduce larger communi-
+cation latency when resolving symbolic taint states. Ac-
+cording to the results, we set the two factors as their op-
+timal values (32MB buffer size and 16 worker threads),
+which will be used in the following experiments.
+
+5.2 Performance
+To evaluate the performance gains achieved by pipelin-
+ing taint logic, we compared TaintPipe with a state-of-
+the-art tool, libdft [20], which performs inlined dynamic
+taint analysis based on Pin (“libdft” bar). In addition, we
+developed a simple tool to measure the slowdown im-
+
+74  24th USENIX Security Symposium 
+
+USENIX Association
+
+ 
+
+ nullpin
+ libdft
+ TaintPipe - application 
+ TaintPipe - overall
+
+20
+19
+18
+17
+16
+15
+14
+13
+12
+11
+10
+9
+8
+7
+6
+5
+4
+3
+2
+1
+0
+
+)
+e
+m
+
+i
+t
+
+n
+u
+r
+ 
+d
+e
+z
+
+i
+l
+
+a
+m
+r
+o
+n
+(
+ 
+
+n
+w
+o
+d
+w
+o
+S
+
+l
+
+14
+13
+12
+11
+10
+9
+8
+7
+6
+5
+4
+3
+2
+1
+0
+
+)
+e
+m
+
+i
+t
+
+n
+u
+r
+ 
+
+d
+e
+z
+
+i
+l
+
+a
+m
+r
+o
+n
+(
+ 
+
+n
+w
+o
+d
+w
+o
+S
+
+l
+
+ 
+
+ 
+
+ nullpin
+ libdft
+ TaintPipe - application
+ TaintPipe - overall
+
+ 
+
+ bzip2
+compress
+
+  gzip
+   
+ 
+compress
+
+  tar
+archive
+
+  bzip2
+decompress
+
+  gzip
+decompress
+
+ tar
+untar
+
+ scp
+1Gbps
+
+ average
+
+p
+
+erlb
+
+b
+zip
+2
+
+g
+
+c
+
+c
+
+m
+
+cf
+
+e
+
+n
+
+c
+
+h
+
+g
+
+o
+
+b
+
+h
+
+m
+
+m
+
+k
+
+lib
+
+sje
+er
+
+n
+
+g
+
+m
+
+q
+
+u
+
+a
+
+h
+
+2
+
+6
+
+o
+
+m
+
+4ref
+
+n
+
+etp
+
+p
+
+ntu
+
+m
+
+a
+
+x
+ala
+
+star
+
+a
+
+v
+era
+
+n
+
+c
+
+b
+
+g
+
+e
+
+m
+
+m
+
+k
+
+Figure 9: Slowdown on SPEC CPU2006.
+
+Figure 10: Slowdown on common Linux utilities.
+
+posed exclusively by TaintPipe. It runs a program under
+Pin without any form of analysis (“nullpin” bar). The
+“TaintPipe - application” bar represents the running time
+of instrumented application thread alone, and “TaintPipe
+- overall” corresponds to the overall overhead when both
+the application thread and pipelined worker threads are
+running. The major reason we reported “TaintPipe -
+application” and “TaintPipe - overall” time separately
+is to show the two improvements, namely “Application
+speedup” and “Taint speedup” (see Figure 1). Since the
+application thread typically runs faster than the worker
+threads, the “TaintPipe - overall” time is actually dom-
+inated by the worker threads. Therefore, usually the
+“TaintPipe - overall” time represents the relative time
+spent by worker threads as well. The times reported in
+this section are all normalized to native execution, that
+is, application running time without dynamic binary in-
+strumentation.
+
+SPEC CPU2006. Figure 9 shows the normalized ex-
+ecution times when running the SPEC CPU2006 int
+benchmark suite under TaintPipe. On average, the in-
+strumented application thread enforces a 2.60X slow-
+down to native execution, while the overall slowdown of
+TaintPipe is 4.14X. If we take Pin’s environment run-
+time overhead (“nullpin” bar) as the baseline, we can see
+TaintPipe imposes 2.67X slowdown (“TaintPipe - over-
+all” / “nullpin”) and libdft introduces 6.4X slowdown—
+this number is coincident to the observation that prop-
+agating a taint tag normally requires extra 6–8 instruc-
+tions [30, 11].
+In summary, TaintPipe outperforms in-
+lined dynamic taint analysis drastically: 2.38X faster
+than the inlined dynamic taint analysis, and 3.79X faster
+in terms of application execution.
+In the best case
+
+(h264ref ), the application speedup under TaintPipe ex-
+ceeds 4.18X.
+
+Utilities. We also evaluated TaintPipe on four common
+Linux utilities, which were not chosen randomly. These
+four utilities represent three kinds of workloads:
+I/O
+bounded (tar), CPU bounded (bzip2 and gzip), and
+the case in-between (scp). We applied tar to archive
+and extract the GNU Core utilities package (version
+8.13) (∼50MB), then we employed bzip2 and gzip to
+compress and decompress the archive ﬁle. Finally we
+utilized scp to copy the archive ﬁle over a 1Gbps link.
+As shown in Figure 10, TaintPipe reduced slowdown of
+dynamic taint analysis from 7.88X to 3.24X, by a factor
+of 2.43 on average.
+
+Effects of Optimizations.
+In this experiment, we
+quantify the effects of taint logic optimizations we pre-
+sented in Section 4.2, which are paramount for optimized
+TaintPipe performance. Figure 11 shows the impact of
+these optimizations when applied cumulatively on SPEC
+CPU2006 and the set of common utilities. The “un-
+opt” bar approximates an un-optimized TaintPipe, which
+does not adopt any optimization method. The “O1” bar
+indicates the optimization of function summary, reduc-
+ing application slowdown notably by 26.6% for SPEC
+CPU2006 and 25.0% for the common utilities. The “O2”
+bar captures the effect of taint basic block cache, leading
+to a further reduction by 19.0% and 22.9% for SPEC and
+utilities, respectively. Intra-block optimizations, denoted
+by “O3”, offer further improvement, 12.0% with SPEC
+and 11.6% with the utilities).
+
+USENIX Association  
+
+24th USENIX Security Symposium  75
+
+Program
+
+Vulnerability
+
+CVE ID
+
+Nginx
+
+Validation Bypass CVE-2013-4547
+Micro httpd Validation Bypass CVE-2014-4927
+Tiny Server Validation Bypass CVE-2012-1783
+Validation Bypass CVE-2010-4052
+Regcomp
+Denial Of Service CVE-2014-0333
+Libpng
+Integer Underﬂow CVE-2010-0001
+Gzip
+Grep
+Integer Overﬂows CVE-2012-5667
+CVE-2013-0221
+Buffer Overﬂow
+CVE-2013-4231
+Buffer Overﬂow
+Buffer Overﬂow
+CVE-2012-6303
+CVE-2009-4496
+Information Leak
+Information Leak
+CVE-2009-4491
+
+Coreutils
+Libtiff
+
+Boa
+Thttpd
+
+WaveSurfer
+
+Table 2: Tested software vulnerabilities.
+
+# Taint Bytes
+
+libdft Temu TaintPipe
+45
+80
+125
+1,180
+72
+96
+653
+256
+290
+406
+164
+328
+
+45
+85
+126
+1,148
+72
+112
+682
+260
+286
+418
+164
+328
+
+45
+80
+125
+1,124
+72
+94
+608
+252
+268
+384
+164
+328
+
+9
+
+8
+
+7
+
+6
+
+5
+
+4
+
+3
+
+2
+
+1
+
+0
+
+)
+e
+m
+
+i
+t
+
+n
+u
+r
+ 
+
+d
+e
+z
+
+i
+l
+
+a
+m
+r
+o
+n
+(
+ 
+n
+w
+o
+d
+w
+o
+S
+
+l
+
+ 
+
+ 
+
+SPEC CPU2006
+
+ Unopt
+ O1
+ O2
+ O3
+
+ 
+
+Table 3: Malware samples and taint graphs.
+
+Sample
+
+Svat
+RST
+Agent
+KeyLogger
+Subsevux
+Tsunami
+Keitan
+Fireback
+
+Type
+
+Virus
+Virus
+Rootkit
+Trojan
+
+Backdoor
+Backdoor
+Backdoor
+Backdoor
+
+Taint Graph
+
+Node # Edge #
+62
+82
+402
+368
+764
+534
+482
+620
+
+90
+154
+624
+554
+1648
+734
+618
+1038
+
+Control Flow
+Obfuscation
+
+(cid:31)
+(cid:31)
+(cid:31)
+(cid:31)
+(cid:31)
+(cid:31)
+
+ Common utilities
+
+Figure 11: The impact of optimizations to speed up
+TaintPipe when applied cumulatively: O1 (function sum-
+mary), O2 (O1 + taint basic block cache), O3 (O2 + intra-
+block optimizations).
+
+5.3 Security Applications
+
+Software Attack Detection. One important applica-
+tion of taint analysis is to deﬁne taint policies, and en-
+sure they are not violated during taint propagation. We
+tested TaintPipe with 12 recent software exploits listed
+in Table 2, which covers a wide range of real-life soft-
+ware vulnerabilities. For example, the vulnerabilities in
+nginx, micro httpd, and tiny server allow remote
+attackers to bypass input validation and crash the pro-
+gram. The libtiff buffer overﬂow vulnerability leads
+to an out of bounds loop limit via a malformed gif image.
+Both boa and thttpd write data to a log ﬁle without san-
+itizing non-printable characters, which may be exploited
+to execute arbitrary commands. Since we have detailed
+
+vulnerability reports, we can easily mark the locations of
+taint sinks in the straight-line code and set corresponding
+taint policies.
+
+In our evaluation, TaintPipe did not generate any false
+positives and successfully identiﬁed taint policy viola-
+tions while incurring only small overhead. At the same
+time, we evaluated the accuracy of TaintPipe. To this
+end, we counted the total number of tainted bytes in the
+taint state when taint analysis hit the taint sinks. Col-
+umn 4 ∼ 6 of Table 2 show the number of taint bytes
+when running libdft, Temu [44] and TaintPipe, respec-
+tively. Compared with the inlined dynamic taint anal-
+ysis tools (libdft and Temu), TaintPipe’s symbolic taint
+analysis achieves almost the same results in 8 cases and
+introduces only a few additional taint bytes in the other
+4 cases. We attribute this to our conservative approach
+to handling of symbolic memory indices. The evalu-
+ation data show that TaintPipe does not result in over-
+tainting [32] and rivals the inlined dynamic taint analysis
+at the same level of precision.
+
+76  24th USENIX Security Symposium 
+
+USENIX Association
+
+Table 4: Cryptographic function detection time.
+
+TEA
+
+MD5
+SHA-1
+
+Algorithm TaintPipe (s)
+3.8 (<1.1X)
+12.3 (1.2X)
+4.5 (<1.1X)
+7.4 (<1.1X)
+8.8 (1.1X)
+
+AES-CBC
+Blowﬁsh
+
+Temu (s)
+15.2 (2.2X)
+125.6 (3.8X)
+21.4 (2.5X)
+35.1 (2.6X)
+40.2 (3.3X)
+
+Generating Taint Graphs for Malware. We ran 8
+malware samples collected from VX Heavens1 with
+TaintPipe.2 Similar to Panorama [43], we tracked infor-
+mation ﬂow and generated a taint graph for each sam-
+ple. In a taint graph, nodes represent taint seeds or in-
+structions operating on taint data, and a directed edge
+indicates an explicit data ﬂow dependency between two
+nodes. Taint graph faithfully describes intrinsic mali-
+cious intents, which can be used as malware speciﬁcation
+to detect suspicious samples [12]. The statistics of our
+testing results are presented in Table 3. It is worth noting
+that 6 out of 8 malware samples are applied with vari-
+ous control ﬂow obfuscation methods (the ﬁfth column),
+such as opaque predicates, control ﬂow ﬂattening, obfus-
+cated control transfer targets, and call stack tampering.
+As a result, the control ﬂow graphs are heavily cluttered.
+For example, malware samples Keitan and Fireback
+have a relatively high ratio of indirect jumps (e.g., jmp
+eax). Typically it is hard to precisely infer the destina-
+tion of an indirect jump statically. Thus, the taint logic
+optimization methods that rely on accurate control ﬂow
+graph [17, 18] will fail. In contrast, our approach does
+not rely on control ﬂow graph and therefore we analyzed
+these obfuscated malware samples smoothly.
+
+Cryptography Function Detection. Malware authors
+often use cryptography algorithms to encrypt malicious
+code, sensitive data, and communication. Detecting
+cryptography functions facilitates malware analysis and
+forensics. Recent work explored the avalanche effect
+to quickly identify possible cryptography functions by
+observing the input-output dependency with multi-tag
+taint analysis. That is, each byte in the encrypted mes-
+sage is dependent on almost all bytes of input data or
+key [7, 21, 48]. However, multi-tag dynamic taint anal-
+ysis normally has to sacriﬁce more shadow memory and
+imposes much higher runtime overhead than single-tag
+dynamic taint analysis. Recall that multi-tag propagation
+is handled transparently in TaintPipe. In this experiment,
+we applied TaintPipe to detect such avalanche effects in
+binary code. We utilized the test case suite of Crypto++
+
+1http://vxheaven.org
+2All these 8 samples are not packed. To analyze packed binaries, we
+can start TaintPipe when the unpacking procedure arrives at the original
+entry point.
+
+library3 and tested 5 cryptography algorithms. Each byte
+of the plain messages was labeled as a different taint tag.
+We compared TaintPipe with Temu [44], which supports
+multiple byte-to-byte taint propagation as well.4 The de-
+tection time is shown in Table 4. We also reported the ra-
+tio of multi-tag’s running time to single-tag’s. The results
+show that TaintPipe is able to detect cryptographic func-
+tions with little additional overhead (less than 1.1X on
+average), while Temu’s multi-tag propagation imposes a
+signiﬁcant slowdown (2.9X to single-tag propagation on
+average).
+
+6 Discussions and Limitations
+
+Since TaintPipe’s pipelining design leads to an asyn-
+chronous taint check, TaintPipe may detect a violation
+of taint policy after the real attack happens. One possible
+solution is to provide synchronous policy enforcement at
+critical points (e.g., indirect jump and system call sites).
+In that case, we can explicitly suspend the application
+thread, and wait for the worker threads to complete. Our
+current design spawns worker threads in the same pro-
+cess of running both Pin and the application. In the fu-
+ture, we plan to replace the worker threads with different
+processes to increase isolation.
+
+As TaintPipe may perform symbolic taint analysis
+when explicit taint states are not available, TaintPipe ex-
+hibits similar limitations as symbolic execution of bi-
+naries. Recent work MAYHEM [8] proposes an ad-
+vanced index-based memory model to deal with sym-
+bolic memory index. We plan to extend our symbolic
+memory index handling in the future. TaintPipe recovers
+the straight-line code by logging basic block entry ad-
+dress. However, with malicious self-modifying code, the
+entry address may not uniquely identify a code block. To
+address this issue, we can augment TaintPipe by logging
+the real executed instructions at the expense of runtime
+performance overhead.
+
+Our focus is to demonstrate the feasibility of pipelined
+symbolic taint analysis. We have not fully optimized
+the symbolic taint analysis part which we believe can
+be greatly improved in terms of performance based on
+our current prototype. As our taint analysis engine simu-
+lates the semantics of taint operations, the speed of taint
+analysis is slow. One future direction is to execute con-
+crete taint analysis natively like micro execution [16] and
+switch to the interpretation-style when performing sym-
+bolic taint analysis. Currently TaintPipe requires large
+share memory to reduce communication overhead be-
+tween different pipeline stages. Therefore, our approach
+is more suitable for large servers with sufﬁcient memory.
+
+3http://www.cryptopp.com/
+4libdft does not support multi-tag taint analysis.
+
+USENIX Association  
+
+24th USENIX Security Symposium  77
+
+7 Related Work
+
+In this section we ﬁrst present previous work on static
+and dynamic taint analysis. Our work is a hybrid of
+these two analyses. Then we introduce previous efforts
+on taint logic code optimization, which beneﬁts our taint
+operation generation. Finally, we describe recent work
+on decoupling taint tracking logic from original program
+execution, which is the closest to TaintPipe’s method.
+
+Static and Dynamic Taint Analysis. Since static taint
+analysis (STA) is performed prior to execution by con-
+sidering all possible execution paths, it does not affect
+application runtime performance. STA has been applied
+to data lifetime analysis for Android applications [1], ex-
+ploit code detection [36], and binary vulnerability test-
+ing [28]. Dynamic taint analysis (DTA) is more pre-
+cise than static taint analysis as it only propagates taint
+following the real path taken at run time. DTA has
+been widely used in various security applications, includ-
+ing data ﬂow policy enforcement [25, 40, 27], revers-
+ing protocol data structures [33, 38, 6], malware anal-
+ysis [39] and Android security [14]. However, an in-
+trinsic limitation of DTA is its signiﬁcant performance
+slowdown. Schwartz et al. [32] formally deﬁned the op-
+erational semantics for DTA and forward symbolic exe-
+cution (FSE). Our approach is in fact a hybrid of these
+techniques. Worker thread conducts concrete taint anal-
+ysis (like DTA) whenever explicit taint information is
+available; otherwise symbolic taint analysis (like STA
+and FSE) is performed.
+
+Taint Logic Optimization. Taint logic code, deciding
+whether and how to propagate taint, require additional in-
+structions and “context switches”. Frequently executing
+taint logic code incurs substantial overhead. Minemu [3]
+achieved a decent runtime performance at the cost of sac-
+riﬁcing memory space to speed up shadow memory ac-
+cess. Moreover, Minemu utilized spare SSE registers to
+alleviate the pressure of general register spilling. As a
+result, Minemu only worked on 32-bit program. Tain-
+tEraser [49] developed function summaries for Windows
+programs to propagate taint at function level. Libdft [20]
+introduced two guidelines to facilitate DBI’s code inlin-
+ing: 1) tag propagation code should have no branch; 2)
+shadow memory updates should be accomplished with
+a single assignment. Ruwase et al. [30] applied com-
+piler optimization techniques to eliminate redundant taint
+logic code in hot paths. Jee et al. [19] proposed Taint
+Flow Algebra to summarize the semantics of taint logic
+for basic blocks. All these efforts to generate optimized
+taint logic code are orthogonal and complementary to
+TaintPipe.
+
+Decoupling Dynamic Taint Analysis. A number
+of researchers have considered the high performance
+penalty imposed by inlined dynamic taint analysis. They
+proposed various solutions to decouple taint tracking
+logic from application under examination [24, 31, 26, 15,
+17, 9], which are close in spirit to our proposed approach.
+Speck [26] forked multiple taint analysis processes from
+application execution to spare cores by means of specula-
+tive execution, and utilized record/replay to synchronize
+taint analysis processes. Speck required OS level support
+for speculative execution and rollback. Speck’s approach
+sacriﬁces processing power to achieve acceleration. Sim-
+ilar to TaintPipe’s segmented symbolic taint analysis,
+Ruwase et al. [31] proposed symbolic inheritance track-
+ing to parallelize dynamic taint analysis. TaintPipe dif-
+fers from Ruwase et al.’s approach in three ways: 1)
+Their approach was built on top of a log-based archi-
+tecture [10] for efﬁcient communication with idle cores,
+while TaintPipe works on commodity multi-core hard-
+ware directly. 2) To achieve better parallelization, they
+adopted a relaxed taint propagation policy to set a bi-
+nary operation as untainted, while TaintPipe performs
+full-ﬂedged taint propagation so that we provide stronger
+security guarantees. 3) They used a separate “master”
+processor to update each segment’s taint status sequen-
+tially, while TaintPipe resolves symbolic taint states be-
+tween two consecutive segments. Our approach could
+achieve better performance when there are more than a
+few “worker” processors.
+
+Software-only approaches [15, 17, 9] are the most re-
+lated to TaintPipe. They decouple dynamic taint anal-
+ysis to a shadow thread by logging the runtime values
+that are needed for taint analysis. However, as we have
+pointed out, these methods [15, 9] may suffer from high
+overhead of frequent communication between the appli-
+cation thread and shadow thread. Recent work Shad-
+owReplica [17] ameliorates this drawback by adopting
+ﬁne-grained ofﬂine optimizations to remove redundant
+taint logic code.
+In principle, it is possible to remove
+redundant taint logic by means of static ofﬂine optimiza-
+tions. Unfortunately, even static disassembly of stripped
+binaries is still a challenge [22, 35]. Therefore, the
+assumption by ShadowReplica that an accurate control
+ﬂow graph can be constructed may not be feasible in cer-
+tain scenarios, such as analyzing control ﬂow obfuscated
+software. We take a different angle to address this issue
+with lightweight runtime information logging and seg-
+mented symbolic taint analysis. We demonstrate the ca-
+pability of TaintPipe in speeding up obfuscated binary
+analysis, which ShadowReplica may not be able to han-
+dle. Furthermore, ShadowReplica does not support bit-
+level and multi-tag taint analysis, while TaintPipe han-
+dles them naturally.
+
+78  24th USENIX Security Symposium 
+
+USENIX Association
+
+8 Conclusion
+
+We have presented TaintPipe, a novel tool for pipelin-
+ing dynamic taint analysis with segmented symbolic taint
+analysis. Different from previous parallelization work on
+taint analysis, TaintPipe uses a pipeline style that relies
+on straight-line code with very few runtime values, en-
+abling lightweight online logging and much lower run-
+time overhead. We have evaluated TaintPipe on a num-
+ber of benign and malicious programs. The results show
+that TaintPipe rivals conventional inlined dynamic taint
+analysis in precision, but with a much lower online ex-
+ecution slowdown. The performance experiments indi-
+cate that TaintPipe can speed up dynamic taint analysis
+by 2.43 times on a set of common utilities and 2.38 times
+on SPEC2006, respectively. Such experimental evidence
+demonstrates that TaintPipe is both efﬁcient and effective
+to be applied in real production environments.
+
+9 Acknowledgments
+
+We thank the Usenix Security anonymous reviewers and
+Niels Provos for their valuable feedback. This research
+was supported in part by the National Science Foun-
+dation (NSF) grants CNS-1223710 and CCF-1320605,
+and the Ofﬁce of Naval Research (ONR) grant N00014-
+13-1-0175. Liu was also partially supported by ARO
+W911NF-09-1-0525.
+
+References
+[1] ARZT, S., RASTHOFER, S., FRITZ, C., BODDEN, E., BARTEL,
+A., KLEIN, J., LE TRAON, Y., OCTEAU, D., AND MCDANIEL,
+P. FlowDroid: Precise context, ﬂow, ﬁeld, object-sensitive and
+lifecycle-aware taint analysis for android apps. In Proceedings of
+the 35th ACM SIGPLAN Conference on Programming Language
+Design and Implementation (PLDI’14) (2014).
+
+[2] BALAKRISHNAN, G., AND REPS, T. WYSINWYX: What You
+See Is Not What You eXecute. ACM transactions on program-
+ming languages and systems 32, 6 (2010).
+
+[3] BOSMAN, E., SLOWINSKA, A., AND BOS, H. Minemu: The
+world’s fastest taint tracker.
+In Proceedings of the 14th Inter-
+national Symposium on Recent Advances in Intrusion Detection
+(RAID’11) (2011).
+
+[4] BRUENING, D., GARNETT, T., AND AMARASINGHE, S. An in-
+frastructure for adaptive dynamic optimization. In Proceedings
+of the 2003 international symposium on code generation and op-
+timization (CGO’03) (2003).
+
+[5] BRUMLEY, D., JAGER, I., AVGERINOS, T., AND SCHWARTZ,
+E. J. BAP: A binary analysis platform.
+In Proceedings of
+the 23rd international conference on computer aided veriﬁcation
+(CAV’11) (2011).
+
+[7] CABALLERO, J., POOSANKAM, P., MCCAMANT, S., BABI ´C,
+D., AND SONG, D.
+Input generation via decomposition and
+re-stitching: Finding bugs in malware.
+In Proceedings of the
+17th ACM Conference on Computer and Communications Secu-
+rity (CCS’10) (2010).
+
+[8] CHA, S. K., AVGERINOS, T., REBERT, A., AND BRUMLEY, D.
+Unleashing mayhem on binary code. In Proceedings of the 2012
+IEEE Symposium on Security and Privacy (2012).
+
+[9] CHABBI, M., PERIYANAYAGAM, S., ANDREWS, G., AND DE-
+BRAY, S. Efﬁcient dynamic taint analysis using multicore ma-
+chines. Tech. rep., The University of Arizona, May 2007.
+
+[10] CHEN, S., GIBBONS, P. B., KOZUCH, M., AND MOWRY, T. C.
+Log-based architectures: Using multicore to help software be-
+have correctly. ACM SIGOPS Operating Systems Review 45, 1
+(2011), 84–91.
+
+[11] CHENG, W., ZHAO, Q., YU, B., AND HIROSHIGE, S. Taint-
+Trace: Efﬁcient ﬂow tracing with dynamic binary rewriting. In
+Proceedings of the 11th IEEE Symposium on Computers and
+Communications (ISCC’06) (2006).
+
+[12] CHRISTODORESCU, M., JHA, S., AND KRUEGEL, C. Mining
+speciﬁcations of malicious behavior. In Proceedings of the 6th
+Joint Meeting of the European Software Engineering Conference
+and the ACM SIGSOFT Symposium on The Foundations of Soft-
+ware Engineering (ESEC-FSE’07) (2007).
+
+[13] CLAUSE, J., LI, W. P., AND ORSO, A. Dytan: A generic dy-
+namic taint analysis framework. In Proceedings of the ACM SIG-
+SOFT International Symposium on Software Testing and Analysis
+(ISSTA 2007) (2007).
+
+[14] ENCK, W., GILBERT, P., CHUN, B.-G., COX, L. P., JUNG,
+J., MCDANIEL, P., AND SHETH, A. N.
+TaintDroid: An
+information-ﬂow tracking system for realtime privacy monitoring
+on smartphones. In Proceedings of the 2010 USENIX Symposium
+on Operating Systems Design and Implementation (OSDI’10),
+(2010).
+
+[15] ERMOLINSKIY, A., KATTI, S., SHENKER, S., FOWLER, L. L.,
+AND MCCAULEY, M. Towards practical taint tracking. Tech.
+rep., EECS Department, University of California, Berkeley, Jun
+2010.
+
+[16] GODEFROID, P. Micro execution.
+
+In Proceedings of the 36th
+International Conference on Software Engineering (ICSE’14)
+(2014).
+
+[17] JEE, K., KEMERLIS, V. P., KEROMYTIS, A. D., AND POR-
+TOKALIDIS, G. ShadowReplica: Efﬁcient parallelization of dy-
+namic data ﬂow tracking.
+In Proceedings of the 2013 ACM
+SIGSAC conference on Computer & communications security
+(CCS’13) (2013).
+
+[18] JEE, K., PORTOKALIDIS, G., KEMERLIS, V. P., GHOSH, S.,
+AUGUST, D. I., AND KEROMYTIS, A. D. A general approach
+for efﬁciently accelerating software-based dynamic data ﬂow
+tracking on commodity hardware.
+In Proceedings of the 19th
+Internet Society (ISOC) Symposium on Network and Distributed
+System Security (NDSS) (2012).
+
+[19] JEE, K., PORTOKALIDIS, G., KEMERLIS, V. P., GHOSH, S.,
+AUGUST, D. I., AND KEROMYTIS, A. D. A general approach
+for efﬁciently accelerating software-based dynamic data ﬂow
+tracking on commodity hardware.
+In Proceedings of the 2012
+Network and Distributed System Security Symposium (NDSS’12)
+(2012).
+
+[6] CABALLERO, J., POOSANKAM, P., KREIBICH, C., AND SONG,
+D. Dispatcher: Enabling active botnet inﬁltration using automatic
+protocol reverse-engineering.
+In Proceedings of the 16th ACM
+Conference on Computer and Communication Security (CCS’09)
+(2009).
+
+[20] KEMERLIS, V. P., PORTOKALIDIS, G.,
+
+JEE, K., AND
+libdft: Practical dynamic data ﬂow track-
+KEROMYTIS, A. D.
+ing for commodity systems.
+In Proceedings of the 8th ACM
+SIGPLAN/SIGOPS International Conference on Virtual Execu-
+tion Environments (VEE’12) (2012).
+
+USENIX Association  
+
+24th USENIX Security Symposium  79
+
+[21] LI, X., WANG, X., AND CHANG, W. CipherXRay: Exposing
+cryptographic operations and transient secrets from monitored bi-
+nary execution. IEEE Transactions on Dependable and Secure
+Computing 11, 2 (2014).
+
+[22] LINN, C., AND DEBRAY, S. Obfuscation of executable code to
+improve resistance to static disassembly. In Proceedings of the
+10th ACM Conference on Computer and Communications Secu-
+rity (CCS’03) (2003).
+
+[23] LUK, C.-K., COHN, R., MUTH, R., PATIL, H., KLAUSER, A.,
+LOWNEY, G., WALLACE, S., REDDI, V. J., AND HAZELWOOD,
+K. Pin: building customized program analysis tools with dy-
+namic instrumentation.
+In Proceedings of the 2005 ACM SIG-
+PLAN conference on Programming language design and imple-
+mentation (PLDI’05) (2005).
+
+[24] NAGARAJAN, V., KIM, H.-S., WU, Y., AND GUPTA, R. Dy-
+namic information ﬂow tracking on multicores. In Proceedings of
+the 2008 Workshop on Interaction between Compilers and Com-
+puter Architectures (2008).
+
+[25] NEWSOME, J., AND SONG, D. Dynamic taint analysis for auto-
+matic detection, analysis, and signature generation of exploits on
+commodity software. In Proceedings of the 2005 Network and
+Distributed System Security Symposium (NDSS’05) (2005).
+
+[26] NIGHTINGALE, E. B., PEEK, D., CHEN, P. M., AND FLINN,
+J. Parallelizing security checks on commodity hardware.
+In
+Proceedings of the 13th International Conference on Architec-
+tural Support for Programming Languages and Operating Sys-
+tems (ASPLOS’08) (2008).
+
+[27] QIN, F., WANG, C., LI, Z., SEOP KIM, H., ZHOU, Y., AND
+WU, Y. LIFT: A low-overhead practical information ﬂow track-
+ing system for detecting security attacks. In Proceedings of the
+39th Annual IEEE/ACM International Symposium on Microar-
+chitecture (MICRO’06) (2006).
+
+[28] RAWAT, S., MOUNIER, L., AND POTET, M.-L. Static taint-
+analysis on binary executables.
+http://stator.imag.fr/
+w/images/2/21/Laurent_Mounier_2013-01-28.pdf, Oc-
+tober 2011.
+
+[29] RENIERIS, M., RAMAPRASAD, S., AND REISS, S. P. Arith-
+metic program paths. In Proceedings of the 10th European soft-
+ware engineering conference held jointly with 13th ACM SIG-
+SOFT international symposium on Foundations of software engi-
+neering (ESEC/FSE-13) (2005).
+
+[30] RUWASE, O., CHEN, S., GIBBONS, P. B., AND MOWRY, T. C.
+Decoupled lifeguards: Enabling path optimizations for online
+correctness checking tools. In Proceedings of the ACM SIGPLAN
+2010 Conference on Programming Language Design and Imple-
+mentation (PLDI’10) (2010).
+
+[31] RUWASE, O., GIBBONS, P. B., MOWRY, T. C., RAMACHAN-
+DRAN, V., CHEN, S., KOZUCH, M., AND RYAN, M. Paralleliz-
+ing dynamic information ﬂow tracking lifeguards.
+In Proceed-
+ings of the 20th ACM Symposium on Parallelism in Algorithms
+and Architectures (SPAA’08) (2008).
+
+[32] SCHWARTZ, E. J., AVGERINOS, T., AND BRUMLEY, D. All you
+ever wanted to know about dynamic taint analysis and forward
+symbolic execution (but might have been afraid to ask). In Pro-
+ceedings of the 2010 IEEE Symposium on Security and Privacy
+(2010).
+
+[33] SLOWINSKA, A., STANCESCU, T., AND BOS, H. Howard: A
+dynamic excavator for reverse engineering data structures.
+In
+Proceedings of the 2011 Network and Distributed System Secu-
+rity Symposium (NDSS’11) (2011).
+
+[34] VACHHARAJANI, N., BRIDGES, M. J., CHANG, J., RANGAN,
+R., OTTONI, G., BLOME, J. A., REIS, G. A., VACHHARAJANI,
+M., AND AUGUST, D. I. RIFLE: An architectural framework
+
+for user-centric information-ﬂow security. In Proceedings of the
+37th Annual IEEE/ACM International Symposium on Microar-
+chitecture (MICRO’37) (2004).
+
+[35] WANG, S., WANG, P., AND WU, D. Reassembleable disassem-
+bling. In Proceedings of the 24th USENIX Security Symposium
+(2015), USENIX Association.
+
+[36] WANG, X., JHI, Y.-C., ZHU, S., AND LIU, P. STILL: Ex-
+ploit code detection via static taint and initialization analyses. In
+Proceedings of the 24th Annual Computer Security Applications
+Conference (ACSAC’08) (2008).
+
+[37] WHELAN, R., LEEK, T., AND KAELI, D. Architecture-
+independent dynamic information ﬂow tracking. In Proceedings
+of the 22nd international conference on Compiler Construction
+(CC’13) (2013).
+
+[38] WONDRACEK, G., COMPARETTI, P. M., KRUEGEL, C., AND
+KIRDA, E. Automatic network protocol analysis. In Proceed-
+ings of the 15th Annual Network and Distributed System Security
+Symposium (NDSS’08) (2008).
+
+[39] XU, M., MALYUGIN, V., SHELDON, J., VENKITACHALAM,
+G., AND WEISSMAN, B. ReTrace: Collecting execution trace
+with virtual machine deterministic replay.
+In Proceedings of
+the 2007 Workshop on Modeling, Benchmarking and Simulation
+(2007).
+
+[40] XU, W., BHATKAR, S., AND SEKAR, R. Taint-enhanced pol-
+icy enforcement: A practical approach to defeat a wide range of
+attacks. In Proceedings of the 15th Conference on USENIX Secu-
+rity Symposium (USENIX’06) (2006).
+
+[41] YADEGARI, B., AND DEBRAY, S. Bit-level taint analysis.
+
+In
+Proceedings of the 14th IEEE International Working Conference
+on Source Code Analysis and Manipulation (2014).
+
+[42] YADEGARI, B., JOHANNESMEYER, B., WHITELY, B., AND
+DEBRAY, S. A generic approach to automatic deobfuscation of
+executable code. In Proceedings of the 36th IEEE Symposium on
+Security and Privacy (2015).
+
+[43] YIN, H., AMD M. EGELE, D. S., KRUEGEL, C., AND KIRDA,
+E. Panorama: Capturing system-wide information ﬂow for mal-
+ware detection and analysis. In ACM Conference on Computer
+and Communications Security (CCS’07) (2007).
+
+[44] YIN, H., AND SONG, D.
+
+TEMU: Binary code analysis
+via whole-system layered annotative execution.
+Tech. Rep.
+UCB/EECS-2010-3, EECS Department, University of California,
+Berkeley, Jan 2010.
+
+[45] YIP, A., WANG, X., ZELDOVICH, N., AND KAASHOEK, M. F.
+Improving application security with data ﬂow assertions. In Pro-
+ceedings of the ACM SIGOPS 22nd symposium on Operating sys-
+tems principles (2009), ACM, pp. 291–304.
+
+[46] ZHAO, Q., CUTCUTACHE, I., AND WONG, W.-F.
+
+PiPA:
+Pipelined proﬁling and analysis on multi-core systems. In Pro-
+ceedings of the 2008 International Symposium on Code Genera-
+tion and Optimization (CGO’08) (2009).
+
+[47] ZHAO, Q., SIM, J. E., RUDOLPH, L., AND WONG, W.-F. DEP:
+Detailed execution proﬁle.
+In Proceedings of the 15th Inter-
+national Conference on Parallel Architectures and Compilation
+Techniques (PACT’06) (2006).
+
+[48] ZHAO, R., GU, D., LI, J., AND ZHANG, Y. Automatic detection
+and analysis of encrypted messages in malware. In Proceedings
+of the 9th China International Conference on Information Secu-
+rity and Cryptology (INSCRYPT’13) (2013).
+
+[49] ZHU, D. Y., JUNG, J., SONG, D., KOHNO, T., AND WETHER-
+ALL, D. TaintEraser: Protecting sensitive data leaks using
+application-level taint tracking. ACM SIGOPS Operating Sys-
+tems Review 45 (January 2011), 142–154.
+
+80  24th USENIX Security Symposium 
+
+USENIX Association
+
+

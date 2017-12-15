@@ -1,0 +1,2568 @@
+Authenticated Network Time Synchronization
+
+Benjamin Dowling, Queensland University of Technology; Douglas Stebila,  
+
+McMaster University; Greg Zaverucha, Microsoft Research
+
+ https://www.usenix.org/conference/usenixsecurity16/technical-sessions/presentation/dowling
+
+This paper is included in the Proceedings of the 25th USENIX Security SymposiumAugust 10–12, 2016 • Austin, TXISBN 978-1-931971-32-4Open access to the Proceedings of the 25th USENIX Security Symposium is sponsored by USENIX Authenticated Network Time Synchronization
+
+Benjamin Dowling
+
+Queensland University of Technology
+
+Douglas Stebila
+
+McMaster University
+
+b1.dowling@qut.edu.au
+
+stebilad@mcmaster.ca
+
+Greg Zaverucha
+
+Microsoft Research
+
+gregz@microsoft.com
+
+Abstract
+The Network Time Protocol (NTP) is used by many
+network-connected devices to synchronize device time
+with remote servers. Many security features depend on the
+device knowing the current time, for example in deciding
+whether a certiﬁcate is still valid. Currently, most services
+implement NTP without authentication, and the authen-
+tication mechanisms available in the standard have not
+been formally analyzed, require a pre-shared key, or are
+known to have cryptographic weaknesses. In this paper
+we present an authenticated version of NTP, called ANTP,
+to protect against desynchronization attacks. To make
+ANTP suitable for large-scale deployments, it is designed
+to minimize server-side public key operations by infre-
+quently performing a key exchange using public key cryp-
+tography, then relying solely on symmetric cryptography
+for subsequent time synchronization requests; moreover,
+it does so without requiring server-side per-connection
+state. Additionally, ANTP ensures that authentication
+does not degrade accuracy of time synchronization. We
+measured the performance of ANTP by implementing it
+in OpenNTPD using OpenSSL. Compared to plain NTP,
+ANTP’s symmetric crypto reduces the server throughput
+(connections/second) for time synchronization requests
+by a factor of only 1.6. We analyzed the security of ANTP
+using a novel provable security framework that involves
+adversary control of time, and show that ANTP achieves
+secure time synchronization under standard cryptographic
+assumptions; our framework may also be used to analyze
+other candidates for securing NTP.
+
+Keywords: time synchronization, Network Time Pro-
+
+tocol (NTP), provable security, network security
+
+1
+
+Introduction
+
+The Network Time Protocol (NTP) is one of the Internet’s
+oldest protocols, dating back to RFC 958 [15] published
+in 1985. In the simplest NTP deployment, a client device
+
+sends a single UDP packet to a server (the request), who
+responds with a single packet containing the time (the
+response). The response contains the time the request was
+received by the server, as well as the time the response
+was sent, allowing the client to estimate the network delay
+and set their clock. If the network delay is symmetric, i.e.,
+the travel time of the request and response are equal, then
+the protocol is perfectly accurate. Accuracy means that
+the client correctly synchronizes its clock with the server
+(regardless of whether the server clock is accurate in the
+traditional sense, e.g., synchronized with UTC).
+The importance of accurate time for security. There
+are many examples of security mechanisms which (often
+implicitly) rely on having an accurate clock:
+
+• Certiﬁcate validation in TLS and other protocols.
+Validating a public key certiﬁcate requires conﬁrm-
+ing that the current time is within the certiﬁcate’s
+validity period. Performing validation with a slow
+or inaccurate clock may cause expired certiﬁcates to
+be accepted as valid. A revoked certiﬁcate may also
+validate if the clock is slow, since the relying party
+will not check for updated revocation information.
+• Ticket veriﬁcation in Kerberos. In Kerberos, authen-
+tication tickets have a validity period, and proper
+veriﬁcation requires an accurate clock to prevent
+authentication with an expired ticket.
+
+• HTTP Strict Transport Security (HSTS) policy du-
+ration. HSTS [10] allows website administrators to
+protect against downgrade attacks from HTTPS to
+HTTP by sending a header to browsers indicating
+that HTTPS must be used instead of HTTP. HSTS
+policies specify the duration of time that HTTPS
+must be used. If the browser’s clock jumps ahead,
+the policy may expire re-allowing downgrade attacks.
+A related mechanism, HTTP Public Key Pinning [7]
+also relies on accurate client time for security.
+
+For clients who set their clocks using NTP, these se-
+curity mechanisms (and others) can be attacked by a
+
+USENIX Association  
+
+25th USENIX Security Symposium  823
+
+network-level attacker who can intercept and modify NTP
+trafﬁc, such as a malicious wireless access point or an
+insider at an ISP. In practice, most NTP servers do not
+authenticate themselves to clients, so a network attacker
+can intercept responses and set the timestamps arbitrarily.
+Even if the client sends requests to multiple servers, these
+may all be intercepted by an upstream network device
+and modiﬁed to present a consistently incorrect time to
+a victim. Such an attack on HSTS was demonstrated by
+Selvi [28], who provided a tool to advance the clock of
+victims in order to expire HSTS policies. Malhotra et
+al. [12] present a variety of attacks that rely on NTP being
+unauthenticated, further emphasizing the need for authen-
+ticated time synchronization. (Conﬁdentiality, however,
+is not a requirement for time synchronization, since all
+time synchronization is public. Similarly, client-to-server
+authentication is not a goal.)
+NTP security today.
+Early versions of NTP had no
+standardized authentication method. NTPv3 added an
+authentication method using pre-shared key symmetric
+cryptography. An extension ﬁeld in the NTP packet added
+a cryptographic checksum, computed over the packet.
+In NTPv3 negotiation of keys and algorithms must be
+done out-of-band. For example, NIST offers a secure
+time server, and (symmetric) keys are transported from
+server to client by postal mail [21]. Establishing pre-
+shared symmetric keys with billions of client PCs and
+other NTP-synchronizing devices would be impractical.
+NTPv4 introduced a public key authentication mechanism
+called Autokey which has not seen widespread adoption;
+and unfortunately, Autokey uses small 32-bit seeds that
+can be easily brute forced to then forge packets. A more
+recent proposal is the Network Time Security (NTS) pro-
+tocol [31], which we discuss in §2.3.
+Most NTP servers do not support NTP authentica-
+tion, and NTP clients in desktop and laptop operating
+systems will set their clocks based on unauthenticated
+NTP responses. On Linux and OS X, by default the
+client either polls a server periodically, or creates an NTP
+request when the network interface is established.
+In
+both cases the system clock will be set to any time spec-
+iﬁed by the NTP response. On Windows, by default
+clients will synchronize their clock every nine hours (us-
+ing time.microsoft.com), and ignore responses that
+would change the clock by more than 15 hours. These two
+defaults reduce the opportunity for a man-in-the-middle
+(MITM) attacker to change a victim clock and the amount
+by which it may be changed, but cumulative small-scale
+changes can build over time to large-scale time inaccu-
+racies. Teichel et al. used this technique when attacking
+time-synchronization secured by TESLA-like protocols
+[33]. In Windows domains (a network of computers, of-
+ten in an enterprise), the domain controller provides the
+time with an authenticated variant of NTPv3 [14].
+
+1.1 Contributions
+We present the ANTP protocol for authenticated network
+time synchronization, along with results on its perfor-
+mance and security. ANTP protocol messages are trans-
+ported in the extension ﬁelds of NTP messages. ANTP
+allows a server to authenticate itself to a client using pub-
+lic key certiﬁcates and public key exchange, and provides
+cryptographic assurance using symmetric cryptography
+that no modiﬁcation of the packets has occurred in transit.
+Like other authenticated time synchronization protocols
+using public keys [31], we assume an out-of-band method
+for certiﬁcate validation exists, as certiﬁcate validation
+requires an accurate clock. We follow the direction set
+by the IETF Informational document “Security Require-
+ments of Time Protocols in Packet-Switched Networks”
+(RFC 7384) [20] to determine what cryptographic, com-
+putational, and storage properties ANTP should achieve.
+ANTP has three phases. In the negotiation phase, the
+client and server agree on which cryptographic algorithms
+to use; this phase would be carried out quite infrequently,
+on the order of monthly or less.
+In the key exchange
+phase, the client and server use public key cryptography
+to establish a symmetric key that the server will use to
+authenticate later time synchronization responses; this
+phase would also be carried out infrequently, say monthly.
+In the time synchronization phase, the client sends a time
+synchronization request, and the server replies with an
+NTP response that is symmetrically authenticated using
+the key established in the key exchange phase; this may
+be done frequently, perhaps daily or more often. No-
+tably, the server need not keep per-client state: the server
+ofﬂoads any such state to the client by encrypting and
+authenticating it under a long-term symmetric key, and
+the client sends that ciphertext back to the server with
+each subsequent request.
+
+The time synchronization phase of ANTP can be run in
+a “no-cryptographic-latency” mode: here, the server sends
+two response packets, the ﬁrst being the unauthenticated
+NTP packet, and the second being the same NTP packet
+(with unchanged timestamps) along with the ANTP ex-
+tensions providing authentication. The client measures
+the roundtrip time based on the unauthenticated response,
+but does not update its clock until authenticating the re-
+sponse. In this way, no time synchronization inaccuracy is
+added by the time required to compute the authentication
+tag over the outgoing timestamp. Since the latency of
+ANTP’s time synchronization phase is nearly as fast as
+unauthenticated simple NTP time synchronization (only
+21 microseconds slower at 50% load in our implementa-
+tion as reported below), we make this mode optional since
+plain ANTP may be sufﬁciently accurate for general use.
+ANTP performance. Performance constraints on time
+synchronization protocols are driven by the fact that time
+
+824  25th USENIX Security Symposium 
+
+USENIX Association
+
+Phase
+
+Throughput
+
+ANTP – Negotiation – RSA
+ANTP – Negotiation – ECDH
+ANTP – Key Exchange – RSA
+ANTP – Key Exchange – ECDH
+ANTP – Time Synchronization
+ANTP – All 3 phases – RSA
+ANTP – All 3 phases – ECDH
+NTP
+
+58 240
+146 808
+1 754
+13 210
+175 644
+–
+–
+291 926
+
+Latency within LAN (µs)
+90% load
+50% load
+202 ± 44
+186 ± 26
+172 ± 35
+233 ± 133
+997 ± 348
+891 ± 125
+344 ± 142
+197 ± 56
+168 ± 35
+230 ± 160
+2646 ± 345
+2255 ± 587
+2252 ± 1172
+1325 ± 499
+147 ± 34
+181 ± 136
+
+Latency across US (ms)
+90% load
+50% load
+77.5 ± 0.1
+76.3 ± 0.1
+75.3 ± 0.1
+75.3 ± 0.1
+76.9 ± 0.5
+75.8 ± 0.2
+75.4 ± 0.4
+74.7 ± 0.2
+73.7 ± 0.1
+73.5 ± 0.1
+226.6 ± 6.2
+258.0 ± 35
+223.3 ± 6.7
+231.8 ± 10.5
+72.4 ± 0.1
+74.0 ± 0.1
+
+Table 1: Performance results for each phase of ANTP (top), a complete 3-phase execution of ANTP (middle), and NTP
+(bottom). Throughput: mean completed phases per second. Latency: mean and standard deviation of the latency of
+server responses at either 50% or 90% server load on a local area network (reported in microseconds) and across the
+United States (between Virginia and California) (reported in milliseconds). All are computed over 5 trials, top and
+bottom over 100 seconds each; see Section 4.2 for details.
+
+servers are heavily loaded, and must provide responses
+promptly. ANTP’s design allows it to achieve high per-
+formance while maintaining high security. The frequently
+performed time synchronization phase uses only symmet-
+ric cryptography, making it only slightly more expensive
+than simple NTP time synchronization. Since the ses-
+sion key established in the key exchange phases is reused
+across many time synchronization phases, expensive pub-
+lic key operations are amortized, and can be separately
+load-balanced. And, as noted above, ANTP ofﬂoads state
+to clients, leaving the server stateless.
+
+We implemented ANTP in OpenNTPD’s [34] imple-
+mentation of NTP, using OpenSSL’s libcrypto library
+(but not SSL/TLS) [35] for cryptographic computations.
+Table 1 reports the performance of our implementation,
+compared with unauthenticated simple NTP. ANTP does
+decrease throughput and increase latency, but the im-
+pact is quite reasonable. On a single core of a server,
+ANTP can support 175k authenticated time synchroniza-
+tion phase connections per second, a factor of 1.6 fewer
+than the 291k unauthenticated simple NTP connections
+per second. Latency for time synchronization (over a 1
+gigabit per second local area network) at 50% load in-
+creases from 147 microseconds for unauthenticated sim-
+ple NTP to 168 microseconds for ANTP’s time synchro-
+nization phase. The other two phases, negotiation and
+key exchange, will be performed far less frequently on
+average by clients. Throughput of negotiation phases is
+bandwidth-, not CPU-, limited. For exchange, we imple-
+mented methods: 2048-bit RSA key transport and static-
+ephemeral elliptic curve Difﬁe–Hellman key exchange
+using the NIST P-256 curve; as expected, both of these
+are substantially more expensive than time synchroniza-
+tion phases, but are also performed far less frequently.
+
+Protocol
+
+NTPv0–v2
+NTPv3
+sym. key
+
+NTPv4
+Autokey
+
+Auth.
+type
+—
+
+Security
+
+—
+
+sym. key
+
+no proof
+
+pub. key
+
+ﬂaws
+(§. 2.3)
+relies
+on TLS
+
+ProVerif
+proof [32]
+
+proof
+
+tlsdate [3]
+
+pub. key
+
+NTS [31]
+
+pub. key
+
+ANTP
+(Fig. 3)
+
+pub. key
+(Sec. 6)
+
+Server
+
+operations
+
+Round
+trips
+
+—
+
+1 hash
+
+2
+n pub. key,
+
+1
+n + 1 sym. key
+2
+n pub. key†
+
+5
+n + 7 sym. key†
+
+3
+n pub. key,
+
+2
+n + 2 sym. key
+
+1
+n pub. key,
+
+6
+n + 2 sym. key
+
+1
+1
+
+4
+
+4
+
+stateful
+
+4
+
+3
+
+Table 2: Comparison of time synchronization proto-
+cols. Server operations per time synchronization in-
+cludes public key decryptions, symmetric key encryp-
+a
+n + b de-
+tions/decryptions, and hashes/KDFs/MACs.
+notes a operations that can be amortized over n time
+synchronizations plus b operations per time sync.
+† tlsdate operation counts vary based on ciphersuite.
+
+Details of our implementation and testing methodology,
+as well as more results, appear in Section 4.
+
+ANTP compares well with other authentication meth-
+ods for NTP, as seen in Table 2. ANTP uses fewer amor-
+tized public key operations compared to NTPv4 Autokey
+and NTS and has fewer rounds. NTPv3 using symmet-
+ric key operations is more lightweight, but is highly re-
+stricted in that it only supports symmetric authentication
+via pre-established symmetric keys, making it unsuitable
+for deployment with billions of devices.
+
+Because ANTP is designed-for-purpose, it is also more
+
+USENIX Association  
+
+25th USENIX Security Symposium  825
+
+efﬁcient than applying general purpose security protocols
+to NTP. For example, one might consider simply applying
+TLS or DTLS to NTP packets to obtain authentication.
+Unfortunately, TLS and DTLS do not achieve full state-
+lessness as is desirable for high throughput applications
+that need to resist denial of service attacks. TLS and
+DTLS both require that the server maintain state during
+the initial handshake (which requires 3 round trips) and
+during session resumption handshakes (which requires 2
+round trips). While the server can ofﬂoad state between
+the initial handshake and the session resumption using
+session tickets, there is no standardized mechanism to
+do so during the handshakes. DTLS servers also must
+maintain mappings between clients and sessions, as UDP
+does not provide this functionality. ANTP avoids these
+problems by having the server ofﬂoad state at every step.
+ANTP is also much more efﬁcient in terms of communi-
+cation size, as TLS/DTLS have a variety of extensions
+that consume substantial bandwidth.
+ANTP security. ANTP’s design is supported by a thor-
+ough analysis of its cryptographic security using the prov-
+able security paradigm. To do so, we extend existing
+frameworks for key exchange and secure channels [5, 11]
+to develop a novel framework that handles protocols
+where time plays a central role. The adversary in our
+security analysis is a network attacker capable of delet-
+ing, reordering, editing, and creating messages between
+parties. Since our model is about time synchronization,
+parties in our model have local clocks, and the adver-
+sary is given complete control over the initialization of
+all clocks, as well as the ability to increment the time
+of parties not involved in a protocol run. This allows
+us to model the ability of an adversary to delay packet
+transmission: this is particularly important in the case of
+NTP, where delaying packets asymmetrically can cause
+the client to synchronize to an inaccurate time. This dif-
+fers from previous security frameworks that model time,
+such as ones introduced by Schwenk [27] (which uses a
+global time counter to model timestamps) and Basin et
+al. [4] (where the adversary cannot inﬂuence the offset or
+rate-of-change of the party clocks.)
+
+We then show that ANTP achieves secure time syn-
+chronization as deﬁned by our model, under standard as-
+sumptions on the security of the cryptographic primitives
+(key encapsulation mechanism, hash function, authenti-
+cated encryption, message authentication code, and key
+derivation function) used to construct the protocol.
+
+2 Network Time Protocols
+
+Here we review the two most commonly deployed time
+synchronization protocols, NTP and SNTP, as well as a
+recent proposal called Network Time Security [31].
+
+2.1 The Network Time Protocol
+The Network Time Protocol (NTP) was developed by
+Mills in 1985 [15], and revised in 1988, 1989, 1992 and
+2010 (NTPv1 [9], NTPv2 [16], NTPv3 [17] and NTPv4
+[18] respectively). NTP is designed to synchronize the
+clocks of machines directly connected to hardware clocks
+(known as primary servers) to machines without hard-
+ware clocks (known as secondary servers). NTP protects
+against Byzantine traitors by querying multiple servers,
+selecting a majority clique and updating the local clock
+with the majority offset. This assumes the attacker can
+only inﬂuence some minority of the queried servers.
+
+2.2 The Simple Network Time Protocol
+The Simple Network time Protocol (SNTP) is a variant
+of NTP that uses an identical message format [17] but
+only queries a single server when requesting time syn-
+chronization. Windows and OS X by default synchro-
+nize using a single time source (time.windows.com and
+time.apple.com respectively). Our construction lends
+itself well to SNTP, as it authenticates time samples from
+a single server. Security analysis is also easier as we can
+avoid the more complex sorting and ﬁltering algorithms of
+NTP, and client and server behaviours are simpler. Note
+that SNTP and NTP client request messages are the same.
+SNTP has three distinct stages: (1) the creation and
+transmission of req by the client; (2) the processing of
+req by the server, and transmission of resp; and (3) the
+processing of resp and clock update by the client. An
+abstraction of the protocol behaviour can be found in
+Figure 1, including the client’s clock update procedure.
+Though the format of NTP packets is identical for both
+client and server NTP messages, we use req to indicate a
+NTP packet in client mode, and resp to indicate a NTP
+packet in server mode, omitting packet content details.
+
+1. The client creates an SNTP req packet, sets
+
+transmit timestamp (t1) to Now() and sends the
+message.1
+
+2. The
+
+server
+
+creates
+
+signalling Server mode.
+originate timestamp
+
+an SNTP resp packet
+to the received req,
+with all ﬁelds identical
+server
+The
+but
+to
+the
+value
+sets
+transmit timestamp from req.
+The server
+also sets receive timestamp (t2)
+to Now()
+immediately after
+receipt of req,
+and sets
+transmit timestamp (t3) to Now() immediately
+before sending the message to the client.
+
+3. Upon receiving resp,
+
+the client notes the cur-
+t4.
+rent
+If resp.originate timestamp is not equal to
+
+time from Now() and saves
+
+it as
+
+1Now() denotes a party reading its local clock’s current time.
+
+826  25th USENIX Security Symposium 
+
+USENIX Association
+
+Server
+
+req
+
+resp
+
+−→ t2 ← Now()
+
+...
+t3 ← Now()
+←− resp ← t2(cid:28)t3
+
+Client
+t1 ← Now()
+req ← t1
+
+t4 ← Now()
+RTT ← (t4 −t1)− (t3 −t2)
+˜θ3 ← RTT/2
+offset ← 1
+2 (t2 +t3 −t1 −t4)
+time ← Now() + offset
+
+Figure 1: Simple Network Time Protocol (SNTP). Now()
+denotes the procedure that outputs the local machine’s
+current time. RTT denotes the total round-trip delay the
+client observes and ˜θ3 denotes the approximation of the
+propagation time from server to client. The time of the
+server receiving req is denoted t2 and sending resp is t3.
+Note that offset = t3 + ˜θ3 − t4, which we will use in our
+correctness analysis of ANTP.
+
+req.transmit timestamp, the client aborts the
+protocol run. The client calculates the total round-
+trip time RTT and the local clock offset offset as in
+Figure 1.
+
+(The rest of the ﬁelds in the NTP packets are irrele-
+vant for calculating the local clock offset and correcting
+the local clock for a single-source time synchronization
+protocol. These extra ﬁelds in the NTP packet are used
+primarily for ranking multiple distinct time sources.)
+
+From this, we can compute a bound of the amount of
+error that is introduced to the clock update procedure via
+asymmetric packet delay when the packets are unmod-
+iﬁed. Asymmetric packet delay is the scenario where
+the propagation time from client to server is not equal
+to the propagation time from server to client. Let θ1 be
+the propagation time from client to server, θ2 the server
+processing time and θ3 the propagation time from server
+to client. θ3 is approximated in SNTP by ˜θ3 = RTT
+2 , where
+RTT = (t4 −t1)− (t3 −t2) =θ 1 + θ3.
+The actual offset is offsetactual = t3 + θ3 − t4. The ap-
+proximated offset is computed as offset = 1
+2 (t2 + t3 −
+t1 − t4). When θ1 = θ3, then offset = t3 + ˜θ3 − t4 and
+offset = offsetactual. In the worst possible case, packet
+delivery is instantaneous, and the entire roundtrip time
+is asymmetric delay. The client approximates the off-
+set as above, and thus the error introduced this way is
+1
+2|(θ1 − θ3)| ≤ RTT.
+The error that a passive adversary with the ability to
+delay packets can introduce does not exceed the RTT:
+clients can abort the protocol run when RTT grows too
+large, giving them some control over the worst-case error.
+
+2.3 NTP Security and Other Related Work
+In terms of security, early versions of NTP (NTP to
+NTPv2) had no standardized authentication method.
+NTPv3 symmetric key authentication. NTPv3 pre-
+sented a method for authenticating time synchronization –
+using pre-shared key symmetric cryptography. NTPv3’s
+added additional extension ﬁelds to the NTP packet, con-
+sisting of a 32-bit key identiﬁer, and a 64-bit crypto-
+graphic checksum. The speciﬁcation of NTPv3 describes
+the checksum as the encryption of the NTP packet with
+DES, but notes that other algorithms could be negotiated.
+The distribution of keys and negotiation of algorithms
+was considered outside the scope of NTP.
+NTPv4 Autokey public key authentication. NTPv4 in-
+troduced a method for using public key cryptography for
+authentication, known as the Autokey protocol. Autokey
+is designed to prevent inaccurate time synchronization by
+authenticating the server to the client, and verifying no
+modiﬁcation of the packet has occurred in transit. Au-
+tokey is designed to work over the top of authenticated
+NTPv3. Autokey uses MD5 and a variety of Schnorr-
+like [26] identiﬁcation schemes to prevent malicious at-
+tacks, but as an analysis of Autokey by R¨ottger shows
+[23], there are multiple weaknesses inherent in the Au-
+tokey protocol, including use of small seed values (32 bits)
+and allowing insecure identiﬁcation schemes to be negoti-
+ated. The size of the seed allows a MITM adversary with
+sufﬁcient computational power to generate all possible
+seed values and use the cookie to authenticate adversarial-
+chosen NTP packets. This weakness alone allows an
+attacker in control of the network to break authentication
+of time synchronization, thus NTP with the Autokey pro-
+tocol is not a secure time synchronization protocol [30].
+Mills describes his experiments on demonstrating reliabil-
+ity and accuracy of network time synchronization using
+NTPv2 implementations [19], but does not offer a formal
+security analysis of NTP. Mills does show that honest
+deployment of NTP in networks can offer time synchro-
+nization accuracy to within a few tens of milliseconds
+after only a few synchronizations. ANTP was originally
+intended as a means to addressing the vulnerabilities in
+the Autokey protocol, but with many changes to mini-
+mize public key and symmetric key operations, message
+bandwidth. While inspiration for ANTP is the Autokey
+protocol, the design diverged signiﬁcantly enough to con-
+sider it a separate protocol design.
+Network Time Security draft-12. The Network Time
+Security protocol (NTS) [31] is an IETF Internet-Draft
+that uses public key infrastructure in order to secure time
+synchronization protocols such as NTP and the Precision
+Time Protocol (PTP) [1]. However, NTS is costly in
+terms of server-side public key operations, is a four round-
+trip protocol, requires clients to manage public/private
+
+USENIX Association  
+
+25th USENIX Security Symposium  827
+
+key pairs and digital certiﬁcates, and does not have an
+equivalent to ANTP’s no-cryptographic-latency feature.
+We note NTS is a work-in-progress and future revisions
+may be updated to address these issues. We discovered in
+draft-06 a ﬂaw in the Association Phase that would allow
+MITM adversaries to perform downgrade attacks and
+communicated our ﬁndings to the authors. This has since
+been ﬁxed and the following is an overview of draft-12.
+NTS evolved as an attempt to ﬁx the weaknesses in
+Autokey and has inherited many design choices from
+the Autokey protocol, in particular protocol ﬂow and
+key derivation strategy using secret server seeds. Sim-
+ilarly to the Autokey protocol, NTS servers reuse the
+randomness server seed used to generate a shared secret
+key (referred to as a cookie) for each client by cookie =
+HMAC(server seed, Hash(client public key certiﬁcate)),
+encrypting this value and a client-chosen nonce with the
+client public key, authenticating the server by digitally
+signing the cookie with the server private key. Note that
+the client public key certiﬁcate in NTS serves to ensure
+the conﬁdentiality and uniqueness of the cookie for each
+client using a different public key certiﬁcate. It does not
+serve to authenticate the client to the server. In ANTP
+clients do not need a certiﬁcate, only the server.
+
+In the Association Phase NTS requires the server digi-
+tally sign the server assoc message, which (in draft-12)
+includes the client’s selection of hash and public key en-
+cryption algorithms in addition to a client nonce. The
+server must compute costly public key operations over
+these values for each association phase. As a result, a
+NTS server requires three public key operations per client
+to establish a shared secret cookie.
+NTS draft-06 attack. Here we brieﬂy describe our
+downgrade attack on NTS draft-06 and below. Figure 2
+shows the NTS draft-06 Association Phase, which differs
+to the previously described draft-12. (This is analogous
+to the Negotiation Phase in ANTP.) In assocc, the client
+sends the highest version of NTS that it supports, in addi-
+tion to lists of hash and public key encryption algorithms.
+The server responds with a signature over the server host-
+name, the negotiated version, and the negotiated hash
+and public key encryption algorithms. This does not
+contain the server’s received values of the client’s sup-
+ported version and algorithms, so it is straightforward
+for a MITM attacker to strip assocc of strong hash and
+public key encryption algorithms. If the client supports
+weak algorithms, this can translate into a full break of
+time-synchronization security by recovery of the cookie,
+similarly to attacks on weak Difﬁe-Hellman groups in
+TLS [2].
+tlsdate. Another solution for synchronizing time is
+Appelbaum’s tlsdate [3], which uses timestamps in the
+nonces of TLS handshakes to fetch the time. However,
+this requires stateful servers, is not as accurate as cur-
+
+rent solutions and will no longer function when servers
+transition to TLS 1.3 (as the proposed protocol no longer
+includes timestamps in the nonces).
+
+3 Authenticated NTP
+
+In this section we present the Authenticated Network Time
+Protocol (ANTP): a new variant of NTP designed to allow
+an SNTP client to authenticate a single NTP server and
+output a time counter within some accuracy margin of
+the server time counter. Our new protocol ANTP allows
+an ANTP server to authenticate itself to an ANTP client,
+as well as provide cryptographic assurances that no mod-
+iﬁcation of the packets has occurred in transit. ANTP
+messages, much like Autokey and NTS, are included in
+the extension ﬁelds of NTP messages. We summarize the
+novel features of ANTP below:
+
+• The client is capable of authenticating the server,
+and all messages from the server. Replay attacks are
+explicitly prevented for the client.
+
+client in order to generate a shared secret key.
+
+• The server does not need to keep state for each client.
+• The server does only one public key operation per
+• The shared secret key can be used for multiple time
+• The client has a “no-cryptographic-latency” option
+to avoid additional error in the approximation of ˜θ3
+due to cryptographic operations.
+
+synchronization attempts by the same client.
+
+3.1 Protocol Description
+ANTP is divided into four separate phases. A detailed
+protocol ﬂow can be found in Figure 3, and exact message
+formatting can be found in the full version [6].
+
+• Setup: The server chooses a long term key s for
+the authenticated encryption algorithm. This is used
+to encrypt and authenticate ofﬂoaded server state
+between phases.
+
+• Negotiation Phase: The client and server communi-
+cate supported algorithms; the server sends its certiﬁ-
+cate and state C1, an authenticated encryption (using
+s) of the hash of the message ﬂow. The value C1 will
+be later used to authenticate negotiation.
+
+• Key Exchange Phase: The client uses a key encap-
+sulation mechanism (KEM) based on the server’s
+public key from its certiﬁcate to establish a shared
+key with the server. The client sends the KEM ci-
+phertext and encrypted state C1 to the server. The
+server derives the shared key k, then encrypts it (us-
+ing s) to compute C2. The server replies with a MAC
+(for key conﬁrmation) and ofﬂoaded state C2 (for use
+in the next phase).
+
+828  25th USENIX Security Symposium 
+
+USENIX Association
+
+Client
+
+assocc ← versc(cid:30)namec(cid:30) (cid:31)Hashc(cid:30) (cid:31)Encc
+
+Server
+
+Association phase
+
+assocc−→ (versn, Hash, Enc) ← negotiate(assocc,verss, (cid:31)Hashs, (cid:31)Encs)
+σ ← Sign(sks,versn(cid:30)names(cid:30)Hash(cid:30)Enc)
+assocs←−
+assocs ← versn(cid:30)names(cid:30)Hash(cid:30)Enc(cid:30)σ(cid:30)certs
+
+Figure 2: A description of the Network Time Security draft-06 Association Phase. vers is the NTS version indicator;
+namec and names are the hostnames of the client and server respectively.
+
+• Time Synchronization Phase: The client sends a
+time synchronization request and includes ofﬂoaded
+server state C2. The server recovers shared key k
+from C2 and uses it to authenticate the response,
+which the client veriﬁes. The client can also re-
+quest “no-cryptographic-latency” time synchroniza-
+tion, where the server will immediately reply without
+authentication, and then send a second message with
+authentication.
+
+3.2 Design Rationale and Discussion
+Of the security properties discussed in RFC 7384 [20],
+ANTP achieves the following: protection against manipu-
+lation, spooﬁng, replay and delay attacks; authentication
+of the server (if ANTP is applied in a chain, implicit
+authentication of primary server); key freshness; avoids
+degradation of time synchronization; minimizes compu-
+tational load; minimizes per-client storage requirements
+of the server. The following properties from [20] are
+only partly addressed by ANTP, which we explain in fur-
+ther detail below: resistance against the rogue master,
+cryptographic DoS, and time-protocol DoS attacks.
+Stateless server.
+While storage costs are gener-
+ally not an issue, synchronizing state between multiple
+servers implementing a high-volume network endpoint
+like time.windows.com is still expensive and compli-
+cated to deploy. For reliability and performance these
+servers are often in multiple data centres, spread across
+multiple geographic regions. In ANTP the server regen-
+erates per-client state as needed. Our construction uses
+authenticated encryption (AE) in a similar manner to TLS
+Session Tickets [24] for session resumption, where the
+server authenticates and encrypts its per-client state using
+a long-term symmetric key, then sends the ciphertext to
+the client for storage. The client responds with the cipher-
+text in order for the server to decrypt and recover state.
+The server periodically refreshes the long-term secret key
+for the AE scheme (the intervals are dependent on the
+security requirements of the AE scheme).
+No-cryptographic-latency mode.
+In SNTP, the accu-
+racy is bounded by the total roundtrip time of the time
+
+synchronization phase. If we build a secure authentication
+protocol over SNTP, then the total accuracy of the new au-
+thenticated protocol is also bound by the total round-trip
+time of the time synchronization phase.
+
+Since cryptographic computations over the synchro-
+nization messages adds asymmetrically to propagation
+time, it introduces error in the approximation of propa-
+gation time ˜θ3, so authentication operations degrade the
+accuracy of the transmit timestamp in the resp. As
+noted above, ANTP includes a “no-cryptographic-latency”
+mode to reduce error due to authentication: during the
+Time Synchronization Phase, at the client’s option, the
+server will immediately process a resp as in Figure 1
+and sends it to the client, without authentication. The
+server subsequently creates an ANTP ServerResp mes-
+sage, and sends the resp with ServerResp in the NTP
+extension ﬁelds of the saved resp. A client can then use
+the time when receiving the initial resp to set its clock,
+but only after verifying authentication with the ANTP
+ServerResp, aborting if authentication fails, if either
+message wasn’t received, or if messages were received in
+incorrect order. Here, cryptographic processing time does
+not introduce asymmetric propagation time. (The TESLA
+broadcast authentication protocol of Perrig et al. [22] de-
+lays authentication as well, to improve efﬁciency rather
+than accuracy as in ANTP.)
+
+Efﬁcient cryptography. Public key operations are com-
+putationally expensive, especially in the case of a server
+servicing a large pool of NTP clients. ANTP only re-
+quires a single public key operation per-client to ensure
+authentication and conﬁdentiality of the premaster secret
+key material. The client can reuse the shared secret key
+on multiple subsequent time synchronization requests
+with that server. ANTP uses a key encapsulation mech-
+anism for establishing the shared secret key. We allow
+either static-ephemeral elliptic curve Difﬁe-Hellman key
+exchange or key transport using RSA public key encryp-
+tion. While one might ordinarily avoid use of RSA or
+static-ephemeral DH for key exchange since they do not
+provide forward secrecy, this is not a concern for ANTP
+since we do not need conﬁdentiality as the contents of the
+messages (time synchronization data) are public.
+
+USENIX Association  
+
+25th USENIX Security Symposium  829
+
+Client
+supported algorithms (cid:31)algC
+
+α ← in-progress
+nc ←${0,1}256
+m1 ← (cid:31)algC(cid:28)nc
+
+Verify certS
+pkS ← parse(cert)
+
+Server
+supported algorithms (cid:31)algS
+long-term secret s
+certiﬁcate certS for the KEM keypair (pkS,skS)
+
+Negotiation phase
+
+m1−→ (KDF, Hash, KEM, MAC) ← negotiate( (cid:31)algC, (cid:31)algS)
+h ← Hash(m1(cid:28) (cid:31)algS(cid:28)certS)
+C1 ← AuthEncs(01(cid:28)h(cid:28)KDF(cid:28)Hash(cid:28)KEM(cid:28)MAC)
+m2 ← (cid:31)algS(cid:28)certS(cid:28)C1
+
+m2←−
+
+Key exchange phase
+
+(KDF, Hash, KEM, MAC) ← negotiate( (cid:31)algC, (cid:31)algS)
+h ← Hash(m1(cid:28) (cid:31)algS(cid:28)certS)
+(e, pms) ← KEM.Encap(pks)
+m3 ← C1(cid:28)e
+
+k ← KDF(pms,⊥,“ANTP”,len)
+
+Verify τ1 = MAC(k,h(cid:28)m3(cid:28)C2)
+If verify fails, then α ← reject and abort
+
+m3−→ b(cid:28)h(cid:28)KDF(cid:28)Hash(cid:28)KEM(cid:28)MAC ← AuthDecs(C1)
+
+If b (cid:25)= 01, then α ← reject and abort
+pms ← KEM.Decap(skS,e)
+k ← KDF(pms,⊥,“ANTP”,len)
+C2 ← AuthEncs(02(cid:28)k(cid:28)KDF(cid:28)Hash(cid:28)KEM(cid:28)MAC)
+τ1 ← MAC(k,h(cid:28)m3(cid:28)C2)
+m4 ← C2(cid:28)τ1
+
+m4←−
+
+Time synchronization phase p = 1, . . . ,n
+
+α ← in-progress
+nc2 ←${0,1}256
+t1 ← Now()
+m5 ← t1(cid:28)nc2(cid:28)C2
+
+t4 ← Now()
+RTT ← (t4 −t1)− (t3 −t2)
+If RTT > E, then α ← reject and abort
+Verify τ2 = MAC(k,m5(cid:28)t1(cid:28)t2(cid:28)t3)
+If verify fails, then α ← reject and abort
+offset = 1
+timep ← Now() + offset
+α ← acceptp
+If p = n, then terminate
+
+2 (t3 +t2 −t1 −t4)
+
+m5−→ t2 ← Now()
+
+b(cid:28)k(cid:28)KDF(cid:28)Hash(cid:28)KEM(cid:28)MAC ← AuthDecs(s,C2)
+If b (cid:25)= 02, then α ← reject or abort
+t3 ← Now()
+(cid:31) m∗6←−(cid:30) m∗6 ← t1(cid:28)t2(cid:28)t3
+τ2 ← MAC(k,m5(cid:28)t1(cid:28)t2(cid:28)t3)
+m6←−
+m6 ← t1(cid:28)t2(cid:28)t3(cid:28)τ2
+
+Figure 3: Authenticated NTP (ANTPE), where E is a ﬁxed upper bound on the desired accuracy. The pre-determined
+negotiation function negotiate takes as input two ordered lists of algorithms and returns a single algorithm. n denotes
+the maximum number of synchronization phases, and p denotes the current synchronization phase. [m∗6] indicates an
+optional message sent based on a “no-cryptographic-latency” ﬂag present in m5, omitted in this ﬁgure. Note that if
+KEM.Decap or AuthDec fails for any ANTP server, the server simply stops processing the message, aborts, and allows
+the client to time-out. If certiﬁcate validation fails, the client aborts the protocol run. Each of the messages contains an
+identiﬁer ﬂag to prevent confusion between MACs. The protocol in the ﬁgure is an abstraction: messages m1 . . .m 4 and
+the cryptographic components of m5 and m6 are sent as extensions of NTP messages, and detailed message structure
+can be found in the full version [6]. Authenticated Encryption schemes are not negotiated as they are entirely opaque to
+the client.
+
+830  25th USENIX Security Symposium 
+
+USENIX Association
+
+Ampliﬁcation attacks can be of concern. Unauthenti-
+cated SNTP has a roughly 1:1 ratio of attacker work to
+server work, in that one attack packet causes one packet
+in response, and a small computational effort is required
+by the server. In ANTP, the cryptographic operations
+do allow some ampliﬁcation of work. Based on the ex-
+perimental results in Table 1, the negotiation and time
+synchronization phases have less than a 1:2 ratio of at-
+tacker work to server work. As for the key exchange
+phase, the server performs a public key operation while a
+malicious client may not. However, a server under attack
+can temporarily stop responding to key exchange requests
+while still responding to time synchronization requests,
+and since most honest clients will perform key exchange
+infrequently, their service will not be denied.
+
+Another ampliﬁcation can be caused by the no-
+cryptographic-latency feature, since two response packets
+are sent for each request. This mode can be turned off
+during attack, the server indicating with a ﬂag that it does
+not (currently) support this feature.
+
+Key freshness and reuse. ANTP allows multiple time
+synchronization phases for each session using the same
+shared secret key k but with a new nonce in each Time
+Synchronization Phase to prevent replay attacks and en-
+sure uniqueness of the protocol ﬂow. This reuse can
+continue until either the client restarts the negotiation
+phase or the server rotates public keys or authenticated
+encryption keys.
+Denial of service attacks. Against a man-in-the-middle,
+some types of denial-of-service (DoS) attacks are unavoid-
+able, as the adversary may always drop messages.
+
+Finally, in the negotiation phase the server’s response
+is also considerably larger than the client request (be-
+cause it includes a certiﬁcate), but, like the key exchange
+phase, the negotiation phase may be temporarily disabled
+without denying service to clients who already have estab-
+lished a premaster secret. Another option is to replace the
+server certiﬁcate chain with a URL where the client can
+download it. Depending on the size of the certiﬁcate(s)
+this could reduce the bandwidth ampliﬁcation consider-
+ably. This last mitigation requires detailed analysis, which
+we leave to future work.
+Certiﬁcate validation. When using digital certiﬁcates to
+authenticate public keys, the synchronization of the issuer
+and the relying party is an underlying assumption. This
+serves to highlight a signiﬁcant problem – how do you
+securely authenticate time using public key infrastructure
+without previously having time synchronization with the
+issuer? For our construction this must be done once, and
+we assume that the client has some out-of-band method
+for establishing the trustworthiness of public keys, per-
+haps using OCSP [25] with nonces to ensure freshness of
+responses, by the user manually setting the time for ﬁrst
+certiﬁcate validation, or shipping a trusted certiﬁcate with
+
+the operating system. Since certiﬁcate validity periods
+typically range from months to years, if the user is assured
+of time synchronization with the issuer to be within range
+of hours or days and that range sits comfortably within
+the certiﬁcate validation period, this is a viable solution.
+ANTP to NTP downgrade. ANTP servers are also NTP
+servers, since ANTP is implemented as an NTP extension.
+This eases deployment; older clients can continue using
+NTP, while newer clients can use ANTP. However, a net-
+work adversary can drop the ANTP extension from the
+request, and the server will respond with NTP (having in-
+terpreted the request as NTP). For this reason, clients that
+send an ANTP request must only update their clock based
+on a valid ANTP response, and ignore NTP responses.
+For similar reasons, clients are not recommended to im-
+plement a fall back from ANTP to NTP.
+
+4
+
+Implementation and Performance
+
+Here we describe our instantiation of ANTP in terms of
+cryptographic primitives used as well as its implementa-
+tion and results on its performance.2
+
+Instantiation and Implementation
+
+4.1
+We instantiate ANTP using the following cryptographic
+algorithms. We use AES128-GCM as the symmetric
+encryption algorithm for the server to encrypt and de-
+crypt state, SHA-256 as the hash algorithm, and HMAC-
+SHA256 as the MAC and key derivation function. We sup-
+port two key encapsulation mechanisms, RSA key trans-
+port and static-ephemeral elliptic curve Difﬁe-Hellman:
+• RSA key transport: In KeyGen, the public key and
+secret key are a 2048-bit RSA key pair. Encap is
+deﬁned by selecting a key pms←${0,1}128 and en-
+crypting pms using the RSA public key with RSA-
+PKCS#1.5 encryption; Decap performs decryption
+with the corresponding RSA secret key. The shared
+secret is k ← KDF(pms,⊥,“ANTP”,len).
+• Static-ephemeral elliptic curve Difﬁe–Hellman: Let
+P be the generator (base point) of the NIST-P256
+elliptic curve group of prime order q. In KeyGen,
+the secret key is sk←$ Zq and the public key is
+pk = sk · P, where · denotes scalar–point multi-
+In Encap, select r←$ Zq and compute
+plication.
+c ← r · P and pms ← X(r · pk), where X(Q) gives
+the x-coordinate of elliptic curve point Q. In Decap,
+compute pms ← X(sk· c). The shared secret is k ←
+KDF(pms,⊥,“ANTP”(cid:25)c,len). This is the ECIES-
+KEM [29] which is IND-CCA secure under the el-
+
+2Our implementation code and benchmarking tools can be found at
+
+https://github.com/DowlingBJ/AuthenticatedNTP.
+
+USENIX Association  
+
+25th USENIX Security Symposium  831
+
+liptic curve discrete logarithm assumption in the ran-
+dom oracle model [8].
+
+We implemented ANTP by extending OpenNTPD ver-
+sion 1.92 [34]. Our implementation relies on OpenSSL
+version 1.0.2f [35] for its cryptographic components; no-
+tably, this version includes a high-speed assembly imple-
+mentation of the NIST P-256 curve; AES-GCM encryp-
+tion/decryption uses the AES-NI instruction.
+
+4.2 Performance
+
+Methodology. We collected performance measurements
+for each of the negotiation, key exchange, and time syn-
+chronization phases. We wanted to know the maximum
+number of connections per second that could be supported
+in each phase, as well as the latency a client would ex-
+perience for a typical server. For comparison we also
+collected performance measurements for unauthenticated
+NTP time synchronization phases.
+
+Our throughput and LAN latency experiments were
+carried out in the following environment on our local area
+network. We had two machines acting as clients, and
+a single server machine running ANTP. The server had
+an Intel Core i7-4770 (Haswell) processor with 4 cores
+running at 3.4 GHz with 15.6 GiB of RAM; we used two
+similar client machines, which in our experiments were
+always sufﬁcient to saturate the server. The clients and
+server were connected over an isolated 1 gigabit LAN.
+The server was running Linux Mint 17.2 with no other
+software installed.
+
+Our latency experiments across the US were carried
+out between two Amazon AWS m4.2xlarge instances,
+the server in the US East (N. Virginia) region and the
+client in the US West 1 (N. California) region. These
+instances each had eight virtual CPUs, each of which
+was an Intel Xeon E5-2676 v3 (Haswell) core running at
+2.4 GHz, with 32 GiB of RAM, and 1 Gbps of dedicated
+bandwidth; the instances were running Ubuntu 14.04 with
+no other software installed.
+
+It is important to note that OpenNTPD is not multi-
+threaded, so the OpenNTPD server process runs on a
+single core, regardless of the number of cores on the
+machine. As the key exchange phase is CPU bound, in a
+threaded server implementation we expect key exchange
+phase throughput to increase linearly with the number of
+CPU cores until bandwidth is saturated.
+
+For testing throughput (connections/second), we used
+our own multi-threaded UDP ﬂooding benchmarking tool
+that sends static packets and collects the number of re-
+sponses, the average latency of those responses, and the
+number of dropped packets. We tuned the number of
+queries per second to ensure that the server’s (single) core
+had around 95% utilization, and that more client packets
+were sent than being processed, but not so many more that
+
+performance became degraded (i.e., the server dropped
+less than 1% of packets being received per second).
+
+For testing individual phase latency, we again used our
+UDP benchmarking tool, this time measuring latency of
+a subset of connections while maintaining a particular
+background ANTP load at the server (either 50% or 90%
+of supported throughput), to measure the latency a client
+would experience at an unloaded or loaded server.
+
+For testing total protocol runtime, we instrumented
+the OpenNTPD client to report the runtime of a single
+complete (all three phases) ANTP synchronization, again
+with background ANTP load as above.
+Results – individual phases.
+
+Table 1 shows the results of each phase. Results re-
+ported are the average of 5 trials to prevent outlier results.
+For throughput and individual phase latency, each trial
+was run for 100 seconds. For throughput, Table 1 reports
+the number of response packets received at the client
+machine.
+
+Negotiation phases. The lower throughput of RSA and
+ECDH negotiation messages (compared to NTP) is due
+to larger message size of ANTP messages, as network
+bandwidth was saturated for this measurement. Latency
+for ECDH negotiation at 90% load is higher compared to
+RSA negotiation at 90% load; at that load level, a much
+larger number of ECDH packets are being sent than RSA
+packets, so CPU load in the ECDH is higher even though
+they have the same bandwidth consumption, leading to
+higher latency for ECDH negotiation.
+
+Key exchange phases. As expected, server key ex-
+change throughput is higher when ECC is used for pub-
+lic key operations compared to RSA. This difference is
+explained by the relative costs of the underlying crypto-
+graphic operations: using OpenSSL’s speed command
+for benchmarking individual crypto operations, the run-
+time of ECC NIST P-256 point multiplication is 8.62×
+faster than RSA 2048 private key operations, whereas we
+observe a 7.54× improvement in throughput for ANTP’s
+ECDH key exchange over ANTP’s RSA key exchange.
+Latency on the local network for RSA key exchange is
+approximately 2.9× that of ECDH key exchange at 90%
+load.
+Time synchronization phases. While ANTP time syn-
+chronization phases are more computationally intensive
+than unauthenticated NTP, throughput is reduced by only
+a factor of approximately 1.6. Since this phase is CPU
+bound, we expect a multi-threaded server implementation
+to increase ANTP throughput. Latency increase on the
+local network for ANTP at 50% load is only about 14%
+and at 90% load is about 27%.
+Results and extrapolation – all 3 phases. Since each
+client makes a full 3-phase time synchronization (negoti-
+ation, followed by key exchange, followed by time syn-
+chronization) relatively infrequently, it does not make
+
+832  25th USENIX Security Symposium 
+
+USENIX Association
+
+sense to measure server throughput for complete 3-phase
+time synchronizations. We did measure latency of a 3-
+phase time synchronization to note the performance that
+a client would perceive on its initial synchronization. As
+expected, the total runtime of a client exceeds the sum of
+the latencies from each individual phase due to the client
+performing its own cryptographic operations.
+
+It is interesting to note that latency slows as the server
+approaches load capacity. Future work on OpenNTPD
+and other NTP servers could include optimizations to re-
+duce latency and improve time synchronization accuracy
+under increasing load.
+
+We can extrapolate from the individual phase results
+the client pool that ANTP could feasibly support running
+on the same hardware. For example, Windows by de-
+fault polls time servers every 9 hours [13]. Assuming
+this is true for all clients (and that the clients synchronize
+uniformly across the period) 175,644 time synchroniza-
+tion requests per second would correspond to a pool of
+5,755,502,592 clients.
+
+ANTP clients would choose how often to restart the ne-
+gotiation phase and we recommend doing so periodically
+to ensure the attack window from exposure of the symmet-
+ric key is limited. If keys are re-exchanged monthly, this is
+a ratio of 1:1:1440 for expected negotiation, key exchange,
+and time synchronization messages, which increases to
+1:1:8640 if clients re-exchanged every 6 months. From
+these or other expected ratios, one could extrapolate the
+expected performance impact of using ANTP over NTP.
+
+5 Security Framework
+
+In this section we introduce our new time synchronization
+provable security framework for analyzing time synchro-
+nization protocols such as ANTP, NTP, and the Precision
+Time Protocol. It builds on both the Bellare–Rogaway
+model [5] for authenticated key exchange and the Jager
+et al. framework for authenticated and conﬁdential chan-
+nel establishment [11]. Neither of those models however
+includes time.
+
+Our framework models time as a counter that each
+party separately maintains, as the goal of the protocol is
+to synchronize these disparate counters. Additionally, the
+adversary in our execution environment has the ability to
+initialize each protocol run with a new time counter in-
+dependent of the party’s own counter, and controls when
+protocol runs can increment their counter, effectively giv-
+ing the adversary complete control of both the latency of
+the network and the computation time of the parties.
+
+5.1 Execution Environment
+There are np parties P1, . . . ,Pnp, each of whom is a proto-
+col participant. Each party generates a long-term key-pair
+
+i . Note that each session πs
+
+(ski, pki), and can run up to ns instances of the protocol
+which are referred to as sessions. We denote the sth ses-
+sion of a party Pi as πs
+i has
+access to the long-term key pair of the party Pi. In ad-
+dition, we denote with T and Tc the full transcript and
+server-session maintained client transcript Tc.
+Per-Session Variables.
+maintained by each session:
+
+The following variables are
+
+ner.
+
+• ρ ∈ {client, server}: the role of the party.
+• id ∈ {1, ...,np}: the identity of the party.
+• pid ∈ {1, . . . ,n p}: the believed identity of the part-
+• α ∈ {accept, reject, in-progress}: the session
+status.
+• k ∈ {0,1}128: the session key.
+• Tc ∈ {{0,1}∗, /0}: if ρ = server, the transcript of
+client messages, otherwise Tc = /0.
+• T ∈ {0,1}∗: the transcript of messages sent and re-
+• time ∈ N: a counter maintained by the session.
+
+ceived.
+
+Adversary Interaction. The adversary schedules and
+controls all interactions between protocol participants.
+The adversary has control of all communication, able to
+create, delete, reorder or modify messages at will. The
+adversary can compromise long-term and session keys.
+Additionally, the adversary is able to set the clock of
+a party to an arbitrary time when a session begins and
+control the rate at which time progresses during the exe-
+cution of a session. The following queries model normal
+execution with adversary control of time:
+
+• Create(i,r,t): The adversary activates a new session
+i .time = t.
+i responds with
+
+with party Pi, initializing πs
+Note that if πs
+i .ρ = client, then πs
+the ﬁrst message of the protocol run.
+
+i .ρ = r and πs
+
+• Send(i,s,m,(cid:29)∆): The adversary sends a message m
+to a session πs
+i . Party Pi processes the message m
+and responds according to protocol speciﬁcation,
+updating per-session variables and outputting some
+message m∗ if necessary. During message process-
+ing, the party may execute multiple calls to a dis-
+tinguished Now() procedure, modelling the party
+reading its current time from memory; immediately
+before the (cid:28)th such call to the Now() procedure, the
+session’s πs
+
+i .time variable is incremented by ∆(cid:28).
+
+These queries model compromise of secret data:
+
+k of the session πs
+i .
+
+• Reveal(i,s): The adversary receives the session key
+• Corrupt(i): The adversary receives the long-term
+The following query allows additional adversary control
+of the clock:
+
+secret-key ski of the party Pi.
+
+USENIX Association  
+
+25th USENIX Security Symposium  833
+
+πs
+i .time by ∆.
+
+• Tick(i,s,∆): The adversary increments the counter
+The vector (cid:29)∆ in Send is necessary due to subtleties
+in the security framework: An adversary cannot issue
+Tick queries to a session during the processing of a Send
+query, but a party may read its clock multiple times while
+processing a message and thus expect to receive differ-
+ent clock times. The vector (cid:29)∆ in the Send query allows
+adversary control of this clock rate.
+
+Note that our model assumes that during execution
+of a session, the clocks between two parties advance at
+the same rate, otherwise it does not make sense for two
+parties to try to synchronize their clocks at all. This im-
+plicitly assumes that the parties are in the same reference
+frame. Additionally, while computer clocks may progress
+at different rates, we are assuming that, over a relatively
+short period of time, like the few seconds for an execu-
+tion of the protocol, the difference in clock rate will be
+negligible. This will be formalized in Deﬁnitions 3 and
+4 with the condition that the adversary advances the time
+i=1 ∆l)
+of matching sessions symmetrically: a Tick( j,t,∑(cid:28)
+must be issued if session πt
+i exists when
+Send(i,s,m,(cid:29)∆) is issued.
+Security Experiment. The time synchronization secu-
+rity experiment is played between a challenger C who
+implements all np parties according to the execution en-
+vironment and protocol speciﬁcation, and an adversary
+A. After the challenger generates the long-term key pairs,
+the adversary receives the list of public keys and interacts
+with the challenger using the queries described above.
+Eventually the adversary terminates.
+
+j matching πs
+
+i such that πt
+
+j.time| > δ , (where πt
+
+5.2 Security Deﬁnitions
+The goal of the adversary, formalized in this section, is to
+break time synchronization security by causing any client
+session to complete a session with a time counter such that
+|πs
+i .time− πt
+j is the partner of the
+session πs
+j.id = πs
+i .pid, and δ is an accuracy
+margin) or cause a session πs
+i to accept a protocol run
+without having a matching session πt
+j. The adversary
+controls the initialization of the party’s clock in each
+session, and the rate at which the clock advances during
+each session, with the restriction that during execution
+of a session the adversary must advance the party and its
+peer at the same rate.
+
+5.2.1 Matching Conversations and Authentication
+Authentication is deﬁned similarly to the approach of Bel-
+lare and Rogaway [5], by use of matching conversations.
+We use the variant of matching conversations employed
+by Jager et al. [11], and modify the deﬁnition to reﬂect
+client authentication of stateless servers.
+
+j if πs
+
+Deﬁnition 1 (Matching Conversations). We say a session
+πs
+i matches a session πt
+i .T preﬁx-
+matches πt
+j.T . For two transcripts T and T(cid:25), we say that
+T is a preﬁx of T(cid:25) if |T| (cid:26)= 0 and T(cid:25) is identical to T for
+the ﬁrst |T| messages in T(cid:25). Two transcripts T and T(cid:25)
+preﬁx-match if T is a preﬁx of T(cid:25), or T(cid:25) is a preﬁx of T .
+
+i .ρ (cid:26)= πt
+
+j.ρ and πs
+
+Preﬁx-matching prevents an adversary from trivially
+winning the experiment by dropping the last protocol
+message after a session has accepted. Note that since
+our focus is clients authenticating stateless servers, our
+authentication deﬁnition is one-sided.
+
+i accepts maliciously if:
+
+i .α = accept;
+i .ρ = client;
+
+Deﬁnition 2 (Stateless Server Authentication). We say
+that a session πs
+• πs
+• πs
+• no Reveal(i,s) or Reveal( j,t) queries were issued
+before πs
+• no Reveal( j,t(cid:25)) queries were issued before πs
+i .α ←
+accept and πt(cid:25)
+• no Corrupt( j) query was ever issued before πs
+i .α ←
+accept, where j = πs
+but there exists no session πt
+i matches πt
+j.
+
+i .α ← accept and πt
+
+i .pid;
+j such that πs
+
+j matches πs
+i ;
+
+j .Tc = πt
+
+j.Tc;
+
+We deﬁne Advauth
+
+any session πs
+accept maliciously.
+
+T (A) as the probability of A forcing
+i of time synchronization protocol T to
+
+In the above deﬁnition, the ﬁrst Reveal condition pre-
+vents A from trivially winning the experiment by access-
+ing the session key of the Test session. Similarly the
+Corrupt condition prevents A from trivially winning by
+decrypting the premaster secret with the session partner’s
+public key. The possibility exists for an adversary to triv-
+ially win the experiment by replaying client messages to
+a second session and querying the second session with
+Reveal. Disallowing Reveal queries in general is clearly
+too restrictive, so we prevent this in the second Reveal
+condition by disallowing Reveal queries to server sessions
+with matching client transcripts.
+
+5.2.2 Correct and Secure Time Synchronization
+The goal of a time synchronization protocol is to ensure
+that the difference between the two parties’ clocks is
+within a speciﬁed bound. A protocol is δ -correct if that
+difference can be bounded in honest executions of the
+protocol, and δ -accurate secure if that difference can be
+bounded even in the presence of an adversary.
+Deﬁnition 3 (δ -Correctness). A protocol T satisﬁes δ -
+correctness if, in the presence of a passive adversary that
+faithfully delivers all messages and increments in each
+partner session symmetrically, then the client and server’s
+
+834  25th USENIX Security Symposium 
+
+USENIX Association
+
+i .α = accept;
+i .ρ = client;
+
+clocks are within δ of each other. More precisely, in the
+presence of a passive adversary, for all sessions πs
+i where
+• πs
+• πs
+Send(i,s,m,(cid:29)∆)
+• whenever A queries
+Send( j,t,m(cid:29), (cid:29)∆(cid:29)), A also queries Tick( j,t,∑(cid:28)
+or Tick(i,s,∑(cid:28)
+
+i=1 ∆(cid:29)(cid:28)), respectively; and
+
+or
+i=1 ∆(cid:28))
+
+• whenever A queries Tick(i,s,∆), or Tick( j,t,∆(cid:29)),
+A also queries Tick( j,t,∆) or Tick( j,t,∆(cid:29)), respec-
+tively;
+
+i .time− πt
+
+j.time| ≤ δ .
+
+i with partner id πs
+
+i .α = accept;
+i .ρ = client
+
+we must also have that |πs
+Deﬁnition 4 (δ -Accurate Secure Time Synchronization).
+We say that an adversary A breaks the δ -accuracy of a
+time synchronization protocol if when A terminates, there
+exists a session πs
+i .pid = j such that:
+• πs
+• πs
+• A made no Corrupt( j) query before πs
+i .α ←
+accept;
+• A made no Reveal(i,s) or Reveal( j,t) query before
+πs
+i .α ← accept and πt
+• while πs
+i .α = in-progress and A queried
+(where πs
+Send(i,s,m,(cid:29)∆) or Send( j,t,m(cid:29), (cid:29)∆(cid:29))
+i
+matches πt
+i=1 ∆(cid:28))
+j), then A also queried Tick( j,t,∑(cid:28)
+or Tick(i,s,∑∆
+• while πs
+i .α = in-progress and A queried
+i matches πt
+Tick(i,s,∆), or Tick( j,t,∆(cid:29)) (where πs
+j),
+then A also queried Tick( j,t,∆) or Tick(i,s,∆(cid:29)), re-
+spectively; and
+i .time− πt
+• |πs
+The probability an adversary A has in breaking δ -
+accuracy of a time synchronization protocol T is denoted
+Advtime
+
+i=1 ∆(cid:29)(cid:28)), respectively;
+
+j.time| > δ .
+
+j matches πs
+i ;
+
+T ,δ (A).
+
+5.3 Multi-Phase Protocols
+Our construction in Section 3 has a single run of the ne-
+gotiation and key exchange phases, followed by multiple
+time synchronization executions reusing the negotiated
+cryptographic algorithms and shared secret key. To model
+the security of such multi-phase time synchronization pro-
+tocols, we further extend our framework so that a single
+session can include multiple time synchronization phases.
+The differences from the model described in the previous
+section are detailed below.
+Per-Session Variables.
+added or changed:
+
+The following variables are
+
+• n ∈ N: the number of time synchronization phases
+
+allowed in this session.
+
+conclusion of phase p.
+
+• timep, for p ∈ {1, . . . ,n}: the time recorded at the
+• α ∈ {acceptp, rejectp, in-progressp}, for p ∈
+{1, . . . ,n}: the status of the session. Note that, when
+phase p concludes and α ← acceptp is set, the party
+also sets timep ← time.
+Adversary Interaction. The adversary can direct the
+client to run an additional time synchronization phase
+with a new Resync query, and the client will respond
+according the protocol speciﬁcation. The Create query in
+this setting is also changed:
+
+also sets πs
+
+i .n ← n.
+
+• Create(i,r,t,n): Proceeds as for Create(i,r,t), and
+• Resync(i,s,(cid:29)∆) - The adversary indicates to a ses-
+sion πs
+i to begin the next time synchronization phase.
+Party Pi responds according to protocol speciﬁca-
+tion, updating per-session variables and outputting
+some message m∗ if necessary. During message
+processing, immediately before the (cid:28)th call to the
+Now() procedure, the session’s πs
+i .time variable is
+incremented by ∆(cid:28).
+
+The goal of the adversary is also slightly different to ac-
+count for the possibility of breaking time synchronization
+of any given time synchronization phase: the adversary’s
+goal is to cause a client session to have any phase where
+its time is desynchronized from the server’s. In partic-
+ular, for there to be some client instance πs
+i and some
+phase p such that |πs
+j is
+the partner of session πs
+i . Again the adversary in general
+controls clock ticks and can tick parties at different rates,
+however must tick clocks at the same rate when phases
+have switched back to being in-progress.
+
+j.timep| > δ where πt
+
+i .timep − πt
+
+i .pid = j such that:
+
+Deﬁnition 5 (δ -Accurate Secure Multi-Phase Time Syn-
+chronization). We say that an adversary A breaks the
+δ -accuracy of a multi-phase time synchronization proto-
+col if when A terminates, there exists a phase p session
+πs
+i with partner id πs
+• πs
+i .ρ = client
+• πs
+i .α = acceptq for some q ≥ p;
+• A did not make a Corrupt( j) query before πs
+i .α ←
+acceptp was set;
+• A did not make a Reveal(i,s) or Reveal( j,t) query
+i .α ← acceptp was set and πt
+before πs
+j matches πs
+i ;
+• while πs
+i .α = in-progress and A queried
+Send(i,s,m,(cid:29)∆) or Send( j,t,m(cid:29), (cid:29)∆(cid:29)),
+then A also
+i=1 ∆(cid:29)(cid:28)), re-
+queried Tick( j,t,∑(cid:28)
+spectively;
+• while πs
+i .α = in-progress and A queried
+Tick(i,s,∆), or Tick( j,t,∆(cid:29)), then A also queried
+Tick( j,t,∆) or Tick(i,s,∆(cid:29)), respectively; and
+• |πs
+i .timep − πt
+
+i=1 ∆(cid:28)) or Tick(i,s,∑(cid:28)
+
+j.timep| > δ .
+
+USENIX Association  
+
+25th USENIX Security Symposium  835
+
+The probability an adversary A has in breaking δ -
+accuracy of multi-phase time synchronization protocol
+T is denoted Advmulti-time
+6 Security of ANTP
+
+(A).
+
+T ,δ
+
+Here we present ANTP correctness and security theorems.
+
+6.1 Correctness
+Theorem 1 (Correctness of ANTP). Fix E ∈ N. ANTPE
+is an E-correct time synchronization protocol as deﬁned
+in Deﬁnition 3.
+
+Proof. When analyzing ANTP in terms of correctness,
+we can restrict analysis to data that enters the clock-update
+procedure as input, as the rest of the protocol is designed
+to ensure authentication and does not inﬂuence the ses-
+sion’s time counter. This allows us to narrow our focus to
+SNTP, which is the time synchronization core of ANTP.
+We ﬁrst focus on a single time synchronization phase.
+At the beginning of the time synchronization phase of
+ANTP, the client will send an NTP request (req) which
+contains t1, the time the client sent req. Note that the
+adversary is restricted to delivering the messages faith-
+fully as a passive adversary, and also must increment the
+time of each protocol participant symmetrically. The ad-
+versary otherwise has complete control over the passage
+of time. Thus θ1, θ2, θ3 are non-negative but otherwise
+arbitrary values selected by the adversary (where θ1 is
+the propagation time from client to server, θ2 is server
+processing time and θ3 is propagation time from server
+to client). Thus the client computes the round-trip time
+of the protocol as: RTT = (t4 − t1)− (t3 − t2) =θ 1 + θ3
+and approximates the server-to-client propagation time as
+˜θ3 = 1
+
+2 (θ1 + θ3).
+
+When the client-to-server and server-to-client propa-
+gation times are equal (θ1 = θ3) then ˜θ3 = θ3, and the
+values t3 and t2 allow the client to exactly account for θ2.
+The time counter is updated by time +offset = t3 + ˜θ3−t4,
+and upon completion the client’s clock is exactly synchro-
+nized with the server’s clock.
+When θ1 (cid:27)= θ3, we have that θ3 − ˜θ3 = 1
+2 (θ3 − θ1),
+so the statistics t1, ..., t4 do not allow the client to ex-
+actly account for client-to-server propagation time θ3;
+the client’s updated time may be off by up to 1
+2 (θ3 − θ1).
+Fortunately, we can bound this value by E: we know
+that 1
+2 (θ1 + θ3), and furthermore we know
+that ANTPE will only accept time synchronization when
+1
+2 (θ1 + θ3) ≤ E, so in sessions that accept (assuming a
+passive adversary) we have that the client’s clock is at
+most 1
+2 (θ3 − θ1) ≤ E different from the server’s clock.
+Now moving to the multi-phase setting, we note that
+this analysis of the correctness of ANTP applies to each
+
+2 (θ3 − θ1) ≤ 1
+
+separate time synchronization phase: since the client’s
+(t1,t4) values are only used to calculate the total round-
+trip time of the time synchronization phase, thus if the
+rate-of-time for both client and server during the phase is
+the same, each phase is also E-accurate in the presence
+of a passive adversary, even if the adversary dramatically
+changes the rate-of-time for partners between time syn-
+chronization phases.
+
+6.2 Security
+Security of a single 3-phase execution of ANTP in the
+sense of Deﬁnition 4 is given by Theorem 2 below. Secu-
+rity of multiple phases in the sense of Deﬁnition 5 follows
+with a straightforward adaptation.
+
+Intuitively, the bound on the possible error that an A
+can introduce without altering packets is as in Section 3.
+It follows then that if all messages are securely authenti-
+cated, and the only inputs to the clock-update procedure
+are either: authenticated via messages, or the round trip
+delay RTT; then any attacker can only introduce at most E
+error into the clock-update procedure (where E ≥ RTT).
+Theorem 2 (Security of ANTP). Fix E ∈ N and let λ be
+the length of the nonces in m1 and m5 (in our instantiation,
+λ = 256). Assuming the key encapsulation mechanism
+KEM (with keyspace KEM.K) is IND-CCA-secure, the
+message authentication code MAC is EUF-CMA-secure,
+the hash function Hash is collision-resistant, and the key
+derivation function KDF and authenticated encryption
+scheme AE are secure, then ANTPE is a E-accurate se-
+cure time synchronization protocol as in Deﬁnition 4. In
+particular, there exist algorithms B3, . . . ,B 8, described in
+the proof of the theorem, such that, for all adversaries A,
+we have
+
+Advtime
+
+ANTPE ,E (A) ≤
+
+s(cid:31)Advcoll
+n2
+pn2
+s
+pn2
+2λ−2 + n2
+Hash(BA3 )
+(BA4 ) +Adv ind-cca
++ Advauth-enc
+AE
+KDF(BA6 ) +Adv auth-enc
++ Advkdf
+MAC (BA8 )(cid:30)
++ Adveuf-cma
+where np and ns are the number of parties and sessions
+created by A during the experiment.
+
+KEM (BA5 )
+(BA7 )
+
+AE
+
+AE
+
+(A), Advind-cca
+
+KEM (A), Advcoll
+
+The standard deﬁnitions for security of the un-
+derlying primitives and the corresponding advantages
+Advauth-enc
+Hash(A), Adveuf-cma
+(A), and Advkdf
+KDF(A) are given in the full version [6].
+Proof. From Theorem 1, ANTPE is an E-correct time
+synchronization protocol in the sense of Deﬁnition 3.
+Thus all passive adversaries have probability 0 of break-
+ing E-accuracy of ANTPE. If we show that the advantage
+
+MAC
+
+836  25th USENIX Security Symposium 
+
+USENIX Association
+
+Advauth
+ANTPE (A) of any adversary A of breaking authentica-
+tion security (i.e., to accept without session matching) of
+ANTPE is small, then it follows that the advantage of any
+active adversary A in breaking E-accuracy of ANTPE is
+similarly small. In other words, it immediately is the case
+that Advtime
+
+ANTPE ,E (A) ≤ Advauth
+
+ANTPE (A).
+We now focus on bounding Advauth
+
+ANTPE (A) = Pr(break0).
+
+ANTPE (A). In order to
+show that an active adversary has negligible probability
+in breaking ANTPE authentication, we use a proof struc-
+tured as a sequence of games. We let Pr(breaki) denote
+the probability that the adversary causes some session to
+accept maliciously in game i. We iteratively change the
+security experiment, and demonstrate that the changes
+are either failure events with negligible probability of
+occurring or that if the changes are distinguishable we
+can construct an adversary capable of breaking an un-
+derlying cryptographic assumption. Since the client will
+only accept synchronization if all three phases are prop-
+erly authenticated, the advantage of an active adversary is
+negligible given our cryptographic assumptions.
+Game 0. This is the original time synchronization game
+described in § 4: Advauth
+Game 1.
+In this game, we abort the simulation if
+any nonce is used in two different sessions by client
+instances. There are at most 2nsnp nonces used by
+client instances, each λ bits. The probability that a
+collision occurs among these values is (2nsnp)2/2λ , so:
+Pr(break0) ≤ Pr(break1) +
+Game 2. Here, we guess the ﬁrst client session to accept
+maliciously, aborting if incorrect. We select randomly
+from two indices (i,s)←${1, . . . ,n p} × {1, . . . ,n s} and
+abort if πs
+i is not the ﬁrst session to accept maliciously.
+Now the challenger responds to Reveal(i,s) queries (if
+πs
+i .α = accept) by aborting the game, as it follows that
+the guessed session cannot accept maliciously. There are
+at most npns client sessions, and we guess the ﬁrst session
+to accept maliciously with probability at least 1/npns, so
+Pr(break1) ≤ npns Pr(break2).
+Game 3.
+Here we guess the partner session to
+πs
+i , by selecting from two indices ( j,t)←${1, . . . ,n p}×
+{1, . . . ,n s} and abort if πt
+j is not the partner session to πs
+i .
+Now, the challenger answers Corrupt( j) and Reveal( j,t)
+queries before πs
+i .α ← accept by aborting the game, as it
+follows that the guessed session cannot accept maliciously.
+There are at most npns server sessions, and we guess the
+partner of the ﬁrst session to accept maliciously with prob-
+ability at least 1/npns, so Pr(break2) ≤ npns Pr(break3).
+Game 4.
+Here we abort if a hash collision occurs,
+by computing all hash values honestly and aborting if
+there exists two evaluations (in, Hash(in)), ( ˆin, Hash( ˆin))
+such that in (cid:23)= ˆin but Hash(in) = Hash( ˆin). The simula-
+tor interacts with a Hash-collision challenger, outputting
+
+n2
+s n2
+p
+2λ−2 .
+
+Hash(BA3 ).
+
+the collision if found. Thus: Pr(break3) ≤ Pr(break4) +
+Advcoll
+In this game, we abort if in server session πt
+Game 5.
+j
+the ciphertext received in m3 is not equal to the ciphertext
+sent in m1 but the output of AuthDecs is not ⊥.
+We construct an algorithm BA4 that simulates Game
+4 identically, except to interact with an AE challenger
+in the following way: When Pj needs to run AuthEnc
+or AuthDec, BA4 uses its oracles to compute the required
+value. In server session πt
+j, when BA4 receives a ciphertext
+in m3 that was not equal to the ciphertext sent in m1 but the
+output of the AuthDec oracle is not ⊥, this corresponds to
+a ciphertext forgery, and thus: Pr(break4) ≤ Pr(break5) +
+Advauth-enc
+Game 6.
+j compute
+the session key k by applying KDF to a random secret
+pms(cid:20) ←$ KEM.K, rather than the pms that was encapsu-
+lated using KEM.Encap and transmitted in ciphertext e.
+Any algorithm used to distinguish Game 5 from Game 6
+can be used to construct an algorithm capable of distin-
+guishing KEM encrypted values via plaintext, thus break-
+ing IND-CCA security of the key encapsulation mecha-
+nism.
+
+(BA4 ).
+In this game, sessions πs
+
+i and πt
+
+AE
+
+We construct a simulator BA5 that interacts with a KEM
+challenger. BA5 activates party Pj with the public key pk
+received from the challenger. BA5 responds identically to
+queries from A as in Game 5, except as follows:
+• BA5 computes the KEM ciphertext e for the session
+πs
+i by obtaining a challenge (e, pms) from its KEM
+challenger.
+• BA5 computes πs
+• In any Pj session where m3 contains the challenge
+ciphertext above, BA5 computes the session key as
+k ← KDF(pms, . . .).
+• In any other Pj session where m3 does not contain
+the challenge ciphertext above, BA5 queries the ci-
+phertext to its Decap oracle to obtain the premaster
+secret and uses that as its input to KDF to compute
+the session key k.
+
+i .k ← KDF(pms, . . .)
+
+cause of Game 3.
+
+• BA5 never needs to answer a Corrupt( j) query be-
+When the random bit b sampled by the KEM ind-cca chal-
+lenger is 0, pms is truly the decapsulation of the ciphertext
+e, in which case BA5 perfectly simulates of Game 5. When
+b = 1, pms is random and independent of e, in which case
+BA5 perfectly simulates Game 6. Observe that BA5 never
+asks the challenge ciphertext e to its decapsulation oracle.
+An adversary capable of distinguishing Game 5 from
+Game 6 can therefore be used to break IND-CCA security
+of KEM, so Pr(break5) ≤ Pr(break6) +Adv ind-cca
+KEM (BA5 ).
+Game 7.
+In this game, we replace the secret key k in
+sessions πs
+i and πt
+j with a uniformly random value k(cid:20) from
+
+USENIX Association  
+
+25th USENIX Security Symposium  837
+
+j.k = πs
+
+KDF(BA6 ).
+
+{0,1}lKDF where lKDF is the length of the KDF output, in-
+stead of being computed honestly via k ← KDF(pms, . . .).
+In Game 6, we replaced the premaster secret value
+pms with a uniformly random value from KEM.K. Thus,
+any algorithm that can distinguish Game 6 from Game
+7 can distinguish the output of KDF from random. We
+explicitly construct such a simulator BA6 that interacts
+with a KDF challenger, and proceeds identically to Game
+6, except: when computing k for πs
+i , BA6 queries the KDF
+challenger with pms; and when computing k for πt
+j, BA6
+sets πt
+i .k. When the random bit b sampled by
+the KDF challenger is 0, k = KDF(pms, . . .), and BA6
+provides a perfect simulation of Game 6. When b = 1,
+k←${0,1}lKDF and BA6 provides a perfect simulation of
+Game 7.
+An adversary capable of distinguishing Game 6 from
+Game 7 can therefore distinguish the output of KDF from
+random, so Pr(break6) ≤ Pr(break7) +Adv kdf
+Game 8. In this game, in session πt
+j we replace the con-
+tents of the ciphertext C2 sent in m3 with a random string
+of the same length, and abort if the ciphertext received in
+m5 is not equal to the ciphertext sent in m3 but the output
+of the AuthDecs algorithm is not ⊥.
+We construct an algorithm BA7
+that interacts with
+an AE challenger in the following way: BA7 acts ex-
+actly as in game 7 except for sessions run by party Pj.
+In session πt
+j, for the computation of C2, BA7 picks a
+uniformly random binary string z(cid:24) of length equal to
+z = k(cid:23)KDF(cid:23)Hash(cid:23)KEM(cid:23)MAC and submits (z,z(cid:24)) to its
+AuthEnc oracle. For all other computations that Pj in-
+volving AuthEncs or AuthDecs, BA7 submits the query its
+respective AuthEnc or AuthDec oracle.
+When the random bit b sampled by the AE challenger
+is 0, C2 contains the encryption of z, so BA7 provides a
+perfect simulation of Game 7. When b = 1, C2 contains
+the encryption of z(cid:24), so BA7 provides a perfect simula-
+tion of Game 8. An adversary capable of distinguish-
+ing Game 7 from Game 8 can therefore break the con-
+ﬁdentiality of AE and guess b. Additionally, if BA7 re-
+ceives a ciphertext in m5 that was not equal to the ci-
+phertext sent in m3 but the output of the AuthDec or-
+acle is not ⊥, this corresponds to a ciphertext forgery,
+and thus BA7 has broken the integrity of AE. Thus,
+Pr(break7) ≤ Pr(break8) +Adv auth-enc
+The effect of Game 8 is that, in the target session and
+its partner, the key used in the MAC computations is
+independent of the values transmitted.
+Game 9. In this game, we abort when the session πs
+i ac-
+cepts maliciously. We do this by constructing a simulator
+BA8 that interacts with the MAC challenger, but computes
+τ1 and τ2 for πt
+j by querying h(cid:23)m3(cid:23)C2 and m5(cid:23)t1(cid:23)t2(cid:23)t3
+to the MAC challenger. BA8 veriﬁes MAC tags for πs∗
+i∗
+by again querying h(cid:23)m3(cid:23)C2 and m5(cid:23)t1(cid:23)t2(cid:23)t3 to the MAC
+
+(BA7 ).
+
+AE
+
+challenger and ensuring the MAC challenger’s output is
+equal to the tag to be veriﬁed. Note that now that the
+key k is substituted for the key maintained by the MAC
+challenger: k was already uniformly random and indepen-
+dent of the protocol run, and by Game 2 and Game 3, the
+simulator already responds to Reveal queries to πs
+i and πt
+j
+by aborting the security experiment. Thus these changes
+to the game are indistinguishable. When πs
+i .α ← accept,
+BA8 checks Pj to see if there is a matching session. Since
+by Game 1 all protocol ﬂows are unique (by unique
+nonces), if Pj has no matching session the adversary
+must have produced a valid MAC tag ˆτ1 or ˆτ2 such that
+MAC(k,h(cid:23)m3(cid:23)C2) = ˆτ1 or MAC(k,m5(cid:23)t1(cid:23)t2(cid:23)t3) = ˆτ2
+and (by Game 8) the key k is uniformly random. BA8 sub-
+mits the appropriate pair (h(cid:23)m3(cid:23)C2, ˆτ1), (m5(cid:23)t1(cid:23)t2(cid:23)t3, ˆτ2)
+to the MAC challenger and aborts. Thus, Pr(break8) ≤
+Pr(break9) +Adv euf-cma
+Analysis of Game 9. We now show that an active adver-
+sary has a probability negligibly close to 0 of forcing a
+client session πs∗
+
+i∗ to accept maliciously in Game 9.
+
+MAC (BA8 ).
+
+We brieﬂy summarize the changes in games.
+1. Nonces no longer collide for honest parties. Each
+i .T will have unique honest matching
+
+transcript πs
+session πt
+j.
+
+asked.
+
+2. Guess target session; C aborts if Reveal(i,s) query
+3. Guess partner session; C aborts if Corrupt( j) or
+4. Hash values no longer collide for honest parties.
+Note h is now unique for each negotiation phase,
+via Game 1.
+
+Reveal( j,t) query asked.
+
+5. C1 is not forged in session πt
+j.
+6. Replace premaster secret pms in target session πs
+i
+with a random value, rather than key encapsulated in
+KEM ciphertext e. Note k is unique and computed
+via shared secret data.
+
+7. Replace k with uniformly random data of same
+length when computing τ. Thus veriﬁcation of τ
+in Time Synchronization and Key Exchange phases
+is done via a uniformly random key, independent of
+the protocol run.
+
+8. C2 is not forged in session πt
+
+j and contains random
+
+data.
+
+i are not forged.
+
+9. MAC tags in session πs
+After all of the game changes, πs
+
+i is a target session
+where: no Reveal(i,s) or Reveal( j,t) queries were is-
+sued before πs
+i .α ← accept; no Corrupt( j) query was
+ever issued before πs
+i .pid = j;
+and πs
+i only accepts if τ1 = MAC(k,h(cid:23)m3(cid:23)C2) and τ2 =
+MAC(k,m5(cid:23)t1(cid:23)t2(cid:23)t3). By unforgeability these tags can-
+not be generated by A and by Game 1 the protocol ﬂow
+of each session is unique. τ1 and τ2 veriﬁcation will
+
+i .α ← accept, where πs
+
+838  25th USENIX Security Symposium 
+
+USENIX Association
+
+i .T = πt
+
+thus only occur if πs
+j.T , as τ1 is over all mes-
+sages in the negotiation and key exchange phase, and τ2
+is over all messages in the time synchronization phase
+and thus πs
+i .T .
+Thus, no client session accepts maliciously in Game 9:
+Pr(break9) =0.
+
+i will only accept if πt
+
+j.T preﬁx-matches πs
+
+Summing all of the probabilities yields the desired
+bound, showing that ANTPE is a E-accurate secure time
+synchronization protocol.
+
+6.3 Multi-Phase Security
+Multi-phase security of ANTPE can be established in a
+similar way to single-phase security as in the previous
+section, with minor changes to the games in the proof
+to enable guessing of the ﬁrst phase session to accept
+maliciously.
+Theorem 3 (Multi-Phase Security of ANTP). Fix E,n ∈
+N. Under the same assumptions as in Theorem 2, ANTPE
+is a E-accurate secure multi-phase time synchronization
+protocol as deﬁned in Deﬁnition 5. In particular, there
+exist algorithms B3, . . . ,B 8 described in the proof of The-
+orem 2, such that, for all adversaries A, we have that
+Advmulti-time
+
+ANTPE ,E (A) ≤
+
+s n(cid:31)Advcoll
+n2
+pn2
+s
+pn2
+2λ−2 + n2
+Hash(BA3 )
+(BA4 ) +Adv ind-cca
++ Advauth-enc
+AE
+KDF(BA6 ) +Adv auth-enc
++ Advkdf
+MAC (BA8 )(cid:30)
++ Adveuf-cma
+
+AE
+
+KEM (BA5 )
+(BA7 )
+
+where np, ns, n are the maximum number of parties, ses-
+sions and phases created by A during the experiment.
+Proof. The proof for Theorem 3 is identical to the proof
+to Theorem 2 except as follows.
+
+i matches πt
+
+A new game is inserted between Game 3 and Game
+4 that guesses the ﬁrst time synchronization phase p ∈
+{1, . . . ,n} that the target session πs
+i will accept mali-
+ciously: by Theorem 2, we know that a session πs
+i will
+not accept maliciously for time synchronization phase
+p = 1, so by this step we know that πs
+j up to
+and including phase p− 1.
+We also edit the ﬁnal game (MAC challenger) so that
+B aborts if πs
+i accepts maliciously in phase p. We do this
+by editing the ﬁnal game in the following way: When pro-
+cessing m5 for πt
+j in the guessed phase p (we indicate this
+with m5p) B will also compute τ2p by querying the MAC
+challenger with m5p(cid:24)t1p(cid:24)t2p(cid:24)t3p, and veriﬁes the τ2p for
+πs
+i by querying the MAC challenger with m5p(cid:24)t1p(cid:24)t2p(cid:24)t3p
+and accepting only if the output from the MAC challenger
+matches the τp in m6p. Following the same structure as
+the proof to Theorem 2, we have that k is a uniformly
+random key generated independently from the protocol
+
+run and this change is indistinguishable. Veriﬁcation of τ
+will only occur if πs
+j.T up to phase p, as τ1 is over
+all messages in the negotiation and key exchange phase,
+and τp is over all messages in phase p.
+
+i .T = πt
+
+7 Discussion
+
+In this work we introduced a new authenticated time syn-
+chronization protocol called ANTP, designed to securely
+synchronize the time of a client and server, using public
+key infrastructure. Our design allows a server to perform
+a single public key operation per client during the infre-
+quently performed key exchange phase, and then use only
+faster symmetric key operations for each subsequent time
+synchronization request from that client. This efﬁcient
+design means that the throughput of ANTP time syn-
+chronization phases is reduced by a factor of only 1.6×
+compared to NTP. Our protocol has been designed such
+that servers sharing the same long-term secret can han-
+dle different phases of the same client for load-balancing
+purposes. Furthermore, the server need not even store
+per-client state, instead securely ofﬂoading storage of that
+state to the client.
+
+ANTP is accompanied by a provable security analy-
+sis showing that it provides secure time synchronization
+within user-speciﬁed accuracy bounds. The analysis is
+carried out in a new provable security framework. A novel
+aspect of our new framework, when compared with the
+long line of work on authentication deﬁnitions, is that
+our framework models an adversary with the ability to
+control the ﬂow of time, meaning the adversary can initial-
+ize different parties’ clocks to different times, and even
+control the rate at which their clocks are advanced. The
+security framework can be used for the analysis of other
+time synchronization protocols such as the Network Time
+Security (NTS) protocol and the Precision Time Protocol
+(PTP).
+
+Several interesting open problems in the area of secure
+time synchronization remain. Since ANTP uses public
+keys, it inherits problems associated with public key in-
+frastructure, such as the dangers of certiﬁcate authority
+compromise. All existing time synchronization proto-
+cols that rely on public keys, including ours, need to
+initially validate the certiﬁcate of the time server, speciﬁ-
+cally that it is within its validity period. While nonces can
+be combined with OCSP responses to check freshness,
+this cannot completely solve the “ﬁrst-boot” problem. A
+detailed study of denial of service attacks against secure
+time synchronization protocols including ANTP would
+also be worthwhile, giving detailed consideration to both
+the cost of cryptographic operations in practice and the
+bandwidth ampliﬁcation afforded by directing protocol
+responses to a victim.
+
+USENIX Association  
+
+25th USENIX Security Symposium  839
+
+Acknowledgements
+We thank Gleb Sechenov at the Queensland University of
+Technology for assistance in setting up the network for
+the experiments. B.D. and D.S. were supported in part
+by Australian Research Council (ARC) Discovery Project
+grant DP130104304. Part of this work performed while
+B.D. was an intern at Microsoft Research and while D.S.
+was at QUT.
+
+References
+[1] IEEE Std 1588 for a Precision Clock Synchronization Protocol for
+Networked Measurement and Control Systems Networked Mea-
+surement and Control Systems. Tech. rep., IEEE Instrumentation
+and Measurement Society, 2008.
+
+[2] ADRIAN, D., BHARGAVAN, K., DURUMERIC, Z., GAUDRY, P.,
+GREEN, M., HALDERMAN, J. A., HENINGER, N., SPRINGALL,
+D., THOM ´E, E., VALENTA, L., VANDERSLOOT, B., WUSTROW,
+E., B ´EGUELIN, S. Z., AND ZIMMERMANN, P. Imperfect forward
+secrecy: How difﬁe-hellman fails in practice. In ACM CCS 15
+(Oct. 2015), I. Ray, N. Li, and C. Kruegel:, Eds., ACM Press,
+pp. 5–17.
+
+[3] APPELBAUM, J.
+
+ioerror/tlsdate.
+
+tlsdate, 2015.
+
+https://github.com/
+
+[4] BASIN, D., CAPKUN, S., SCHALLER, P., AND SCHMIDT, B.
+Formal reasoning about physical properties of security protocols.
+ACM Trans. Inf. Syst. Secur. 14, 2 (Sept. 2011), 16:1–16:28.
+
+[5] BELLARE, M., AND ROGAWAY, P. Random oracles are practical:
+A paradigm for designing efﬁcient protocols. In ACM CCS 93
+(Nov. 1993), V. Ashby, Ed., ACM Press, pp. 62–73.
+
+[6] DOWLING, B., STEBILA, D., AND ZAVERUCHA, G. Authenti-
+cated network time synchronization. Cryptology ePrint Archive,
+Report 2015/171, 2015. http://eprint.iacr.org/2015/
+171.
+
+[7] EVANS, C., PALMER, C., AND SLEEVI, R. Public Key Pinning
+Extension for HTTP. RFC 7469 (Proposed Standard), Apr. 2015.
+[8] GALINDO, D., MARTIN, S., AND VILLAR, J. L. Evaluating
+elliptic curve based KEMs in the light of pairings. Cryptology
+ePrint Archive, Report 2004/084, 2004. http://eprint.iacr.
+org/2004/084.
+
+[9] HEDRICK, C. Routing Information Protocol. RFC 1058 (Historic),
+
+June 1988.
+
+[10] HODGES, J., JACKSON, C., AND BARTH, A. HTTP Strict Trans-
+port Security (HSTS). RFC 6797 (Proposed Standard), Nov. 2012.
+[11] JAGER, T., KOHLAR, F., SCH ¨AGE, S., AND SCHWENK, J. On
+the security of TLS-DHE in the standard model. In CRYPTO 2012
+(Aug. 2012), R. Safavi-Naini and R. Canetti, Eds., vol. 7417 of
+LNCS, Springer, Heidelberg, pp. 273–293.
+
+[12] MALHOTRA, A., COHEN, I. E., BRAKKE, E., , AND GOLDBERG,
+S. Attacking the Network Time Protocol. In NDSS 2016 (Feb.
+2016), Internet Society.
+
+[13] MICROSOFT CORPORATION. Windows Time Service Tools
+and Settings. Microsoft Developer Network, May 2012. https:
+//msdn.microsoft.com/de-de/library/cc773263%28v=
+ws.10%29.aspx#w2k3tr_times_tools_uhlp.
+
+[14] MICROSOFT CORPORATION. [MS-W32T]: W32Time Remote
+Protocol. Microsoft Developer Network, May 2014. https:
+//msdn.microsoft.com/en-us/library/cc249627.aspx.
+[15] MILLS, D. Network Time Protocol (NTP). RFC 958, Sept. 1985.
+
+[16] MILLS, D. Network Time Protocol (version 2) speciﬁcation and
+
+implementation. RFC 1119 (Internet Standard), Sept. 1989.
+
+[17] MILLS, D. Network Time Protocol (Version 3) Speciﬁcation,
+Implementation and Analysis. RFC 1305 (Draft Standard), Mar.
+1992.
+
+[18] MILLS, D., MARTIN, J., BURBANK, J., AND KASCH, W. Net-
+work Time Protocol Version 4: Protocol and Algorithms Speciﬁ-
+cation. RFC 5905 (Proposed Standard), June 2010.
+
+[19] MILLS, D. L. On the accuracy and stablility of clocks synchro-
+nized by the network time protocol in the internet system. ACM
+SIGCOMM Computer Communication Review 20, 1 (1989), 65–
+75.
+
+[20] MIZRAHI, T. Security Requirements of Time Protocols in Packet
+
+Switched Networks. RFC 7384 (Informational), Oct. 2014.
+
+[21] NATIONAL INSTITUTE FOR STANDARDS AND TECHNOLOGY
+(NIST). The NIST Authenticated NTP Service. http://www.
+nist.gov/pml/div688/grp40/auth-ntp.cfm.
+
+[22] PERRIG, A., CANETTI, R., TYGAR, J., AND SONG, D. The
+TESLA broadcast authentication protocol. RSA CryptoBytes 5,
+Summer (2002).
+
+[23] R ¨OTTGER, S. Analysis of the NTP Autokey Protocol. Masters
+Thesis, Technische Universit¨at Braunschweig, Feb. 2012. http:
+//zero-entropy.de/autokey_analysis.pdf.
+
+[24] SALOWEY, J., ZHOU, H., ERONEN, P., AND TSCHOFENIG,
+H. Transport Layer Security (TLS) Session Resumption with-
+out Server-Side State. RFC 5077 (Proposed Standard), Jan. 2008.
+[25] SANTESSON, S., MYERS, M., ANKNEY, R., MALPANI, A.,
+GALPERIN, S., AND ADAMS, C. X.509 Internet Public Key
+Infrastructure Online Certiﬁcate Status Protocol - OCSP. RFC
+6960 (Proposed Standard), June 2013.
+
+[26] SCHNORR, C.-P. Efﬁcient identiﬁcation and signatures for smart
+cards. In CRYPTO’89 (Aug. 1990), G. Brassard, Ed., vol. 435 of
+LNCS, Springer, Heidelberg, pp. 239–252.
+
+[27] SCHWENK, J. Modelling time, or a step towards reduction-
+based security proofs for OTP and kerberos. Cryptology ePrint
+Archive, Report 2013/604, 2013. http://eprint.iacr.org/
+2013/604.
+
+[28] SELVI, J. Bypassing HTTP Strict Transport Security. In Black
+Hat Europe (2014). https://www.blackhat.com/docs/eu-
+14/materials/eu-14-Selvi-Bypassing-HTTP-Strict-
+Transport-Security-wp.pdf.
+
+[29] SHOUP, V. ISO/IEC 18033-2:2006: Information technology –
+security techniques – encryption algorithms – part 2: Asymmetric
+ciphers. Tech. rep., 2006. See also http://shoup.net/iso/
+std6.pdf.
+
+[30] SIBOLD, D., AND R ¨OTTGER, S. Analysis of NTP’s Autokey
+Protocol, 2012. https://www.ietf.org/proceedings/83/
+slides/slides-83-tictoc-1.pdf.
+
+[31] SIBOLD, D., R ¨OTTGER, S., AND TEICHEL, K.
+
+Net-
+Jan. 2016.
+
+work Time Security.
+https://tools.ietf.org/html/draft-ietf-ntp-
+network-time-security-12.
+
+IETF Internet-Draft,
+
+[32] TEICHEL, K., SIBOLD, D., AND MILIUS, S. First Results of a
+Formal Analysis of the Network Time Security Speciﬁcation. In
+Security Standardisation Research. Springer, 2015, pp. 218–245.
+[33] TEICHEL, K., SIBOLD, D., AND MILIUS, S. An Attack Possi-
+bility on Time Synchronization Protocols Secured with TESLA-
+Like Mechanisms, 2016. https://www8.cs.fau.de/staff/
+milius/AttackPossibilityTimeSyncTESLA.pdf.
+
+[34] THE OPENBSD PROJECT. OpenNTPD version 5.7p4, Mar. 2015.
+
+http://www.openntpd.org/.
+
+[35] THE OPENSSL PROJECT. OpenSSL version 1.0.2f, Jan. 2016.
+
+https://www.openssl.org/.
+
+840  25th USENIX Security Symposium 
+
+USENIX Association
+
+

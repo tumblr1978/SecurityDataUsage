@@ -1,0 +1,3863 @@
+Scheduler-based Defenses against Cross-VM  
+
+Side-channels
+
+Venkatanathan Varadarajan, Thomas Ristenpart, and Michael Swift,  
+
+University of Wisconsin—Madison
+
+https://www.usenix.org/conference/usenixsecurity14/technical-sessions/presentation/varadarajan
+
+This paper is included in the Proceedings of the 23rd USENIX Security Symposium.August 20–22, 2014 • San Diego, CAISBN 978-1-931971-15-7Open access to the Proceedings of  the 23rd USENIX Security Symposium is sponsored by USENIXScheduler-based Defenses against Cross-VM Side-channels
+
+Venkatanathan Varadarajan
+
+University of Wisconsin
+
+Thomas Ristenpart
+
+University of Wisconsin
+
+Michael Swift
+
+University of Wisconsin
+
+Abstract
+
+Public infrastructure-as-a-service clouds, such as Ama-
+zon EC2 and Microsoft Azure allow arbitrary clients
+to run virtual machines (VMs) on shared physical in-
+frastructure.
+This practice of multi-tenancy brings
+economies of scale, but also introduces the threat of
+malicious VMs abusing the scheduling of shared re-
+sources. Recent works have shown how to mount cross-
+VM side-channel attacks to steal cryptographic secrets.
+The straightforward solution is hard isolation that dedi-
+cates hardware to each VM. However, this comes at the
+cost of reduced efﬁciency.
+
+We investigate the principle of soft isolation: reduce
+the risk of sharing through better scheduling. With ex-
+perimental measurements, we show that a minimum run
+time (MRT) guarantee for VM virtual CPUs that lim-
+its the frequency of preemptions can effectively prevent
+existing Prime+Probe cache-based side-channel attacks.
+Through experimental measurements, we ﬁnd that the
+performance impact of MRT guarantees can be very low,
+particularly in multi-core settings. Finally, we integrate a
+simple per-core CPU state cleansing mechanism, a form
+of hard isolation, into Xen. It provides further protection
+against side-channel attacks at little cost when used in
+conjunction with an MRT guarantee.
+
+1
+
+Introduction
+
+Public infrastructure-as-a-service (IaaS) clouds enable
+the increasingly realistic threat of malicious customers
+mounting side-channel attacks [35, 46]. An attacker ob-
+tains tenancy on the same physical server as a target, and
+then uses careful timing of shared hardware components
+to steal conﬁdential data. Damaging attacks enable theft
+of cryptographic secrets by way of shared per-core CPU
+state such as L1 data and instruction caches [46], de-
+spite customers running within distinct virtual machines
+(VMs).
+
+A general solution to prevent side-channel attacks is
+hard isolation: completely prevent sharing of particu-
+lar sensitive resources. Such isolation can be obtained
+by avoiding multi-tenancy, new hardware that enforces
+cache isolation [42, 44], cache coloring [34, 36], or soft-
+ware systems such as StealthMem [22]. However, hard
+isolation reduces efﬁciency and raises costs because of
+stranded resources that are allocated to a virtual machine
+yet left unused.
+
+Another approach has been to prevent attacks by
+adding noise to the cache. For example, in the D¨uppel
+system the guest operating system protects against CPU
+cache side-channels by making spurious memory re-
+quests to obfuscate cache usage [47]. This incurs over-
+heads, and also requires users to identify the particular
+processes that should be protected.
+
+A ﬁnal approach has been to interfere with the ability
+to obtain accurate measurements of shared hardware by
+removing or obscuring time sources. This can be done
+by removing hardware timing sources [28], reducing the
+granularity of clocks exposed to guest VMs [41], allow-
+ing only deterministic computations [6], or using repli-
+cation of VMs to normalize timing [26]. These solutions
+either have signiﬁcant overheads, as in the last solution,
+or severely limit functionality for workloads that need
+accurate timing.
+
+Taking a step back, we note that in addition to shar-
+ing resources and having access to ﬁne-grained clocks,
+shared-core side-channel attacks also require the ability
+to measure the state of the cache frequently. For example,
+Zhang et al.’s cross-VM attack on ElGamal preempted
+the victim every 16 µs on average [46]. With less fre-
+quent interruptions, the attacker’s view of how hardware
+state changes in response to a victim becomes obscured.
+Perhaps surprisingly, then, is the lack of any investigation
+of the relationship between CPU scheduling policies and
+side-channel efﬁcacy. In particular, scheduling may en-
+able what we call soft isolation: limiting the frequency
+of potentially dangerous cross-VM interactions. (We use
+
+USENIX Association  
+
+23rd USENIX Security Symposium  687
+
+the adjective soft to indicate allowance of occasional fail-
+ures, analogous to soft real-time scheduling.)
+
+Contributions. We evaluate the ability of system
+software to mitigate cache-based side-channel attacks
+through scheduling. In particular, we focus on the type of
+mechanism that has schedulers ensure that CPU-bound
+workloads cannot be preempted before a minimum time
+quantum, even in the presence of higher priority or in-
+teractive workloads. We say that such a scheduler offers
+a minimum run time (MRT) guarantee. Xen version 4.2
+features an MRT guarantee mechanism for the stated pur-
+pose of improving the performance of batch workloads
+in the presence of interactive workloads that thrash their
+cache footprint [11]. A similar mechanism also exists in
+the Linux CFS scheduler [29].
+
+Cache-based side-channel attacks are an example of
+such highly interactive workloads that thrash the cache.
+One might therefore hypothesize that by reducing the
+frequency of preemptions via an MRT guarantee, one
+achieves a level of soft isolation suitable for mitigating,
+or even preventing, a broad class of shared-core side-
+channel attacks. We investigate this hypothesis, provid-
+ing the ﬁrst analysis of MRT guarantees as a defense
+against cache-based side-channel attacks. With detailed
+measurements of cache timing, we show that even an
+MRT below 1 ms can defend against existing attacks.
+
+But an MRT guarantee can have negative affects as
+well: latency-sensitive workloads may be delayed for the
+minimum time quantum. To evaluate the performance
+impact of MRT guarantees, we provide extensive mea-
+surements with a corpus of latency-sensitive and batch
+workloads. We conclude that while worst-case latency
+can be hindered by large MRTs in some cases, in prac-
+tice Xen’s existing core load-balancing mechanisms mit-
+igate the cost by separating CPU-hungry batch work-
+loads from latency-sensitive interactive workloads. As
+just one example, memcached, when running alongside
+batch workloads, suffers only a 7% overhead on 95th-
+percentile latency for a 5 ms MRT compared to no MRT.
+Median latency is not affected at all.
+
+The existing MRT mechanism only protects CPU-
+hungry programs that do not yield the CPU or go idle.
+While we are aware of no side-channel attacks that ex-
+ploit such victim workloads, we nevertheless investigate
+a simple and lightweight use of CPU state cleansing to
+protect programs that quickly yield the CPU by obfus-
+cating predictive state. By implementing this in the hy-
+pervisor scheduler, we can exploit knowledge of when
+a cross-VM preemption occurs and the MRT has not
+been exceeded. This greatly mitigates the overheads of
+cleansing, attesting to a further value to soft-isolation
+style mechanisms. In our performance evaluation of this
+mechanism, we see only a 10–50 µs worse-case overhead
+
+on median latency due to cleansing while providing pro-
+tection for all guest processes within a VM (and not just
+select ones, as was the case in D¨uppel). In contrast, other
+proposed defenses have similar (or worse) overhead but
+require new hardware, new guest operating systems, or
+restrict system functionality.
+
+Outline.
+In the next section, we provide background
+on cache-based side-channel attacks and existing defense
+mechanisms. In Section 3 we describe the Xen hyper-
+visor scheduling system, its MRT mechanism, and the
+principle of soft isolation. In Section 4 we measure the
+effectiveness of MRT as a defense. Section 5 shows the
+performance of Xen’s MRT mechanism, and Section 6
+describes combining MRT with cache cleansing.
+
+2 Background and Motivation
+
+Our work is motivated by the increasing importance
+of threats posed by side-channel attacks in multi-tenant
+clouds, in which VMs from multiple customers run on
+the same physical hardware. We focus on cache-based
+side-channels, which are dangerous because they can
+leak secret information such as encryption keys and have
+been demonstrated between virtual machines in a cloud
+environment [46].
+
+time-,
+
+Side-channel attacks. We can delineate side-channel
+attacks into three classes:
+trace-, and access-
+driven. Time-driven attacks arise when an attacker can
+glean useful information via repeated observations of the
+(total) duration of a victim operation, such as the time
+to compute an encryption (e.g., [5, 7, 10, 16, 24]). Trace-
+driven attacks work by having an attacker continuously
+monitor a cryptographic operation, for example via elec-
+tromagnetic emanations or power usage leaked to the at-
+tacker (e.g., [14, 23, 33].
+
+We focus on access-driven side-channel attacks, in
+which the attacker is able to run a program on the same
+physical server as the victim. These abuse stateful com-
+ponents of the system shared between attacker and victim
+program, and have proved damaging in a wide variety of
+settings, including [3, 15, 31, 32, 35, 45].
+In the cross-
+process setting, the attacker and victim are two separate
+processes running within the same operating system. In
+the cross-VM setting, the attacker and victim are two
+separate VMs running co-resident (or co-tenant) on the
+same server. The cross-VM setting is of particular con-
+cern for public IaaS clouds, where it has been shown that
+an attacker can obtain co-residence of a malicious VM
+on the same server as a target [35]
+
+Zhang, Juels, Reiter, and Ristenpart (ZJRR) [46]
+demonstrated the ﬁrst cross-VM attack with sufﬁcient
+
+688  23rd USENIX Security Symposium 
+
+USENIX Association
+
+granularity to extract ElGamal secret keys from the vic-
+tim. They use a version of the classic Prime+Probe tech-
+nique [31]: the attacker ﬁrst primes the cache (instruc-
+tion or data) by accessing a ﬁxed set of addresses that
+ﬁll the entire cache. He then yields the CPU, causing
+the hypervisor to run the victim, which begins to evict
+the attacker’s data or instructions from various cache.
+As quickly as possible, the attacker preempts the vic-
+tim, and then probes the cache by again accessing a set
+of addresses that cover the entire cache. By measuring
+the speed of each cache access, the attacker can deter-
+mine which cache lines were displaced by the victim, and
+hence learn some information about which addresses the
+victim accessed.
+
+The ZJRR attack builds off a long line of cross-
+process attacks (c.f., [3, 4, 15, 31, 32]) all of which tar-
+get per-core microarchitectural state. When simultane-
+ous multi-threading (SMT) is disabled (as is typical in
+cloud settings), such per-core attacks require that the at-
+tacker time-shares a CPU core with the victim.
+In or-
+der to obtain frequent observations of shared state, at-
+tacks abuse scheduler mechanisms that prioritize interac-
+tive workloads in order to preempt the victim. For exam-
+ple, ZJRR use inter-processor interrupts to preempt every
+16 µs on average. In their cross-process attack, Bangerter
+et al. abuse the Linux process scheduler [15].
+
+Fewer attacks thus far have abused (what we call) off-
+core state, such as last-level caches used by multiple
+cores. Some off-core attacks are coarse-grained, allow-
+ing attackers to learn only a few bits of information (e.g.,
+whether the victim is using the cache or not [35]). An
+example of a ﬁne-grained off-core attack is the recent
+Flush+Reload attack of Yarom and Falkner [45]. Their
+attack extends the Bangerter et al. attack to instead target
+last-level caches on some modern Intel processors and
+has been shown to enable very efﬁcient theft of cryp-
+tographic keys in both cross-process and cross-VM set-
+tings. However, like the Bangerter et al. attack, it relies
+on the attacker and victim having shared memory pages.
+This is a common situation for cross-process settings,
+but also arises in cross-VM settings should the hypervi-
+sor perform memory page deduplication. While several
+hypervisors implement deduplication, thus far no IaaS
+clouds are known to use the feature and so are not vul-
+nerable.
+
+Threat model and goals. Our goal is to mitigate or
+completely prevent cross-VM attacks relevant to mod-
+ern public IaaS cloud computing settings. We assume
+the attacker and victim are separate VMs co-resident on
+the same server running a Type I hypervisor. The at-
+tacker controls the entire VM, including the guest oper-
+ating system and applications, but the hypervisor is run
+by the cloud provider and is trusted. SMT and mem-
+
+ory deduplication are disabled. In this context, the best
+known attacks rely on:
+(1)
+
+Shared per-core state that is accessible to the at-
+tacker and that has visibly different behavior based
+on its state, such as caches and branch predictors.
+
+(2) The ability to preempt the victim VM at short inter-
+vals to allow only a few changes to that hardware
+state.
+
+(3) Access to a system clock with enough resolution to
+distinguish micro-architectural events (e.g., cache
+hits and misses).
+
+These conditions are all true in contemporary multi-
+tenant cloud settings, such as Amazon’s EC2. Defenses
+can target any of these dependencies, and we discuss
+some existing approaches next.
+
+Prior defenses. Past work on defenses against such
+side-channel attacks identiﬁed the above requirements
+for successful side-channels and tried to obviate one or
+more of the above necessary conditions for attacks. We
+classify and summarize these techniques below.
+
+An obvious solution is to prevent an attacker and vic-
+tim from sharing hardware, which we call hard isolation.
+Partitioning the cache in hardware or software prevents
+its contents from being shared [22, 34, 36, 42]. This re-
+quires special-purpose hardware or loss of various use-
+ful features (e.g., large pages) and thus limits the adop-
+tion in a public cloud environment. Assigning VMs to
+run on different cores avoids sharing of per-core hard-
+ware [21, 27, 38], and assigning them to different servers
+avoids sharing of any system hardware [35]. A key chal-
+lenge here is identifying an attacker and victim in order
+to separate them; otherwise this approach reduces to us-
+ing dedicated hardware for each customer, reducing uti-
+lization and thus raising the price of computing.
+
+Another form of hard isolation is to reset hardware
+state when switching from one VM to another. For
+example, ﬂushing the caches on every context switch
+prevents the cache state from being shared between
+VMs [47]. However, this can decrease performance of
+cache-sensitive workloads both because of the time taken
+to do the ﬂush and the loss in cache efﬁciency.
+
+Beyond hard isolation are approaches that modify
+hardware to add noise, either in the timing or by obfus-
+cating the speciﬁc side-channel information. The for-
+mer can be accomplished by removing or modifying
+timers [26, 28, 41] to prevent attackers from accurately
+distinguishing between microarchitectural events, such
+as a cache hit and a miss. For example, StopWatch [26]
+removes all timing side-channels and incurs a worse-case
+overhead of 2.8x for network intensive workloads. Spe-
+cialized hardware-support could also be used to obfus-
+cate and randomize processor cache usage [25, 44]. All
+
+USENIX Association  
+
+23rd USENIX Security Symposium  689
+
+of these defenses either result in loss of high-precision
+timer or require hardware changes.
+
+Similarly, one can allocate exclusive memory re-
+sources for a sensitive process [22] or add noise to ob-
+fuscate its hardware usage [47]. Similarly, programs can
+be changed to obfuscate access patterns [8, 9]. These ap-
+proaches are not general-purpose, as they rely on iden-
+tifying and ﬁxing all security-relevant programs. Worst-
+case overheads for these mechanisms vary from 6–7%.
+
+Several past efforts attempt to minimize performance
+interference between workloads (e.g., Q-clouds [30] and
+Bubble-Up [27], but do not consider adversarial work-
+loads such as side-channel attacks.
+
+3 MRT Guarantees and Soft Isolation
+
+We investigate a different strategy for mitigating per-core
+side-channels: adjusting hypervisor core scheduling to
+limit the rate of preemptions. This targets the second
+requirement of attacks such as ZJRR. Such a scheduler
+would realize a security design principle that we call
+soft isolation1: limiting the frequency of potentially dan-
+gerous interactions between mutually untrustworthy pro-
+grams. Unlike hard isolation mechanisms, we will allow
+shared state but attempt to use scheduling to limit the
+damage. Ideally, the ﬂexibility of soft isolation will ease
+the road to deployment, while still signiﬁcantly mitigat-
+ing or even preventing side-channel attacks. We expect
+that soft isolation can be incorporated as a design goal
+in a variety of resource management contexts. That said,
+we focus in the rest of this work on CPU core scheduling.
+
+Xen scheduling. Hypervisors schedule virtual ma-
+chines much like an operating system schedules pro-
+cesses or threads. Just as a process may contain mul-
+tiple threads that can be scheduled on different proces-
+sors, a virtual machine may consist of multiple virtual
+CPUs (VCPUs) that can be scheduled on different phys-
+ical CPUs (PCPUs). The primary difference between
+hypervisor and OS scheduling is that the set of VCPUs
+across all VMs is relatively static, as VM and VCPU cre-
+ation/deletion is a rare event. In contrast, processes and
+threads are frequently created and deleted.
+
+Hypervisor schedulers provide low-latency response
+times to interactive tasks by prioritizing VCPUs that
+need to respond to an outstanding event. The events
+are typically physical device or virtual interrupts from
+packet arrivals or completed storage requests. Xen’s
+credit scheduler normally lets a VCPU run for 30ms be-
+fore preempting it so another VCPU can run. However,
+
+1The term “soft” is inherited from soft real-time systems, where one
+similarly relaxes requirements (in that case, time deadlines, in our case,
+isolation).
+
+schedule event!
+
+choose next 
+
+VCPU!
+
+Is next same 
+
+as prev 
+VCPU?!
+
+No!
+
+Is prev_runtime 
+< ratelimit_us?!
+
+No!
+
+switch to next 
+
+VCPU!
+
+Yes!
+
+continue running 
+
+prev VCPU!
+
+set event timer to 
+
+(ratelimit_us - prev_runtime)!
+
+Yes!
+
+Figure 1: Logic underlying the Xen MRT mechanism.
+
+when a VCPU receives an event, it may receive boost
+priority, which allows it to preempt non-boosted VCPUs
+and run immediately.
+
+VCPUs are characterized by Xen as either interactive
+(or latency-sensitive) if they are mostly idle until an in-
+terrupt comes in, at which point they execute for a short
+period and return to idle. Typical interactive workloads
+are network servers that execute in response to an incom-
+ing packet. We refer to VCPUs that are running longer
+computations as batch or CPU-hungry, as they typically
+execute for longer than the scheduler’s time slice (30ms
+for Xen) without idling.
+
+Schedulers can be work conserving, meaning that they
+will never let a PCPU idle if a VCPU is ready to run,
+or non-work conserving, meaning that they enforce strict
+limits on how much time a VCPU can run. While work-
+conserving schedulers can provide higher utilization,
+they also provide worse performance isolation:
+if one
+VCPU goes from idle to CPU-hungry, another VCPU on
+the same PCPU can see its share of the PCPU drop in
+half. As a result, many cloud environments use non-work
+conserving schedulers. For example, Amazon EC2’s
+m1.small instances are conﬁgured to be non-work con-
+serving, allocating roughly 40% of a PCPU (called cap
+in Xen) to each VCPU of a VM.
+
+Since version 4.2, Xen has included a mechanism
+for rate limiting preemptions of a VCPU; we call this
+mechanism a minimum run-time (MRT) guarantee. The
+logic underlying this mechanism is shown as a ﬂowchart
+in Figure 1. Xen exposes a hypervisor parameter,
+ratelimit us (the MRT value) that determines the
+minimum time any VCPU is guaranteed to run on a
+PCPU before being available to be context-switched out
+of the PCPU by another VCPU. One could also rate limit
+preemptions in other ways, but an MRT guarantee is sim-
+
+690  23rd USENIX Security Symposium 
+
+USENIX Association
+
+ple to implement. Note that the MRT is not applicable to
+VMs that voluntarily give up the CPU, which happens
+when the VM goes idle or waits for an event to occur.
+
+As noted previously, the original intent of Xen’s MRT
+was to improve performance for CPU-hungry workloads
+run in the presence of latency-sensitive workloads: each
+preemption pollutes the cache and other microarchitec-
+tural state, slowing the CPU-intensive workload
+
+Case study. We experimentally evaluate the Xen MRT
+mechanism as a defense against side-channel leakage
+by way of soft isolation. Intuitively, the MRT guaran-
+tee rate-limits preemptions and provides an attacker less
+granularity in his observations of the victim’s use of per-
+CPU-core resources. Thus one expects that increased
+rate-limits decreases vulnerability. To be deployable,
+however, we must also evaluate the impact of MRT guar-
+antees on benign workloads. In the next two sections we
+investigate the following questions:
+(1) How do per-core side-channel attacks perform un-
+
+der various MRT values? (Section 4)
+
+(2) How does performance vary with different MRT
+
+values? (Section 5)
+
+4 Side-channels under MRT Guarantees
+
+We experimentally evaluate the MRT mechanism as a de-
+fense against side-channel leakage for per-core state. We
+focus on cache-based leakage.
+
+Experimental setup. Running on the hardware setup
+shown in Figure 2, we conﬁgure Xen to use two VMs, a
+victim and attacker. Each has two VCPUs, and we pin
+one attacker VCPU and one victim VCPU to each of two
+PCPUs (or cores). We use a non-work-conserving sched-
+uler whose conﬁguration is shown in Figure 9. This is a
+conservative version of the ZJRR attack setting, where
+instead the VCPUs were allowed to ﬂoat — pinning the
+victims to the same core only makes it easier for the at-
+tacker. The hardware and Xen conﬁgurations are similar
+to the conﬁguration used in EC2 m1.small instances [12].
+(Although Amazon does not make their precise hardware
+conﬁgurations public, we can still gain some insight into
+the hardware on which an instance is running by looking
+at sysfs and the CPUID instruction.)
+
+Cache-set timing proﬁle. We start by ﬁxing a simple
+victim to measure the effects of increasing MRT guaran-
+tees. We have two functions that each access a (distinct)
+quarter of the instruction cache (I-cache)2. The victim
+
+2Our test machine has a 32 KB, 4-way set associative cache with
+
+64-byte lines. There are 128 sets.
+
+Machine Conﬁguration
+
+Memory Hierarchy
+
+Xen Version
+Xen Scheduler
+Dom0 OS
+
+Guest OS
+
+Intel Xeon E5645, 2.40GHz
+clock, 6 cores in one package
+Private 32 KB L1 (I- and D-
+cache), 256 KB uniﬁed L2,
+12 MB shared L3 and 16 GB
+main memory.
+4.2.1
+Credit Scheduler 1
+Fedora
+18,
+202.fc18.x86 64
+Ubuntu 12.04.3, Linux 3.7.5
+
+3.8.8-
+
+Figure 2: Hardware conﬁguration in local test bed.
+
+alternates between these two functions, accessing each
+quarter 500 times. This experiment models a simple I-
+cache side-channel where switching from one quarter to
+another leaks some secret information (we call any such
+leaky function a sensitive operation). Executing the 500
+access to a quarter of the I-cache requires approximately
+100µs when run in isolation.
+
+We run this victim workload pinned to a victim VCPU
+that is pinned to the same PCPU as the attacker VCPU.
+The attacker uses the IPI-based Prime+Probe technique3
+and measures the time taken to access each I-cache set,
+similar to ZJRR [46].
+
+Figure 3 shows heat maps of the timings of the vari-
+ous I-cache sets as taken by the Prime+Probe attacker,
+for various MRT values between 0 (no MRT) and 5 ms.
+Darker colors are longer access times, indicating con-
+ﬂicting access to the cache set by the victim. One can
+easily see the simple alternating pattern of the victim as
+we move up the y-axis of time in Figure 3(b). Also note
+that this is different from an idle victim under zero-MRT
+shown in Figure 3(a). With no MRT, the attacker makes
+approximately 40 observations of each cache set, allow-
+ing a relatively detailed view of victim behavior.
+
+As the MRT value increases we see the loss of res-
+olution by the attacker as its observations become less
+frequent than the alternations of the victim. At an MRT
+of 100 µs the pattern is still visible, but noisier. Although
+the victim functions run for 100 µs, the prime+probe at-
+tacker slows downs the victim by approximately a factor
+of two, allowing the pattern to be visible with a 100 µs
+MRT. When the MRT value is set to 1 ms the attacker
+obtains no discernible information on when the switch-
+ing between each I-cache set happens.
+
+In general, an attacker can observe victim behavior
+that occurs at a lower frequency than the attacker’s pre-
+emptions. We modify the victim program to be 10x
+
+3Note that the attacker requires two VCPUs, one measuring the I-
+cache set timing whenever interrupted and the other issuing the IPIs
+to wake up the other VCPU. The VCPU issuing IPIs is pinned to a
+different PCPU.
+
+USENIX Association  
+
+23rd USENIX Security Symposium  691
+
+)
+s
+e
+i
+r
+e
+s
+ 
+
+e
+m
+
+i
+t
+(
+ 
+
+e
+b
+o
+r
+p
+
+ 
+
+l
+
+e
+p
+m
+a
+S
+
+)
+s
+e
+i
+r
+e
+s
+ 
+
+e
+m
+
+i
+t
+(
+ 
+
+e
+b
+o
+r
+p
+
+ 
+
+l
+
+e
+p
+m
+a
+S
+
+ 10000
+
+ 9800
+
+ 9600
+
+ 9400
+
+ 9200
+
+ 9000
+
+ 10000
+
+ 9800
+
+ 9600
+
+ 9400
+
+ 9200
+
+ 9000
+
+ 
+
+e
+b
+o
+r
+p
+
+ 
+t
+
+e
+s
+ 
+
+e
+h
+c
+a
+C
+
+i
+ 
+r
+e
+p
+
+ 
+
+i
+
+i
+
+g
+n
+m
+T
+e
+h
+c
+a
+C
+
+ 
+
+)
+e
+g
+n
+a
+r
+ 
+
+l
+
+e
+c
+y
+c
+ 
+
+0
+0
+2
+
+ 
+
+o
+
+t
+ 
+
+0
+(
+
+)
+s
+e
+i
+r
+e
+s
+ 
+
+e
+m
+
+i
+t
+(
+ 
+
+e
+b
+o
+r
+p
+
+ 
+
+l
+
+e
+p
+m
+a
+S
+
+ 10000
+
+ 9800
+
+ 9600
+
+ 9400
+
+ 9200
+
+ 9000
+
+ 0
+
+ 20
+
+ 40
+
+ 60
+
+ 80
+
+ 100
+
+ 120
+
+ 0
+
+ 20
+
+ 40
+
+ 60
+
+ 80
+
+ 100
+
+ 120
+
+I-cache set number
+
+(a) Zero-MRT w/ Idle Victim
+
+I-cache set number
+
+(b) Zero-MRT
+
+ 
+
+e
+b
+o
+r
+p
+ 
+t
+
+e
+s
+ 
+
+e
+h
+c
+a
+C
+
+i
+ 
+r
+e
+p
+
+ 
+
+i
+
+i
+
+g
+n
+m
+T
+e
+h
+c
+a
+C
+
+ 
+
+)
+e
+g
+n
+a
+r
+ 
+
+l
+
+e
+c
+y
+c
+ 
+
+0
+0
+2
+
+ 
+
+o
+
+t
+ 
+
+0
+(
+
+)
+s
+e
+i
+r
+e
+s
+ 
+
+e
+m
+
+i
+t
+(
+ 
+
+e
+b
+o
+r
+p
+
+ 
+
+l
+
+e
+p
+m
+a
+S
+
+ 10000
+
+ 9800
+
+ 9600
+
+ 9400
+
+ 9200
+
+ 9000
+
+ 
+
+e
+b
+o
+r
+p
+
+ 
+t
+
+e
+s
+ 
+
+e
+h
+c
+a
+C
+
+i
+ 
+r
+e
+p
+
+ 
+
+i
+
+i
+
+g
+n
+m
+T
+e
+h
+c
+a
+C
+
+ 
+
+ 
+
+e
+b
+o
+r
+p
+ 
+t
+
+e
+s
+ 
+
+e
+h
+c
+a
+C
+
+i
+ 
+r
+e
+p
+
+ 
+
+i
+
+i
+
+g
+n
+m
+T
+e
+h
+c
+a
+C
+
+ 
+
+)
+e
+g
+n
+a
+r
+ 
+
+l
+
+e
+c
+y
+c
+ 
+
+0
+0
+2
+
+ 
+
+o
+
+t
+ 
+
+0
+(
+
+)
+e
+g
+n
+a
+r
+ 
+
+l
+
+e
+c
+y
+c
+ 
+
+0
+0
+2
+
+ 
+
+o
+
+t
+ 
+
+0
+(
+
+ 0
+
+ 20
+
+ 40
+
+ 60
+
+ 80
+
+ 100
+
+ 120
+
+ 0
+
+ 20
+
+ 40
+
+ 60
+
+ 80
+
+ 100
+
+ 120
+
+I-cache set number
+
+(c) 100µs-MRT
+
+I-cache set number
+
+(d) 1ms-MRT
+
+Figure 3: Heatmaps of I-cache set timing as observed by a prime-probe attacker. Displayed values are from a larger trace of
+10,000 timings. (a) Timings for idle victim and no MRT. (b)–(d) Timings for varying MRT values with the victim running.
+
+slower (where each function takes approximately 1 ms
+standalone). Figure 4 shows the result for this experi-
+ment. With a 1 ms MRT, we observe the alternating pat-
+tern. When the MRT is raised to 5 ms, which is longer
+than the victim’s computation (≈ 2 ms), no pattern is ap-
+parent. Thus, when the MRT is longer than the execution
+time of a security-critical function this side-channel fails.
+
+While none of this proves lack of side-channels, it
+serves to illustrate the dynamics between side-channels,
+duration of sensitive victim operations, and the MRT:
+as the MRT increases, the frequency with which an at-
+tacker can observe the victim’s behavior decreases, and
+the signal and hence leaked information decreases. All
+this exposes the relationship between the speed of a sen-
+sitive operation, the MRT, and side-channel availability
+for an attacker. In particular, very long operations (e.g.,
+longer than the MRT) may still be spied upon by side-
+channel attackers. Also, infrequently accessed but sen-
+sitive memory accesses may leak to the attacker. We
+hypothesis that at least for cryptographic victims, even
+moderate MRT values on the order of a handful of mil-
+
+liseconds are sufﬁcient to prevent per-core side-channel
+attacks. We next look, therefore, at how this relationship
+plays out for cryptographic victims.
+
+ElGamal victim. We ﬁx a victim similar to that tar-
+geted by ZJRR. The victim executes the modular expo-
+nentiation implementation from libgcrypt 1.5.0 using a
+2048-bit exponent, base and modulus, in a loop. Pseudo-
+code of the exponentiation algorithm appears in Figure 5.
+One can see that learning the sequence of operations
+leaks the secret key values:
+if the code in lines 7 and
+8 is executed, the bit is a 1; otherwise it is a zero. We in-
+strument libgcrypt to write the current bit being operated
+upon to a memory page shared with the attacker, allow-
+ing us to determine when preemptions occur relative to
+operations within the modular exponentiation.
+
+For no MRT guarantee, we observe that the attacker
+can preempt the victim many times per individual square,
+multiply, or reduce operation (as was also reported by
+ZJRR). With MRT guarantees, the rate of preemptions
+drops so much that the attacker only can interrupt once
+
+692  23rd USENIX Security Symposium 
+
+USENIX Association
+
+)
+s
+e
+i
+r
+e
+s
+ 
+
+e
+m
+
+i
+t
+(
+ 
+
+e
+b
+o
+r
+p
+
+ 
+
+l
+
+e
+p
+m
+a
+S
+
+ 9200
+
+ 9150
+
+ 9100
+
+ 9050
+
+ 9000
+
+ 
+
+e
+b
+o
+r
+p
+
+ 
+t
+
+e
+s
+ 
+
+e
+h
+c
+a
+C
+
+i
+ 
+r
+e
+p
+
+ 
+
+i
+
+i
+
+g
+n
+m
+T
+e
+h
+c
+a
+C
+
+ 
+
+)
+e
+g
+n
+a
+r
+ 
+
+l
+
+e
+c
+y
+c
+ 
+
+0
+0
+2
+
+ 
+
+o
+
+t
+ 
+
+0
+(
+
+)
+s
+e
+i
+r
+e
+s
+ 
+
+e
+m
+
+i
+t
+(
+ 
+
+e
+b
+o
+r
+p
+
+ 
+
+l
+
+e
+p
+m
+a
+S
+
+ 9200
+
+ 9150
+
+ 9100
+
+ 9050
+
+ 9000
+
+ 
+
+e
+b
+o
+r
+p
+
+ 
+t
+
+e
+s
+ 
+
+e
+h
+c
+a
+C
+
+i
+ 
+r
+e
+p
+
+ 
+
+i
+
+i
+
+g
+n
+m
+T
+e
+h
+c
+a
+C
+
+ 
+
+)
+e
+g
+n
+a
+r
+ 
+
+l
+
+e
+c
+y
+c
+ 
+
+0
+0
+2
+
+ 
+
+o
+
+t
+ 
+
+0
+(
+
+ 0
+
+ 20
+
+ 40
+
+ 60
+
+ 80
+
+ 100
+
+ 120
+
+ 0
+
+ 20
+
+ 40
+
+ 60
+
+ 80
+
+ 100
+
+ 120
+
+I-cache set number
+
+(a) 1ms-MRT
+
+I-cache set number
+
+(b) 5ms-MRT
+
+Figure 4: Heatmaps of I-cache set timings as observed by a prime-probe attacker for 10x slower victim computations.
+Displayed values are from a larger trace of 9,200 timings.
+
+SQUAREMULT(x,e,N):
+1: Let en, ...,e1 be the bits of e
+2: y ← 1
+3: for i = n down to 1 do
+y ← SQUARE(y)
+4:
+y ← MODREDUCE(y,N)
+5:
+if ei = 1 then
+6:
+7:
+8:
+9:
+10: end for
+11: return y
+
+y ← MULT(y,x)
+y ← MODREDUCE(y,N)
+
+end if
+
+Xen MRT ( ms) Avg. ops/run Min. ops/run
+0
+4
+32
+68
+155
+386
+728
+
+0.096
+14.1
+49.0
+92.6
+180.7
+441.2
+873.1
+
+0
+0.1
+0.5
+1.0
+2.0
+5.0
+10.0
+
+Figure 6: The average and minimal number of ElGamal se-
+cret key bits operated upon between two attacker preemp-
+tions for a range of MRT values. Over runs with 40K pre-
+emptions.
+
+Xen MRT Preemptions per function call
+
+(ms)
+
+0
+0.1
+0.5
+1.0
+2.0
+5.0
+10.0
+
+Min Median
+3247
+19940
+155
+74
+42
+22
+22
+16
+11
+10
+0
+4
+2
+1
+
+Max
+20606
+166
+47
+25
+13
+6
+3
+
+Figure 5: Modular exponentiation algorithm used in
+libgcrypt version 1.5.0. Note that the control ﬂow followed
+when ei = 1 is lines 4 → 5 → 6 → 7 → 8 and when ei = 0 is
+lines 4 → 5; denoted by the symbols 1 and 0, respectively.
+
+every several iterations of the inner loop. Figure 6 gives
+the number of bits operated on between attacker preemp-
+tions for various MRT values. Figure 7 gives the number
+of preemptions per entire modular exponentiation com-
+putation. We see that for higher MRT values, the rate
+of preemption per call to the full modular exponentiation
+reduces to just a handful. The ZJRR attack depends on
+multiple observations per operation to ﬁlter out noise, so
+even at the lowest MRT value of 100 µs, with 4–14 op-
+erations per observation, the ZJRR attack fails.
+In the
+full version [40], we discuss how one might model this
+leakage scenario formally and evidence a lack of any of
+a large class of side-channel attacks.
+
+AES victim. We evaluate another commonly exploited
+access-driven side-channel victim, AES, which leaks se-
+cret information via key-dependent indexing into tables
+stored in the L1 data cache [15, 31]. The previous at-
+
+Figure 7: Rate of preemption with various MRT. Here the
+function called is the Modular-Exponentiation implementation
+in libgcrypt with a 2048 bit exponent. Note that for zero MRT
+the rate of preemption is very high that victim computation in-
+volving a single bit was preempted multiple times.
+
+tacks, all in the cross-process setting, depend on observ-
+ing a very small number of cache accesses to obtain a
+clear signal of what portion of the table was accessed by
+the victim. Although there has been no known AES at-
+tack in the cross-VM setting (at least when deduplication
+is turned off, otherwise see [19]), we evaluate effective-
+ness of MRT against the best known IPI Prime+Probe
+
+USENIX Association  
+
+23rd USENIX Security Symposium  693
+
+n
+o
+
+i
+t
+
+i
+
+u
+b
+i
+r
+t
+s
+D
+e
+v
+i
+t
+
+ 
+
+l
+
+a
+u
+m
+u
+C
+
+ 1
+
+ 0.8
+
+ 0.6
+
+ 0.4
+
+ 0.2
+
+ 0
+
+0 ms
+0.1 ms
+1 ms
+5 ms
+
+ 0
+
+ 50
+
+ 100  150  200  250
+
+L2 Data Loads
+
+Figure 8: CDF of L2 data-loads per time slice experienced
+by OpenSSL-AES victim. L2 data loads are performance
+counter events that happen when a program requests for a mem-
+ory word that is not in both L1 and L2 private caches (effec-
+tively a miss). When running along-side a Prime+Probe at-
+tacker, these data-cache accesses can be observed by the at-
+tacker.
+
+spy process due to ZJRR. In particular, we measured the
+number of private data-cache misses possibly observable
+by this Prime+Probe attacker when the victim is running
+AES encryption in a loop.
+
+To do so, we modiﬁed the Xen scheduler to log the
+count of private-cache misses (in our local testbed both
+L1 and L2 caches are private) experienced by any VCPU
+during a scheduled time slice. This corresponds to the
+number of data-cache misses an attacker could ideally
+observe. Figure 8 shows the cumulative distribution of
+the number of L2-data cache misses (equivalently, pri-
+vate data-cache loads) during a time slice of the victim
+running OpenSSL-AES. We can see that under no or
+lower MRTs the bulk of time slices suffer only a few
+tens of D-cache misses that happen between two back-
+to-back preemptions of the attacker. (We note that this is
+already insufﬁcient to perform prior attacks.) The num-
+ber of misses increases to close to 200 for an MRT value
+of 5 ms. This means that the AES process is evicting its
+own data, further obscuring information from a would-
+be attacker. Underlying this is the fact that the number of
+AES encryptions completed between two back-to-back
+preemptions increases drastically with the MRT: found
+that thousands to ten thousands AES block-encryptions
+were completed between two preemptions when MRT
+was varied from 100 µs to 5 ms, respectively.
+
+Summary. While side channels pose a signiﬁcant
+threat to the security of cloud computing, our measure-
+ments in this section show that, fortunately, the hyper-
+visor scheduler can help. Current attacks depend on
+
+frequent preemptions to make detailed measurements of
+cache contents. Our measurements show that even de-
+laying preemption for a fraction of millisecond prevents
+known attacks. While this is not proof that future attacks
+won’t be found that circumvent the MRT guarantee, it
+does strongly suggest that deploying such a soft-isolation
+mechanism will raise the bar for attackers. This leaves
+the question of whether this mechanism is cheap to de-
+ploy, which we answer in the next section.
+
+Note that we have focused on using the MRT mech-
+anism for CPU and, indirectly, per-core hardware re-
+sources that are shared between multiple VMs. But
+rate-limiting-type mechanisms may be useful for other
+shared devices like memory, disk/SSD, network, and any
+system-level shared devices which suffer from a similar
+access-driven side-channels. For instance, a timed disk
+read could reveal user’s disk usage statistics like relative
+disk head positions [20]. Fine-grained sharing of the disk
+across multiple users could leak sensitive information via
+such a timing side-channel. Reducing the granularity of
+sharing by using MRT-like guarantees in the disk sched-
+uler (e.g., servicing requests from user for at least Tmin,
+minimum service time, before serving requests from an-
+other user) would result in a system with similar secu-
+rity guarantees as above, eventually making such side-
+channels harder to exploit. Further research is required
+to analyze the end-to-end performance impact of such
+a mechanism for various shared devices and schedulers
+that manage them.
+
+5 Performance of MRT Mechanism
+
+The analysis in the preceding section demonstrates that
+MRT guarantees can meaningfully mitigate a large class
+of cache-based side-channel attacks. The mitigation be-
+comes better as MRT increases. We therefore turn to de-
+termining the maximal MRT guarantee one can ﬁx while
+not hindering performance.
+
+5.1 Methodology
+We designed experiments to quantify the negative and
+positive effects of MRT guarantees as compared to a
+baseline conﬁguration with no MRT (or zero MRT). Our
+testbed conﬁguration uses the same hardware as in the
+last section and the Xen conﬁgurations are summarized
+in Figure 9. We run two DomU VMs each with a single
+VCPU. The two VCPUs are pinned to the same PCPU.
+Pinning to the same PCPU serves to isolate the effect of
+the MRT mechanism. The management VM, Dom0, has
+6 VCPUs, one for each PCPU (a standard conﬁguration
+option). The remaining PCPUs in the system are other-
+wise left idle.
+
+694  23rd USENIX Security Symposium 
+
+USENIX Association
+
+Work-conserving conﬁguration
+
+Dom0
+6 VCPU / no cap / weight 256
+DomU 1 VCPU / 2 GB memory / no
+
+cap / weight 256
+
+Non-work-conserving conﬁguration
+Dom0
+6 VCPU / no cap / weight 512
+DomU 1 VCPU / 2 GB memory /
+
+40% cap / weight 256
+
+Figure 9: Xen conﬁgurations used for performance experi-
+ments.
+
+CPU-hungry Workloads
+
+Workload
+SPECjbb
+graph500
+
+mcf ,
+bzip2
+Nqueens
+
+CProbe
+
+sphinx,
+
+Description
+Java-based application server [37]
+Graph analytics workload [1] with scale
+of 18 and edge factor of 20.
+SpecCPU2006 cache sensitive bench-
+marks [17]
+Microbenchmark
+problem
+Microbenchmark
+that
+trashes L2 private cache.
+Latency-sensitive Workloads
+
+continuously
+
+n-queens
+
+solving
+
+Workload
+Data-Caching
+
+Data-Serving
+
+Apache
+
+Ping
+Chatty-CProbe
+
+Description
+Memcached from Cloud Suite-2 with
+twitter data set scaled by factor of 5 run
+for 3 minutes with rate of 500 requests
+per second [13].
+Cassandra KV-store from Cloud Suite-2
+with total of 100K records4 [13]
+Apache
+HTTPing
+client [18], single 4 KB ﬁle at 1 ms
+interval.
+Ping command at 1 ms interval.
+One iteration of CProbe every 10 µs.
+
+webserver,
+
+Figure 10: Workloads used in performance experiments.
+
+We use a mix of real-world applications and mi-
+crobenchmarks in our experiments (shown in Figure 10).
+The microbenchmark CProbe simulates a perfectly
+cache-sensitive workload that continuously overwrites
+data to the (uniﬁed) L2 private cache, and Chatty-CProbe
+is its interactive counterpart that overwrites the cache ev-
+ery 10 µs and then sleeps. We also run the benchmarks
+with an idle VCPU (labeled Idle below).
+
+5.2 Latency Sensitivity
+The most obvious potential performance downside of a
+MRT guarantee is increased latency:
+interactive work-
+loads may have to wait before gaining access to a
+PCPU. We measure the negative effects of MRT guar-
+antees by running latency-sensitive workloads against
+Nqueens (a CPU-bound program with little memory ac-
+
+ 
+
+e
+
+l
+i
+t
+
+n
+e
+c
+r
+e
+p
+
+ 
+
+ 
+)
+s
+m
+
+(
+ 
+s
+e
+c
+n
+e
+
+i
+
+t
+
+a
+
+l
+
+h
+
+t
+
+5
+9
+
+ping
+apache
+data-caching
+data-serving
+
+ 20
+ 18
+ 16
+ 14
+ 12
+ 10
+ 8
+ 6
+ 4
+ 2
+ 0
+
+ 0
+
+ 2
+
+ 4
+
+ 6
+
+ 8
+
+ 10
+
+Xen Ratelimit (ms)
+
+Figure 11: 95th Percentile Latency of Various Latency Sen-
+sitive Workloads. Under non-work-conserving scheduling.
+
+cess). Figure 11 shows the 95th percentile latency for the
+interactive workloads. The baseline results are shown as
+a MRT of 0 on the X-axis. As expected, the latency is ap-
+proximately equal to the MRT for almost all workloads
+(Apache has higher latency because it requires multiple
+packets to respond, so it must run multiple times to com-
+plete a request). Thus, in the presence of a CPU-intensive
+workload and when pinned to the same PCPU, the MRT
+can have a large negative impact on interactive latency.
+
+As the workloads behave essentially similarly, we now
+focus on just the Data-Caching workload. Figure 12
+shows the response latency when run against other work-
+loads. For the two CPU-intensive workloads, CProbe
+and Nqueens, latency increases linearly with the MRT.
+However, when run against either an idle VCPU or
+Chatty-CProbe, which runs for only a short period, la-
+tency is identical across all MRT values. Thus, the MRT
+has little impact when an interactive workload runs alone
+or it shares the PCPU with another interactive workload.
+
+We next evaluate the extent of latency increase.
+Figure 13 shows the 25th, 50th, 75th, 90th, 95th and 99th
+percentile latency for Data-Caching. At the 50th per-
+centile and below, latency is the same as with an idle
+VCPU. However, at the 75th latency rises to half the
+MRT, indicating that a substantial fraction of requests are
+delayed.
+
+We repeated the above experiments for the work-
+conserving setting, and the results were essentially the
+same. We omit them for brevity. Overall, we ﬁnd that
+enforcing an MRT guarantee can severely increase la-
+tency when interactive VCPUs share a PCPU with CPU-
+intensive workloads. However, they have limited impact
+when multiple interactive VCPUs share a PCPU.
+
+USENIX Association  
+
+23rd USENIX Security Symposium  695
+
+ 
+
+e
+
+l
+i
+t
+
+ 
+)
+s
+m
+
+(
+ 
+y
+c
+n
+e
+
+t
+
+a
+
+l
+
+n
+e
+c
+r
+e
+p
+
+ 
+
+5
+9
+
+h
+
+t
+
+Idle
+Nqueens
+Cprobe
+Chatty-CProbe
+
+ 10
+ 9
+ 8
+ 7
+ 6
+ 5
+ 4
+ 3
+ 2
+ 1
+ 0
+
+ 0
+
+ 2
+
+ 4
+
+ 6
+
+ 8
+
+ 10
+
+Xen Ratelimit (ms)
+
+Figure 12: 95th Percentile Request Latency of Data-Caching
+Workload with Various Competing Micro-benchmarks.
+Under non-work-conserving scheduling.
+
+25
+50
+75
+90
+95
+99
+
+ 
+)
+s
+m
+
+(
+ 
+y
+c
+n
+e
+
+t
+
+a
+L
+e
+
+ 
+
+l
+i
+t
+
+n
+e
+c
+r
+e
+P
+
+ 12
+
+ 10
+
+ 8
+
+ 6
+
+ 4
+
+ 2
+
+ 0
+
+ 0
+
+ 2
+
+ 4
+
+ 6
+
+ 8
+
+ 10
+
+Xen Ratelimit (ms)
+
+Figure 13: 25th, 50th, 75th, 90th, 95th and 99th Percentile
+Latency of Data-Caching Workload when run alongside
+Nqueens. Under non-work-conserving scheduling.
+
+5.3 Batch Efﬁciency
+
+In addition to measuring the impact on latency-sensitive
+workloads, we also measure the impact of MRT guaran-
+tees on CPU-hungry workloads. The original goal of the
+MRT mechanism was to reduce frequent VCPU context-
+switches and improve performance of batch workloads.
+We pin a CPU-hungry workload to a PCPU against com-
+peting microbenchmarks.
+
+Figure 14 shows the effect of MRT values on the
+graph500 workload when run alongside various compet-
+ing workloads. Because this is work-conserving schedul-
+ing,
+the runtime of graph500 workload increases by
+roughly a factor of two when run alongside Nqueens and
+CProbe as compared to Idle, because the share of the
+PCPU given to the VCPU running graph500 drops by
+one half. The affect of MRT is more pronounced when
+
+looking running alongside Chatty-CProbe, the workload
+which tries to frequently interrupt graph500 and trash its
+cache. With no MRT guarantee, this can double the run-
+time of a program. But with a limit of only 0.5 ms, per-
+formance is virtually the same as with an idle VCPU,
+both because Chatty-CProbe uses much less CPU and
+because it trashes the cache less often.
+
+With a non-work-conserving scheduler, the picture is
+signiﬁcantly different. Figure 15 shows the performance
+of three batch workloads when run alongside a variety
+of other workloads, for various MRT values. First, we
+observe that competing CPU-bound workloads such as
+Nqueens and CProbe do not signiﬁcantly affect the per-
+formance of CPU-bound applications, even in the case of
+CProbe that trashes the cache. This occurs because the
+workloads share the PCPU at coarse intervals (30 ms),
+so the cache is only trashed once per 30 ms period. In
+contrast, when run with the interactive workload Chatty-
+CProbe, applications suffer up to 4% performance loss,
+which increases with longer MRT guarantees. Investi-
+gating the scheduler traces showed that under zero MRT
+the batch workload enjoyed longer scheduler time slices
+of 30 ms compared to the non-zero MRT cases. This
+was because under zero MRT highly interactive Chatty-
+CProbe quickly exhausted Xen’s boost priority. After
+this, Chatty-CProbe could not preempt and waited un-
+til the running VCPU’s 30 ms time slice expires. With
+longer MRT values, though, Chatty-CProbe continues to
+preempt and degrade performance more consistently.
+
+Another interesting observation in Figure 15 is that
+when the batch workloads share a PCPU with an idle
+VCPU,
+they perform worse than when paired with
+Nqueens or CProbe. Further investigation revealed that
+an idle VCPU is not completely idle but wakes up at
+regular intervals for guest timekeeping reasons. Over-
+all, under non-work-conserving settings, running a batch
+VCPU with any interactive VCPU (even an idle one) is
+worse than running with another batch VCPU (even one
+like CProbe that trashes the cache).
+
+5.4 System Performance
+The preceding sections showed the impact of MRT guar-
+antees when both applications are pinned to a single
+core. We next analyze the impact of the Xen scheduler’s
+VCPU placement policies, which choose the PCPU on
+which to schedule a runnable VCPU. We conﬁgure the
+system with 4 VMs each with 2 VCPUs to run on 4 PC-
+PUs under a non-work conserving scheduler. We run
+three different sets of workload mixes, which together
+capture a broad spectrum of competing workload com-
+binations. Together with a target workload running on
+both VCPUs of a single VM, we run: (1) All-Batch —
+consisting of worst-case competing CPU-hungry work-
+
+696  23rd USENIX Security Symposium 
+
+USENIX Association
+
+)
+s
+d
+n
+o
+c
+e
+s
+(
+ 
+
+e
+m
+
+i
+t
+
+n
+u
+r
+ 
+
+e
+g
+a
+r
+e
+v
+A
+
+ 56
+
+ 54
+
+ 52
+
+ 50
+
+ 48
+
+ 46
+
+ 44
+
+ 42
+
+ 40
+
+)
+s
+d
+n
+o
+c
+e
+s
+(
+ 
+
+e
+m
+
+i
+t
+
+n
+u
+r
+ 
+
+e
+g
+a
+r
+e
+v
+A
+
+ 270
+
+ 260
+
+ 250
+
+ 240
+
+ 230
+
+ 220
+
+ 210
+
+ 200
+
+ 
+t
+
+u
+p
+h
+g
+u
+o
+r
+h
+
+t
+ 
+
+e
+g
+a
+r
+e
+v
+A
+
+Idle
+Nqueens
+CProbe
+Chatty-CProbe
+
+Idle
+Nqueens
+CProbe
+Chatty-CProbe
+
+)
+c
+e
+s
+/
+s
+p
+o
+b
+K
+b
+b
+C
+E
+P
+S
+
+ 
+
+j
+
+(
+
+ 14
+
+ 13
+
+ 12
+
+ 11
+
+ 10
+
+ 9
+
+ 8
+
+Idle
+Nqueens
+CProbe
+Chatty-CProbe
+
+ 0
+
+ 2
+
+ 4
+
+ 6
+
+ 8
+
+ 10
+
+ 0
+
+ 2
+
+ 4
+
+ 6
+
+ 8
+
+ 10
+
+ 0
+
+ 2
+
+ 4
+
+ 6
+
+ 8
+
+ 10
+
+Xen Ratelimit (ms)
+
+(a) mcf
+
+Xen Ratelimit (ms)
+
+(b) graph500
+
+Xen Ratelimit (ms)
+
+(c) SPECjbb
+
+Figure 15: Average runtime of various batch workloads under non-work conserving setting. Note that for SPECjbb higher is
+better (since the graph plots the throughput instead of runtime). All data points are averaged across 5 runs.
+
+)
+s
+d
+n
+o
+c
+e
+s
+(
+ 
+
+e
+m
+
+i
+t
+
+n
+u
+r
+ 
+e
+g
+a
+r
+e
+v
+A
+
+ 200
+
+ 180
+
+ 160
+
+ 140
+
+ 120
+
+ 100
+
+ 80
+
+ 60
+
+ 40
+
+ 20
+
+Idle
+Nqueens
+CProbe
+Chatty-CProbe
+
+ 0
+
+ 2
+
+ 4
+
+ 6
+
+ 8
+
+ 10
+
+Xen Ratelimit (ms)
+
+Figure 14: Average runtime of graph500 workload when run
+alongside various competing workloads and under work-
+conserving scheduling. Averaged over 5 runs.
+
+load (CProbe); (2) All-Interactive — consisting of worst-
+case competing interactive workload (Chatty-CProbe);
+and (3) Batch & Interactive — where half of other VC-
+PUs run Chatty-CProbe and half CProbe. We compare
+the performance of Xen without MRT to running with
+the default 5ms limit. The result of the experiment is
+shown in Figure 16. For interactive workloads, the ﬁg-
+ure shows the relative 95th percentile latency, while for
+CPU-hungry workloads it shows relative execution time.
+On average across the three programs and three com-
+peting workloads, latency-sensitive workloads suffered
+on average of only 4% increase in latency with the MRT
+guarantee enabled. This contrasts sharply with the 5-fold
+latency increase in the pinned experiment discussed ear-
+lier. CPU-hungry workloads saw their performance im-
+prove by 0.3%. This makes sense given the results in the
+preceding section, which showed that an MRT guarantee
+offers little value to batch jobs in a non-work-conserving
+setting.
+
+To understand why the latency performance is so much
+
+e
+c
+n
+a
+m
+r
+o
+
+f
+r
+e
+P
+d
+e
+z
+
+ 
+
+i
+l
+
+a
+m
+r
+o
+N
+
+ 1.2
+
+ 1.1
+
+ 1
+
+ 0.9
+
+ 0.8
+
+All-Batch
+All-Interactive
+Interactive-Batch
+Idle
+
+p
+i
+n
+
+g
+
+m
+
+e
+
+m
+
+c
+
+a
+
+s
+
+s
+
+m
+
+c
+f
+
+c
+
+a
+
+c
+
+a
+
+n
+
+d
+
+r
+
+a
+
+h
+
+e
+
+d
+
+s
+
+p
+
+e
+
+g
+
+r
+
+a
+
+cj
+
+b
+
+b
+
+p
+
+h
+
+5
+
+0
+
+0
+
+Normalized Performance in a non-work-
+Figure 16:
+conserving conﬁguration with 5 ms MRT. Normalized to per-
+formance under zero-MRT case. The left three workloads re-
+port 95th percentile latency and the right three report runtime,
+averaged across 5 runs. In both cases lower is better.
+
+better than our earlier results would suggest, we analyzed
+a trace of the scheduler’s decisions. With the non-work-
+conserving setting, Xen naturally segregates batch and
+interactive workloads. When an interactive VCPU re-
+ceives a request, it will migrate to an idle PCPU rather
+than preempt a PCPU running a batch VCPU. As the
+PCPU running interactive VCPUs is often idle, this leads
+to coalescing the interactive VCPUs on one or more PC-
+PUs while the batch VCPUs share the remaining PCPUs.
+
+5.5 Summary
+Overall, our performance evaluation shows that
+the
+strong security beneﬁts described the in Section 4 can
+be achieved at low cost in virtualized settings. Prior
+research suggests more complex defense mechanisms
+[22, 26, 28, 43, 47] that achieve similar low performance
+overheads but at a higher cost of adoption, such as sub-
+
+USENIX Association  
+
+23rd USENIX Security Symposium  697
+
+stantial hardware changes or modiﬁcations to security-
+critical programs.
+In comparison, the MRT guarantee
+mechanism is simple and monotonically improves the
+security against many existing side-channel attacks with
+zero cost of adoption and low overhead.
+
+We note that differences between hypervisor schedul-
+ing and OS scheduling mean that the MRT mechanism
+cannot be as easily applied by an operating system to de-
+fend against malicious processes. As mentioned above, a
+hypervisor schedules a small and relatively static number
+of VCPUS onto PCPUs. Thus, it is feasible to coalesce
+VCPUs with interactive behavior onto PCPUs separate
+from those running batch VCPUs. Furthermore, virtu-
+alized settings generally run with share-based schedul-
+ing, where each VM or VCPU is assigned a ﬁxed share
+of CPU resources. In contrast, the OS scheduler must
+schedule an unbounded number of threads, often with-
+out assigned shares. Thus, there may be more oversub-
+scription of PCPUs, which removes the idle time that
+allows interactive VCPUs to coalesce separately from
+batch VCPUs. As a result, other proposed defenses may
+still be applicable for non-virtualized systems, such as
+PaaS platforms that multiplex code from several cus-
+tomers within a single VM [2].
+
+6
+
+Integrating Core-State Cleansing
+
+While the MRT mechanism was shown to be a cheap mit-
+igation for protecting CPU-hungry workloads, it may not
+be effective at protecting interactive ones. If a (victim)
+VCPU yields the PCPU quickly, the MRT guarantee does
+not apply and an attacker may observe its residual state in
+the cache, branch predictor, or other hardware structures.
+We are unaware of any attacks targeting such interactive
+workloads, but that is no guarantee future attacks won’t.
+We investigate incorporating per-core state-cleansing
+into hypervisor scheduling. Here we are inspired in
+large part by the D¨uppel system [47], which was pro-
+posed as a method for guest operating systems to pro-
+tect themselves by periodically cleansing a fraction of
+the L1 caches. We will see that by integrating a se-
+lective state-cleansing (SC) mechanism for I-cache, D-
+cache and branch predictor states into a scheduler that al-
+ready enforces an MRT guarantee incurs much less over-
+head than one might expect. When used, our cleansing
+approach provides protection for all processes within a
+guest VM (unlike D¨uppel, which targeted particular pro-
+cesses).
+
+6.1 Design and Implementation
+We ﬁrst discuss the cleansing process, and below discuss
+when to apply it. The cleanser works by executing a spe-
+cially crafted sequence of instructions that together over-
+
+write the I-cache, D-cache, and branch predictor states of
+a CPU core. A sample of these instructions is shown in
+Figure 17; these instructions are 27 bytes long and ﬁt in
+a single I-cache line.
+
+In order to overwrite the branch predictor or the
+Branch Target Buffer (BTB) state, a branch instruction
+conditioned over a random predicate in memory is used.
+There are memory move instructions that add noise to
+the D-cache state as well. The last instruction in the set
+jumps to an address that corresponds to the next way in
+the same I-cache set. This jump sequence is repeated un-
+til the last way in the I-cache set is accessed, at which
+point it is terminated with a ret instruction. These in-
+structions and the random predicates are laid out in mem-
+ory buffers that are equal to the size of the I-cache and
+D-cache, respectively. Each invocation of the cleansing
+mechanism randomly walks through these instructions to
+touch all I-cache sets, D-cache sets, and ﬂush the BTB.
+We now turn to how we have the scheduler decide
+when to schedule cleansing. There are several possibil-
+ities. The simplest strategy would be to check, when a
+VCPU wakes up, if the prior running VCPU was from
+another VM and did not use up its MRT. If so, then run
+the cleansing procedure before the incoming VCPU. We
+refer to this strategy as Delayed-SC because we defer
+cleansing until a VCPU wants to execute. This strat-
+egy guarantees to cleanse only when needed, but has the
+downside of potentially hurting latency-sensitive appli-
+cations (since the cleanse has to run between receiving
+an interrupt and executing the VCPU). Another strategy
+is to check, when a VCPU relinquishes the PCPU be-
+fore its MRT guarantee expires, whether the next VCPU
+to run is from another domain or if the PCPU will go
+idle. In either case, a cleansing occurs before the next
+VCPU or idle task runs. Note that we may do unnec-
+essary cleansing here, because the VCPU that runs after
+idle may be from the same domain. We therefore refer
+to this strategy as Optimistic-SC, given its optimism that
+a cross-VM switch will occur after idle. This optimism
+may pay off because idle time can be used for cleansing.
+Note that the CPU time spent in cleansing in Delayed-
+SC is accounted to the incoming VCPU but it is often
+free with Optimistic-SC as it uses idle time for cleansing
+when possible.
+
+6.2 Evaluation
+We focus our evaluation on latency-sensitive tasks: be-
+cause we only cleanse when an MRT guarantee is not hit,
+CPU-hungry workloads will only be affected minimally
+by cleansing. Quantitatively the impact is similar to the
+results of Section 5 that show only slight degradation due
+to Chatty-CProbe on CPU-hungry workloads.
+
+We use the hardware conﬁguration shown in Figure 2.
+
+698  23rd USENIX Security Symposium 
+
+USENIX Association
+
+000 <L13-0xd>:
+
+0: 8b 08
+2: 85 c9
+4: 74 07
+6: 8b 08
+8: 88 4d ff
+b: eb 05
+
+00d <L13>:
+d: 8b 08
+f: 88 4d ff
+
+012 <L14>:
+
+mov
+test
+je
+mov
+mov
+jmp
+
+(%rax),%ecx
+%ecx,%ecx
+d <L13>
+(%rax),%ecx
+%cl,-0x1(%rbp)
+12 <L14>
+
+mov
+mov
+
+(%rax),%ecx
+%cl,-0x1(%rbp)
+
+ 
+)
+s
+m
+
+(
+ 
+y
+c
+n
+e
+a
+L
+
+t
+
+ 2.2
+ 2
+ 1.8
+ 1.6
+ 1.4
+ 1.2
+ 1
+ 0.8
+ 0.6
+ 0.4
+ 0.2
+ 0
+
+p
+i
+n
+
+g
+
+a
+
+p
+
+a
+
+c
+
+h
+
+e
+
+a
+t
+a
+
+-
+
+a
+t
+a
+
+-
+
+C
+
+S
+
+p
+i
+n
+
+g
+
+a
+
+p
+
+a
+
+c
+
+a
+t
+a
+
+-
+
+a
+t
+a
+
+-
+
+C
+
+S
+
+h
+
+e
+
+D
+
+D
+
+D
+
+D
+
+a
+
+c
+
+e
+
+r
+vi
+
+h
+i
+n
+
+g
+
+n
+
+g
+
+a
+
+c
+
+e
+
+r
+vi
+
+h
+i
+n
+
+g
+
+n
+
+g
+
+12: 48 8b 40 08
+17: e9 e5 1f 00 00
+
+mov
+jmpq
+
+0x8(%rax),%rax
+<next way in set>
+
+Median
+
+   95th Percentile
+
+0ms-MRT
+5ms-MRT
+Delayed-SC
+
+Optimistic-SC
+
+Instructions used to add noise. The assembly
+Figure 17:
+code is shown using X86 GAS Syntax. %rax holds the address
+of the random predicate used in the test instruction at the rel-
+ative address 0x2. The moves in the basic blocks <L13> and
+<L14> reads the data in the buffer, which uses up the corre-
+sponding D-cache set.
+
+Figure 18: Median and 95th percentile latency impact of the
+cleansing scheduler under worst-case scenario. Here all the
+measured workloads are feed by a client at 500 requests per
+second. The error bars show the standard deviation across 3
+runs.
+
+We measured the standalone, steady state execution time
+of the cleansing routine as 8.4 µs; all overhead beyond
+that is either due to additional cache misses that the
+workload experiences or slow down of the execution of
+the cleansing routine which might itself experience ad-
+ditional cache misses. To measure the overhead of the
+cleansing scheduler, we pinned two VCPUs of two dif-
+ferent VMs to a single PCPU. We measured the perfor-
+mance of one of several latency-sensitive workloads run-
+ning within one of these VMs, while the other VM ran a
+competing workload similar to Chatty-CProbe (but it did
+not access memory buffers when awoken). This ensured
+frequent cross-VM VCPU-switches simulating a worst
+case scenario for the cleansing scheduler.
+
+We ran this experiment in four settings: no MRT guar-
+antee (0ms-MRT), a 5 ms MRT guarantee (5ms-MRT),
+a 5 ms MRT with Delayed-SC, and ﬁnally a 5 ms MRT
+with Optimistic-SC. Figure 18 shows the median and
+95th percentile latencies under this experiment. The me-
+dian latency increases between 10–50 µs compared to the
+5ms-MRT baseline, while the 95th percentile results are
+more variable, and show at worst a 100 µs increase in tail
+latency. For very fast workloads, like Ping, this results
+in a 17% latency increase despite the absolute overhead
+being small. Most of the overhead comes from reloading
+data into the cache, as only 1/3rd of the overhead is from
+executing the cleansing code.
+
+To measure overhead for non-adversarial workloads,
+we replaced the synthetic worst-case interactive work-
+load with a moderately loaded Apache webserver (at 500
+requests per second). The result of this experiment is not
+shown here as it looks almost identical to Figure 18, sug-
+
+gesting the choice of competing workload has relatively
+little impact on overheads. In this average-case scenario,
+we observed an overhead of 20–30 µs across all work-
+loads for the Delayed-SC and 10–20 µs for Optimistic-
+SC, which is 10 µs faster. Note that in all the above cases,
+the cleansing mechanism perform better than the base-
+line of no MRT guarantee with no cleansing.
+
+To further understand the trade-off between the two
+variations of state-cleansing, we repeated the ﬁrst (worst-
+case) experiment above with varying load on the two
+latency-sensitive workloads, Data-Caching and Data-
+The 95th percentile and median latencies
+Serving.
+of these workloads under varying loads are shown in
+Figure 19 and Figure 20, respectively. The offered load
+shown on the x-axis is equivalent to the load perceived
+at the server in all cases except for Data-Serving work-
+load whose server throughput saturates at 1870rps (this
+is denoted as Max in the graph).
+
+The results show that the two strategies perform simi-
+larly in most situations, with optimization beneﬁting in a
+few cases. In particular, we see that the 95% latency for
+heavier loads on Data-Serving (1250, 1500, and 1750)
+is signiﬁcantly reduced for Optimistic-SC over Delayed-
+SC. It turned out that the use of idle-time for cleans-
+ing in Optimistic-SC was crucial for Data-Serving work-
+load as the tens to hundreds of microsecond overhead
+of cleansing mechanism under the Delayed-SC scheme
+was enough to exhaust boost priority at higher loads.
+From scheduler traces of the runs with Data-Serving
+at 1500rps, we found that the VM running the Data-
+Serving workload spent 1.9s without boost priority un-
+der Delayed-SC compared to 0.8s and 1.1s spent under
+
+USENIX Association  
+
+23rd USENIX Security Symposium  699
+
+)
+s
+m
+
+(
+ 
+y
+c
+n
+e
+a
+L
+
+t
+
+ 500
+
+ 400
+
+ 300
+
+ 200
+
+ 100
+20
+ 0.8
+ 0.7
+ 0.6
+ 0.5
+ 0.4
+ 0.3
+ 0.2
+ 0.1
+ 0
+
+)
+s
+m
+
+(
+ 
+y
+c
+n
+e
+t
+a
+L
+
+ 38
+ 36
+ 34
+ 32
+ 30
+ 28
+ 26
+ 12
+ 10
+ 8
+ 6
+ 4
+ 2
+ 0
+
+0ms-MRT
+5ms-MRT
+Delayed-SC
+Optimistic-SC
+
+1
+
+0
+
+5
+
+0
+
+1
+
+0
+
+1
+
+2
+
+1
+
+5
+
+1
+
+7
+
+2
+
+0
+
+0
+
+0
+
+0
+
+0
+
+5
+
+0
+
+0
+
+0
+
+5
+
+0
+
+0
+
+0
+
+Load (requests per second)
+
+(a) Data-Caching
+
+0ms-MRT
+5ms-MRT
+Delayed-SC
+Optimistic-SC
+
+1
+
+5
+
+1
+
+1
+
+1
+
+1
+
+M
+
+0
+
+0
+
+0
+
+0
+
+0
+
+0
+
+2
+
+5
+
+5
+
+0
+
+7
+
+5
+
+0
+
+0
+
+0
+
+0
+
+a
+
+x
+
+Load (requests per second)
+
+(b) Data-Serving
+
+)
+s
+m
+
+(
+ 
+y
+c
+n
+e
+a
+L
+
+t
+
+ 250
+
+ 200
+
+ 150
+
+ 100
+
+ 50
+
+5
+ 0.8
+ 0.7
+ 0.6
+ 0.5
+ 0.4
+ 0.3
+ 0.2
+ 0.1
+ 0
+
+ 
+)
+s
+m
+
+(
+ 
+y
+c
+n
+e
+t
+a
+L
+
+ 1.1
+
+ 1
+
+ 0.9
+
+ 0.8
+
+ 0.7
+
+ 0.6
+
+ 0.5
+
+0ms-MRT
+5ms-MRT
+Delayed-SC
+Optimistic-SC
+
+1
+
+5
+
+1
+
+1
+
+1
+
+1
+
+2
+
+0
+
+0
+
+0
+
+0
+
+0
+
+0
+
+2
+
+5
+
+5
+
+0
+
+7
+
+5
+
+0
+
+0
+
+0
+
+0
+
+0
+
+0
+
+0
+
+Load (requests per second)
+
+(a) Data-Caching
+
+0ms-MRT
+5ms-MRT
+Delayed-SC
+Optimistic-SC
+
+1
+
+5
+
+1
+
+1
+
+1
+
+1
+
+M
+
+0
+
+0
+
+0
+
+0
+
+0
+
+0
+
+2
+
+5
+
+5
+
+0
+
+7
+
+5
+
+0
+
+0
+
+0
+
+0
+
+a
+
+x
+
+Load (requests per second)
+
+(b) Data-Serving
+
+Figure 19: 95th percentile latency impact of the cleansing
+scheduler with varying load on the server. (a) Data-Caching
+and (b) Data-Serving. The error bars show the standard devia-
+tion across 3 runs.
+
+Figure 20: Median latency impact of the cleansing sched-
+uler with varying load on the servers. (a) Data-Caching and
+(b) Data-Serving. The error bars show the standard deviation
+across 3 runs.
+
+5ms-MRT and Optimistic-SC, respectively (over a 120
+long second run). The Data-Serving VM also experi-
+enced 37% fewer wakeups under Delayed-SC relative to
+5ms-MRT baseline, implying less interactivity.
+
+We conclude that both strategies provide a high-
+performance mechanism for selectively cleansing, but
+that Optimistic-SC handles certain cases slightly better
+due to taking advantage of idle time.
+
+7 Conclusions
+
+Cloud computing promises improved efﬁciency, but
+opens up new threats due to the sharing of hardware
+across mutually distrustful customers. While virtual ma-
+chine managers effectively prevent direct access to the
+data of other customers, current hardware platforms in-
+herently leak information when that data is accessed
+through predictive structures such as caches and branch
+predictors.
+
+We propose that the ﬁrst line of defense against these
+
+attacks should be the software responsible for determin-
+ing access: the hypervisor scheduler. For cache-based
+side channels, we showed that the simple mechanism of
+MRT guarantees can prevent useful information from be-
+ing obtained via side-channel attacks that abuse per-core
+state. This suggests a high performance way of achieving
+soft isolation, which limits the frequency of potentially
+dangerous cross-VM interactions.
+
+We also investigate how the classic defense technique
+of CPU state cleansing can interoperate productively
+with MRT guarantees. This provides added protection
+for interactive workloads at low cost, and takes advan-
+tage of the fact that the use of MRT makes rescheduling
+(each of which may require cleansing) rarer.
+
+Finally we note that while the focus of our work was
+on side-channel attacks, the soft-isolation approach, and
+the mechanisms we consider in this paper in particu-
+lar, should also be effective at mitigating other classes
+of shared-resource attacks.
+For example, resource-
+freeing [39] and on-system degradation-of-service at-
+tacks.
+
+700  23rd USENIX Security Symposium 
+
+USENIX Association
+
+Acknowledgments
+
+We thank Yinqian Zhang for sharing his thoughts on de-
+fenses against side-channel attacks and the code for the
+IPI-attacker that was used in the ZJRR attack. This work
+was supported in part by NSF grants 1253870, 1065134,
+and 1330308 and a generous gift from Microsoft. Swift
+has a signiﬁcant ﬁnancial interest in Microsoft.
+
+References
+[1] Graph 500 benchmark 1.
+
+graph500.org/.
+
+http://www.
+
+[2] Heroku PaaS system.
+
+com/.
+
+https://www.heroku.
+
+[3] O. Aciic¸mez. Yet another microarchitectural at-
+tack:: Exploiting i-cache.
+In Proceedings of the
+2007 ACM Workshop on Computer Security Archi-
+tecture, CSAW ’07, pages 11–18, New York, NY,
+USA, 2007. ACM.
+
+[4] O. Aciic¸mez, c. K. Koc¸, and J.-P. Seifert. On the
+power of simple branch prediction analysis.
+In
+Proceedings of the 2Nd ACM Symposium on Infor-
+mation, Computer and Communications Security,
+ASIACCS ’07, pages 312–320, New York, NY,
+USA, 2007. ACM.
+
+[5] O. Aciic¸mez, W. Schindler, and C¸ . K. Koc¸. Cache
+based remote timing attack on the AES. In Topics in
+Cryptology – CT-RSA 2007, The Cryptographers’
+Track at the RSA Conference 2007, pages 271–286,
+Feb. 2007.
+
+[6] A. Aviram, S. Hu, B. Ford, and R. Gummadi.
+Determinating timing channels in compute clouds.
+In Proceedings of the 2010 ACM workshop on
+Cloud computing security workshop, pages 103–
+108. ACM, 2010.
+
+[7] D. J. Bernstein. Cache-timing attacks on AES,
+
+2005.
+
+[8] J. Bl¨omer, J. Guajardo, and V. Krummel. Provably
+secure masking of aes. In Selected Areas in Cryp-
+tography, pages 69–83. Springer, 2005.
+
+[9] E. Brickell, G. Graunke, M. Neve, and J.-P. Seifert.
+Software mitigations to hedge aes against cache-
+based software side channel vulnerabilities. IACR
+Cryptology ePrint Archive, 2006:52, 2006.
+
+[10] D. Brumley and D. Boneh. Remote timing attacks
+are practical. Computer Networks, 48(5):701–716,
+2005.
+
+[11] G. Dunlap. Xen 4.2: New scheduler parameters.
+http://blog.xen.org/index.php/2012/04/10/xen-4-2-
+new-scheduler-parameters-2/.
+
+[12] B. Farley, A. Juels, V. Varadarajan, T. Ristenpart,
+K. D. Bowers, and M. M. Swift. More for your
+money: Exploiting performance heterogeneity in
+public clouds.
+In Proceedings of the Third ACM
+Symposium on Cloud Computing, SoCC ’12. ACM,
+2012.
+
+[13] M. Ferdman, A. Adileh, O. Kocberber, S. Vo-
+los, M. Alisafaee, D. Jevdjic, C. Kaynak, A. D.
+Popescu, A. Ailamaki, and B. Falsaﬁ. Clearing the
+clouds: a study of emerging scale-out workloads
+on modern hardware.
+In Proceedings of the sev-
+enteenth international conference on Architectural
+Support for Programming Languages and Operat-
+ing Systems, ASPLOS ’12. ACM, 2012.
+
+[14] K. Gandolﬁ, C. Mourtel, and F. Olivier. Electro-
+magnetic analysis: Concrete results.
+In Crypto-
+graphic Hardware and Embedded Systems – CHES
+2001, volume 2162 of LNCS, pages 251–261, May
+2001.
+
+[15] D. Gullasch, E. Bangerter, and S. Krenn. Cache
+games – bringing access-based cache attacks on
+AES to practice. In Security and Privacy (SP), 2011
+IEEE Symposium on, 2011.
+
+[16] M. W. B. Heinz and F. Stumpf. A cache timing at-
+tack on AES in virtualization environments. In 16th
+International Conference on Financial Cryptogra-
+phy and Data Security, Feb. 2012.
+
+[17] J. L. Henning. Spec cpu2006 benchmark descrip-
+
+tions. SIGARCH Comput. Archit. News, 2006.
+
+[18] HTTPing.
+
+Httping client.
+vanheusden.com/httping/.
+
+http://www.
+
+[19] G. Irazoqui, M. S. Inci, T. Eisenbarth, and B. Sunar.
+Wait a minute! A fast, Cross-VM attack on AES.
+Cryptology ePrint Archive, Report 2014/435, 2014.
+http://eprint.iacr.org/.
+
+[20] P. A. Karger and J. C. Wray. Storage channels in
+disk arm optimization. In 2012 IEEE Symposium
+on Security and Privacy, pages 52–52. IEEE Com-
+puter Society, 1991.
+
+[21] E. Keller, J. Szefer, J. Rexford, and R. B. Lee. No-
+hype: virtualized cloud infrastructure without the
+virtualization. In Proceedings of the 37th annual in-
+ternational symposium on Computer architecture,
+ISCA ’10, pages 350–361, New York, NY, USA,
+2010. ACM.
+
+[22] T. Kim, M. Peinado, and G. Mainar-Ruiz. Stealth-
+mem: System-level protection against cache-based
+side channel attacks in the cloud. In Proceedings
+of the 21st USENIX Conference on Security Sym-
+posium, Security’12. USENIX Association, 2012.
+[23] P. Kocher, J. Jaffe, and B. Jun. Differential power
+analysis.
+In Advances in Cryptology – CRYPTO
+’99, volume 1666 of LNCS, pages 388–397, Aug.
+1999.
+
+[24] P. C. Kocher. Timing attacks on implementations
+of Difﬁe-Hellman, RSA, DSS, and other systems.
+In N. Koblitz, editor, Advances in Cryptology –
+Crypto’96, volume 1109 of LNCS, pages 104–113.
+Springer-Verlag, 1996.
+
+[25] J. Kong, O. Aciic¸mez, J.-P. Seifert, and H. Zhou.
+Hardware-software integrated approaches to de-
+fend against software cache-based side channel at-
+tacks. In HPCA, pages 393–404. IEEE Computer
+Society, 2009.
+
+USENIX Association  
+
+23rd USENIX Security Symposium  701
+
+[26] P. Li, D. Gao, and M. K. Reiter. Mitigating access-
+driven timing channels in clouds using stopwatch.
+2013 43rd Annual IEEE/IFIP International Confer-
+ence on Dependable Systems and Networks (DSN),
+0:1–12, 2013.
+
+[27] J. Mars, L. Tang, R. Hundt, K. Skadron, and
+M. L. Soffa. Bubble-up:
+increasing utilization
+in modern warehouse scale computers via sensible
+co-locations.
+In Proceedings of the 44th Annual
+IEEE/ACM International Symposium on Microar-
+chitecture, MICRO-44 ’11. ACM, 2011.
+
+[28] R. Martin, J. Demme, and S. Sethumadhavan.
+Timewarp: Rethinking timekeeping and perfor-
+mance monitoring mechanisms to mitigate side-
+channel attacks.
+In Proceedings of the 39th An-
+nual International Symposium on Computer Archi-
+tecture, ISCA ’12. IEEE Computer Society, 2012.
+
+[29] I. Molnar.
+
+Linux Kernel Documenta-
+http:
+
+CFS Scheduler Design.
+
+tion:
+//www.kernel.org/doc/Documentation/
+scheduler/sched-design-CFS.txt.
+
+[30] R. Nathuji, A. Kansal, and A. Ghaffarkhah. Q-
+clouds: Managing performance interference effects
+for QoS-aware clouds.
+In Proceedings of the 5th
+European Conference on Computer Systems, Eu-
+roSys ’10, pages 237–250, 2010.
+
+[31] D. A. Osvik, A. Shamir, and E. Tromer. Cache
+attacks and countermeasures: The case of AES.
+In Proceedings of the 2006 The Cryptographers’
+Track at the RSA Conference on Topics in Cryp-
+tology, pages 1–20, Berlin, Heidelberg, 2006.
+Springer-Verlag.
+
+[32] C. Percival. Cache missing for fun and proﬁt. In
+
+Proc. of BSDCan 2005, 2005.
+
+[33] J.-J. Quisquater and D. Samyde. Electromagnetic
+analysis (EMA): Measures and counter-measures
+for smart cards. In Smart Card Programming and
+Security, International Conference on Research in
+Smart Cards, E-smart 2001, volume 2140 of LNCS,
+pages 200–210, Sept. 2001.
+
+[34] H. Raj, R. Nathuji, A. Singh, and P. England. Re-
+source management for isolation enhanced cloud
+services.
+In Proceedings of the 2009 ACM work-
+shop on Cloud computing security, pages 77–84.
+ACM, 2009.
+
+[35] T. Ristenpart, E. Tromer, H. Shacham, and S. Sav-
+age. Hey, you, get off of my cloud: Exploring in-
+formation leakage in third-party compute clouds. In
+Proceedings of the 16th ACM conference on Com-
+puter and communications security, pages 199–
+212. ACM, 2009.
+
+[36] J. Shi, X. Song, H. Chen, and B. Zang. Limit-
+ing cache-based side-channel in multi-tenant cloud
+using dynamic page coloring.
+In Dependable
+Systems and Networks Workshops (DSN-W), 2011
+IEEE/IFIP 41st International Conference on, pages
+194–199. IEEE, 2011.
+
+[37] SPEC. SPECjbb2005 - Industry-standard server-
+side Java benchmark (J2SE 5.0). Standard Perfor-
+mance Evaluation Corporation, June 2005.
+
+[38] L. Tang, J. Mars, and M. L. Soffa. Contentiousness
+vs. sensitivity: improving contention aware runtime
+systems on multicore architectures.
+In Proceed-
+ings of the 1st International Workshop on Adap-
+tive Self-Tuning Computing Systems for the Exaﬂop
+Era, EXADAPT ’11, pages 12–21, New York, NY,
+USA, 2011. ACM.
+
+[39] V. Varadarajan, T. Kooburat, B. Farley, T. Risten-
+part, and M. M. Swift. Resource-freeing attacks:
+Improve your cloud performance (at your neigh-
+bor’s expense).
+In Proceedings of the 2012 ACM
+conference on Computer and communications se-
+curity, CCS ’12, pages 281–292, New York, NY,
+USA, 2012. ACM.
+
+[40] V. Varadarajan, T. Ristenpart, and M. Swift.
+Scheduler-based Defenses against Cross-VM Side-
+channels, 2014. Full version, available from au-
+thors’ web pages.
+
+[41] B. C. Vattikonda, S. Das, and H. Shacham. Elimi-
+nating ﬁne grained timers in Xen (short paper). In
+T. Ristenpart and C. Cachin, editors, Proceedings
+of CCSW 2011. ACM Press, Oct. 2011.
+
+[42] Z. Wang and R. B. Lee. New cache designs for
+thwarting software cache-based side channel at-
+tacks. In Proceedings of the 34th annual interna-
+tional symposium on Computer architecture, ISCA
+’07, pages 494–505, New York, NY, USA, 2007.
+ACM.
+
+[43] Z. Wang and R. B. Lee. New cache designs for
+thwarting software cache-based side channel at-
+tacks. In Proceedings of the 34th Annual Interna-
+tional Symposium on Computer Architecture, ISCA
+’07. ACM, 2007.
+
+[44] Z. Wang and R. B. Lee. A novel cache architec-
+ture with enhanced performance and security.
+In
+Proceedings of the 41st annual IEEE/ACM Inter-
+national Symposium on Microarchitecture, MICRO
+41, pages 83–93, Washington, DC, USA, 2008.
+IEEE Computer Society.
+
+[45] Y. Yarom and K. Falkner.
+
+a
+High Resolution, Low Noise, L3 Cache Side-
+Channel Attack. Cryptology ePrint Archive, Report
+2013/448, 2013. http://eprint.iacr.org/.
+
+Flush+Reload:
+
+[46] Y. Zhang, A. Juels, M. K. Reiter, and T. Risten-
+part. Cross-VM side channels and their use to ex-
+tract private keys. In Proceedings of the 2012 ACM
+conference on Computer and communications se-
+curity, CCS ’12, pages 305–316, New York, NY,
+USA, 2012. ACM.
+
+[47] Y. Zhang and M. K. Reiter. D¨uppel: Retroﬁtting
+commodity operating systems to mitigate cache
+side channels in the cloud.
+In Proceedings of
+the 2013 ACM SIGSAC Conference on Computer;
+Communications Security, CCS ’13. ACM, 2013.
+
+702  23rd USENIX Security Symposium 
+
+USENIX Association
+
+

@@ -1,18 +1,30 @@
-import unicodedata
+import csv, sys
+csv.field_size_limit(sys.maxsize)
 
-out = []
-f = open('rawPapers.txt','r')
-out = f.readlines()
+papers_info = []
+with open('papers400_whole.csv','rU') as cf:
+    rd = csv.reader(cf, delimiter=',', quotechar='|')
+    for r in rd:
+        papers_info.append(r)
+
+f = open('dataNames.txt', 'r')
+words = [x for x in f.read().split()]
 f.close()
 
-for i in range(len(out)):
-    out[i] = unicode(out[i], 'utf-8')
-    out[i] = unicodedata.normalize('NFKD', out[i])
-    out[i] = out[i].encode('utf-8')
+true = 0
+false = 0
 
-outPut = ' '.join(''.join(out).split('\n'))
-outPut = outPut.replace('  ',' ')
-f = open('rawPapers2.txt', 'w')
-f.write(outPut)
-f.close()
+for paper in papers_info:
+    name, text, label = paper[0], paper[1], paper[2]
+    for word in words:
+        if word in text:
+            if label =='Data':
+                true += 1
+                break
+            else:
+                false += 1
+                print name, word
+                break
 
+print 'true', true
+print 'false', false

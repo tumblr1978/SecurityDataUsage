@@ -1,0 +1,1850 @@
+MAPLE: A Scalable Architecture for Maintaining Packet
+
+Latency Measurements
+
+Myungjin Lee†, Nick Dufﬁeld‡, Ramana Rao Kompella†
+
+†Purdue University, ‡AT&T Labs–Research
+
+ABSTRACT
+Latency has become an important metric for network moni-
+toring since the emergence of new latency-sensitive applica-
+tions (e.g., algorithmic trading and high-performance com-
+puting). To satisfy the need, researchers have proposed
+new architectures such as LDA and RLI that can provide
+ﬁne-grained latency measurements. However, these archi-
+tectures are fundamentally ossiﬁed in their design as they
+are designed to provide only a speciﬁc pre-conﬁgured aggre-
+gate measurement—either average latency across all packets
+(LDA) or per-ﬂow latency measurements (RLI). Network op-
+erators, however, need latency measurements at both ﬁner
+(e.g., packet) as well as ﬂexible (e.g., ﬂow subsets) levels of
+granularity. To bridge this gap, we propose an architecture
+called MAPLE that essentially stores packet-level latencies
+in routers and allows network operators to query the latency
+of arbitrary traﬃc sub-populations. MAPLE is built using
+scalable data structures with small storage needs (uses only
+12.8 bits/packet), and uses a novel mechanism to reduce the
+query bandwidth signiﬁcantly (by a factor of 17 compared to
+the naive method of sending packet queries individually).
+
+Categories and Subject Descriptors
+C.2.3 [Computer Communication Networks]: Network
+management
+
+General Terms
+Measurement, algorithms
+
+Keywords
+Latency, bloom ﬁlter, approximation
+
+1.
+
+INTRODUCTION
+
+For the longest time, networking engineers and researchers
+have focused mainly on obtaining high end-to-end through-
+put in IP networks. In recent years, however, latency has
+
+ 
+Permission to make digital or hard copies of all or part of this work for 
+personal or classroom use is granted without fee provided that copies are 
+not  made  or  distributed  for  profit  or  commercial  advantage  and  that 
+copies  bear  this  notice  and  the  full  citation  on  the  first  page.  To  copy 
+otherwise,  or  republish,  to  post  on  servers  or  to  redistribute  to  lists, 
+requires prior specific permission and/or a fee. 
+IMC’12, November 14–16, 2012, Boston, Massachusetts, USA. 
+Copyright 2012 ACM  978-1-4503-1705-4/12/11...$15.00. 
+ 
+
+evolved into a metric that is as important as throughput in
+IP networks. While low latency is a desirable property for
+any network-based application, this obsession towards low
+end-to-end latency stems from the stringent requirements of
+many new kinds of datacenter, cloud, and wide-area appli-
+cations that have become popular in the recent times. For
+instance, several cloud applications (e.g., Salesforce, Google
+App Engine, modern Web services) involve complex back-
+end processing, such as accessing storage, SQL database
+transactions, etc. After removing time for computation and
+wide-area RTTs, the budget for datacenter network accesses
+is signiﬁcantly reduced. Similar requirement exists for par-
+tition/aggregate type workloads found in search and social
+collaboration applications, where jobs that do not ﬁnish
+within a certain time are typically cancelled thus aﬀecting
+the overall result, and in some cases, lost revenue [7]. Even
+more stringent latency requirements, in the order of 10s of
+microseconds, exist for high-performance computing (HPC)
+applications [1] and ﬁnancial trading applications [31].
+
+Network operators managing such latency-sensitive ap-
+plications need sophisticated tools for high-ﬁdelity latency
+measurements at various places in the network that will help
+them identify root causes of SLA violations, determine of-
+fending applications that may hurt the performance of oth-
+ers, perform traﬃc engineering, and so on. In light of the
+importance of these measurements, there has been some re-
+cent research on developing measurement mechanisms such
+as the lossy diﬀerence aggregator (LDA) [26] and reference
+latency interpolation (RLI) [27]. A key limitation of these
+techniques is that they only obtain latency measurements at
+the granularity of a ﬁxed pre-conﬁgured aggregate (across all
+packets in LDA, and per-ﬂow latencies in RLI). By making
+the granularity of the aggregates for latency measurements
+part of the architecture, these prior architectures are quite
+ossiﬁed, lacking ﬂexibility to obtain arbitrary latency mea-
+surements than what they are already pre-programmed to
+achieve. What network operators need instead is a holis-
+tic architecture that provides the ability to obtain arbitrary
+latency measurements from switches. Such an architecture
+would help operators with powerful tools to help debug and
+manage low-latency applications in their networks. Design-
+ing such an architecture is the main objective of this paper.
+In our quest to obtain arbitrary latency measurements
+from switches, we ask, “What is the ﬁnest granularity of la-
+tency measurements a network operator may be interested in
+?” LDA and RLI implicitly assumed that aggregate or ﬂow-
+level granularity of measurements is what operators may
+care about. In this paper, we argue instead that there are
+
+101many compelling scenarios where ﬁner-granularity measure-
+ments may be important.
+
+For example, for diagnosing client delays in online ser-
+vices, it may be critical to know whether a DNS query (that
+is typically a single packet) got delayed, or whether a back-
+end transaction got delayed in the network, or whether there
+were processing delays. As another canonical example, in a
+real-time bidding (RTB) ecosystem for online ads, bidders
+(e.g., agency trading desks) must respond to bid requests
+within a tight deadline (say, less than 120 ms) by typically
+shipping their response message with bidding price in a sin-
+gle packet [4]. Failing to meet the deadline makes the bid-
+ders miss an opportunity of exposing commercials of their
+customers (i.e., advertisers) to the public. As a result, the
+customers can experience bad practice of marketing, poten-
+tially causing signiﬁcant revenue loss to the customers. Sim-
+ilarly, for ﬁnancial trading applications, one may care about
+the delay of a single stock trade (that may be carried in one
+packet). For HPC applications built on message passing li-
+braries (e.g., MPI), latency of even a single message may be
+quite important. In addition, one may wish to focus on la-
+tencies for a subset of packets that belong to a ﬂow, perhaps
+to hone in on the ones that exhibited abnormal latency, or
+to track the latency time-series of the ﬂow. Thus, clearly, in
+order to satisfy these requirements, we need a more ﬂexible
+architecture than the one-size-ﬁts-all approach of existing
+solutions such as LDA (aggregate) or RLI (per-ﬂow).
+
+Since the ﬁnest granularity of latency measurements is
+on a per-packet basis, we start with an architecture that
+achieves these measurements in a scalable fashion. Then,
+any other forms of aggregation (per-ﬂow, per-preﬁx), that
+may be of importance to network operators, are easily com-
+posable from these packet-level measurements. Such an ar-
+chitecture essentially decouples the collection of measure-
+ments (at the granularity of a packet), and aggregation (across
+arbitrary subpopulations) during query time. This key intu-
+ition forms the basis for our proposed architecture MAPLE.
+MAPLE essentially consists of two main components—a
+scalable packet latency store (PLS) and a query engine—
+at each router. PLS stores the latencies of all packets that
+appear at the router.
+In high speed networks, storing all
+the packets and their associated latencies is going to be ex-
+pensive; hence we store latencies only for a small amount
+of time (e.g., 1s) in high-speed SRAM, and rely on ﬂush-
+ing them periodically to a higher capacity data store. Since
+storing the entire packet and delay requires high storage (in
+terms of bits/packet), we propose a novel approach that ﬁrst
+clusters packets and associates a delay value for each clus-
+ter, and then, uses a novel hardware data structure called
+shared-vector Bloom ﬁlter (SVBF) to signiﬁcantly reduce
+the memory requirement. SVBF makes the architecture
+technologically feasible in high-speed switches where SRAM
+is a very scarce and precious resource. We show how the en-
+tire PLS can enable an eﬃcient streaming implementation
+in hardware that can keep up with line rates.
+
+The second component of MAPLE, the query engine, es-
+sentially allows end-hosts or a centralized entity to initiate
+a query for the packet. These queries need to be within a
+particular timeframe of the original packet; otherwise, the
+store in the router may not have any history of the packet.
+By constructing queries across arbitrary packets, end-hosts
+can easily obtain per-packet latencies for all (or a sample) of
+packets within a given subpopulation, using which they can
+
+compose the aggregate latency measurements for that ﬂow.
+We also consider mechanisms to reduce query bandwidth by
+providing the ability to perform range queries.
+
+Thus, the main contributions in this paper are as follows:
+
+1) We propose MAPLE for maintaining per-packet la-
+tency measurements in a scalable fashion (§2). Our
+architecture allows network operators to obtain any ag-
+gregate of measurements thus subsuming the function-
+ality of existing architectures, while providing newer
+and more powerful capabilities.
+
+2) We propose novel mechanisms that use streaming algo-
+rithms for clustering packet delays, and storing them
+compactly using a novel data structure called SVBF
+that is much more storage-eﬃcient (requires only 12.8
+bits/packet) than a variant of regular hash tables (that
+may require 147 bits/packet) and also minimizes mem-
+ory accesses for inserts and lookups (§3). We also pro-
+pose a range query mechanism to reduce the amount
+of query bandwidth required (§4).
+
+3) We built a software prototype of our architecture. In
+our evaluations (§5), we found that SVBF achieves al-
+most 6× lower per-packet latency estimate error com-
+pared to prior data structures for comparable storage.
+We also found that the range query achieves signiﬁcant
+reduction in query bandwidth (almost 17×) compared
+to naive packet query.
+
+2. MAPLE ARCHITECTURE
+
+In this section, we outline a ﬂexible architecture for ob-
+taining high-ﬁdelity latency measurements in the network.
+Before we describe the architecture, we ﬁrst state our mea-
+surement goals followed by a brief discussion on why previ-
+ous solutions cannot satisfy these goals.
+2.1 Measurement goals
+
+Our goal is to enable a high-ﬁdelity latency measurement
+
+architecture that satisﬁes the following requirements:
+
+• R1) Per-packet latency measurements. The architec-
+ture should allow network operators to obtain latency
+information about a single packet at various routers in
+the network.
+
+• R2) Measurements across arbitrary aggregates. It should
+enable operators to easily compute measurements across
+arbitrary aggregates (e.g., per-preﬁx, ﬂows, sub-ﬂows).
+• R3) Measurements across arbitrary locations. We need
+
+support for latency measurements both within and across
+routers by allowing network operators complete free-
+dom to selectively turn on interfaces between which
+they need measurements.
+
+Such an architecture will provide detailed latency infor-
+mation that will help network operators to debug their net-
+works and satisfy the demands of modern latency-sensitive
+network applications.
+2.2 Limitations of previous solutions
+
+We consider mainly passive measurement solutions since,
+as pointed out by prior work [26, 27], it is diﬃcult to esti-
+mate packet-level latencies by injecting active probes. As
+
+102secondary storage (e.g., DRAM, SSD), where it can be held
+for a longer time. We discuss PLS in §3.
+
+Second, to satisfy requirement R2, it essentially contains
+a generic query engine that allows clients to query switches
+about the latency of a packet (using its hash, for instance)
+that has traversed that particular switch. These queries need
+to be within the storage timeframe (either high-speed or oﬀ-
+chip storage), otherwise the switch may lose the packet la-
+tency record. We expect that queries are mostly going to be
+only for speciﬁc applications or customers which are experi-
+encing trouble. Instead of a per-packet query, we also pro-
+vide a range query mechanism to reduce query bandwidth.
+By querying latencies of speciﬁc packets that form an ag-
+gregate, the client can obtain latency measurements across
+arbitrary sub-populations. More details are discussed in §4.
+Finally, it is simpler to satisfy requirement R3, if we en-
+able packet headers to carry timestamps (Figure 1). While
+we understand that it may be complicated in the short-term
+to make header changes (as prior work [27, 26] pointed out),
+we believe this is a cleaner longer-term option that switch
+vendors are already considering.
+In our discussions with
+prominent switch vendors, they mention that implementing
+a timestamp within the switch is not a problem, and, in
+some cases, such as Fulcrum [3], they already have an in-
+ternal timestamp within the switch. Thus, the assumptions
+in LDA (FIFO ordering) and RLI (temporal delay correla-
+tion) are no longer required in our architecture thus enabling
+a more ﬂexible architecture. However, if timestamping is
+not feasible, for restricted settings, such as packets within
+a router, or when there is a series of routers in a FIFO or-
+der, we can still use temporal delay correlation assumption
+made in prior work [27] and obtain approximate delays on
+a per-packet basis. In that sense, our architecture builds on
+any scheme to obtain one-way delay for each packet.
+
+Note that in all cases, we assume high precision time syn-
+chronization (similar to LDA and RLI) between the two
+measurement points, which has become feasible in modern
+times due to the increasing adoption of IEEE 1588 [2].
+
+3. PACKET LATENCY STORE (PLS)
+
+Simply put, the goal of PLS is to store a packet and its
+associated latency value in a scalable fashion.
+In normal
+settings, this goal would be relatively straightforward to ac-
+complish using a simple linear-probing or linked-list-based
+hashtable implementation [15]. Unfortunately, hashtables
+are not eﬃcient in their storage since they typically require
+storing a packet hash (32 bits) and associated timestamp
+(20 bits). For a million packets, we need about 50 Mbits
+which is already quite expensive; for an OC-192 link, even
+this storage will last only 0.2s unfortunately (assuming 5M
+packets per second). Even if we use a slightly coarser times-
+tamp (say 10 bits), it will reduce the memory need only
+slightly. Besides, collision resolution techniques are not easy
+to implement in a hardware in a pipelined fashion, and may
+incur unpredictable insert/lookup times (e.g., depending on
+the number of accesses required to ﬁnd an empty slot).
+
+If we need to store precise latency values for each and
+every packet, relying on hashtables is probably the best re-
+course unfortunately. Luckily, for the kind of applications
+we envision, such as performance diagnosis or detecting SLA
+violations, we can exploit the fact that the latency values for
+each and every packet need not be precise, and can be ap-
+proximate instead. If we assume some amount of inaccuracy
+
+Figure 1: MAPLE architecture.
+
+mentioned before, there have been mainly two solutions,
+LDA [26] and RLI [27], that have been proposed for ﬁne-
+grained latency measurements in the recent past. (Another
+solution for per-ﬂow latency measurements is Consistent Net-
+Flow [28], but it is quite similar in spirit to RLI, and argu-
+ments applicable to RLI are applicable there too.)
+
+LDA provides only aggregate measurements and cannot
+be modiﬁed simply to satisfy all the requirements listed be-
+fore. For instance, it cannot satisfy R1. R2 could potentially
+be satisﬁed by conﬁguring diﬀerent LDAs on a per-aggregate
+basis, but this approach will not scale well, as all potential
+aggregates need to be pre-conﬁgured, and there can be many
+such aggregates. RLI provides per-ﬂow measurements, and
+hence, it can satisfy R2 partially for aggregates that can be
+obtained from individual per-ﬂow measurements. For exam-
+ple, one can aggregate all the ﬂows per-preﬁx from per-ﬂow
+measurements but cannot obtain ﬁner granularity measure-
+ments than ﬂow, such as a packet (or ﬂow subsets). In ad-
+dition, LDA and RLI cannot easily satisfy requirement R3,
+because of the FIFO ordering assumption in LDA and tem-
+poral delay correlation assumption in RLI, both of which
+may not hold true across arbitrary measurement points.
+2.3 Architecture
+
+Given existing solutions fall short of satisfying the require-
+ments we outlined earlier, we propose Measurement Archi-
+tecture for Packet LatEncies (MAPLE). Our architecture
+(shown in Figure 1) is based on three key ideas: First, in
+order to satisfy requirement R1, we need MAPLE to store
+per-packet latency measurements in some scalable way; any
+form of aggregation within routers cannot be used to satisfy
+R1. Thus, at its heart, MAPLE contains a scalable packet
+latency store (called PLS) designed to simply store laten-
+cies of all packets in a scalable and eﬃcient fashion. Since
+storing all packets will mean signiﬁcant storage requirement
+that will be prohibitively expensive if not technologically in-
+feasible, it stores packet latencies only for a small amount
+of time, τ , say 1-100s, in high speed memory. Every τ sec-
+onds, the store will be (optionally) ﬂushed to an oﬀ-chip
+
+BDAC1) Packet Latency Store2) Query EngineQueryResponseQ(P1)Query packet initiated by the end hostQuery responsePacket StreamP2P1A(P1)TSTSP2P1Packet StreamP2P1TSTS3) TimestampUnit103is tolerable, then we can signiﬁcantly reduce the memory
+usage—this is the key intuition behind our approach.
+
+Our approach In our approach, we exploit two key ideas.
+First, within a given measurement interval, there are typ-
+ically only a few dominant latency values (depending on
+the utilization) where most of the packet latencies are clus-
+tered. In the worst case, the latency values can be all over
+the entire permissible range, but in general, this is typically
+rare. Thus, instead of storing packets and their associated
+latencies, we can ﬁrst cluster packets into equivalence classes
+based on the delay values, and associated a single delay
+value, called cluster center, for all packets within the clus-
+ter. Second, for each cluster, we can leverage approximate
+membership query data structures such as Bloom ﬁlters [10],
+that have gained signiﬁcant prominence in networking ap-
+plications recently, for better eﬃciency in storage (in terms
+of bits/packet) as well as implementation in hardware (just
+a bit vector and few hash functions). We discuss these in
+more detail next.
+3.1 Selecting representative delays
+
+Depending on whether the clusters are chosen statically
+or dynamically, there are two broad choices for selecting the
+cluster centers. For the static case, we consider logarith-
+mic center selection, while we explore online clustering al-
+gorithms (k-means and k-medians) for determining centers
+dynamically.
+
+Logarithmic delay selection.
+In this method, we ﬁrst
+select a range of latency values that packets can experience,
+and then divide this range into logarithmic sub-ranges. For
+instance, if the delay range is 0.1-10,000 µs, we have 5 sub-
+ranges; 0.1-1 µs, 1-10 µs, and so on.
+If we have γ sub-
+ranges, we assign k/γ representative delays linearly for each
+sub-range.
+If k = 50, and γ = 5, each sub-range assigns
+10 representative delays linearly. While this method does
+not take the pattern of delays into account, the complexity
+of choosing representative delays is minimal. Because the
+distance between two center delays in a sub-range is equal,
+the relative and absolute error of a packet latency estimate
+remains bounded and stable regardless of packet delay distri-
+butions. However, accuracy may not be close to the optimal
+accuracy as we can obtain with given k delay centers.
+
+k-means and k-medians clustering. If we know distri-
+bution of packet delays in an interval a priori, selecting rep-
+resentative delays can be formulated as a clustering problem.
+In literature, there are two broad classes of algorithms—k-
+means and k-medians—that can help determine good cluster
+centers [23]. Typically, both types of algorithms minimize
+the average absolute error of packet latencies, because they
+choose centers that minimize total sum of distances between
+each member with its closest center.
+Formally, for observations x1, x2, . . . , xn, the k-means al-
+gorithm aims to partition them into k sets, S1, . . . , Sk, k ≤
+n, so as to minimize the sum of squares of distances within
+cluster from the center (mean), i.e.,
+
+||xj − µi||2
+
+k(cid:88)
+
+(cid:88)
+
+arg min
+
+{µi}
+
+i=1
+
+xj∈Si
+
+where µi is the mean of the cluster Si. k-medians clustering
+algorithm minimizes the distance to the median of a clus-
+ter as opposed to the least-squares distance that k-means
+
+Figure 2: Architecture for streaming representative
+delay selection and storage provisioning.
+
+obtains. The advantage of k-medians is that it is more re-
+silient to outliers which have too large or small values.
+
+There are two key concerns with using these algorithms
+directly in our setting though. First, the basic algorithms
+cannot be directly implemented in a streaming fashion due
+to their high run-time complexity, O(nk+1 log n). There ex-
+ist heuristics such as the classic Lloyd’s algorithm [30], but
+still it can be quite computationally intensive. Second, the
+centers are determined after running the algorithm on all the
+packets in a given measurement interval, but we need the
+centers to be determined before the packets start streaming
+in. We discuss how to address these issues next.
+3.2 Streaming clustering
+
+In order to address the ﬁrst problem concerning the high
+run-time complexity, we use a streaming version of k-medians
+clustering algorithm in our architecture. For the second
+problem of lagged availability of centers, we use a pipelined
+architecture, where computed centers from a previous epoch
+are used to cluster packets for this epoch.
+
+Online version of clustering algorithm. There exist a
+few time-eﬃcient k-medians clustering algorithms [12, 22,
+21] in literature.
+In our architecture, we leverage an on-
+line clustering algorithm proposed in [12] because the algo-
+rithm makes no assumption about the characteristics of the
+streaming data and is space-eﬃcient. We need to make sev-
+eral modiﬁcations to make the algorithm more eﬃcient than
+the version in [12]. We describe brieﬂy how the algorithm
+works and our modiﬁcations to speed up the algorithm next.
+Given a stream of n data points and k centers we wish
+to ﬁnd, this algorithm consists of two stages—online and of-
+ﬂine clustering. At a high level, the online stage works in
+many (not necessarily equal) phases over the entire epoch to
+ﬁnd O(k log n) candidate medians that the oﬄine clustering
+stage subsequently reduces to k centers. In each phase, it
+uses Meyerson’s online facility location algorithm [32], and
+chooses to open a new center with probability δ/f , where δ
+is the distance of the current point x to the closest already-
+open center, and f is the cost. In this algorithm, cost f is
+L/(k(1 + log n)), where L is the lower bound cost of the op-
+timal. Note that L is reﬁned at the beginning of every phase
+by multiplying the previous value of L by a ﬁxed constant β.
+(Refer to the PolyLogarithmic Space algorithm in page 4 of
+[12] for the exact description.) The current phase terminates
+if either the number of opened centers or the associated cost
+
+OnlineClusteringStageOfflineClusteringStagePacket streamPacketSamplingPackets in (i+2)th epochk-centersStorage Data StructureDRAM/SSDFlushed after every epoch for archivalDataO(klog(np)) centersat (i+1)th epochnp packets at i-th epochHARDWARESOFTWARE104function exceeds some threshold (details in [12]). The algo-
+rithm terminates when all the packets are consumed, and
+leaves behind a set of O(k log n) candidate medians.
+
+We make a few modiﬁcations to the original algorithm to
+contain the run-time complexity. First, since speed is criti-
+cal, we use only one thread instead of 2 log n parallel threads
+in the original algorithm in [12] (see PARA-CLUSTER in
+page 4 of the paper). Second, the online algorithm requires
+searching for the closest existing center out of O(k log n) cen-
+ters in each phase, which is hard even for small k to do in 1
+cycle. We therefore run the online algorithm only on sam-
+pled packets; a 10% sampling rate trivially gives 10 cycles to
+do these lookups. For k = 50 and n = 400, 000, we observe
+about 1000 centers which can be looked up with a balanced
+binary tree using 10 memory accesses. We observe in our
+evaluations that 1-10% sampling rate has virtually no eﬀect
+on the quality of the centers produced by the algorithm.
+Handling lagged availability of centers. The problem
+here is that we cannot compute the centers and cluster on
+the same packet stream in one pass. Besides, the streaming
+algorithm itself operates in two stages, online and oﬄine.
+To address this problem, we design a three-stage pipeline
+consisting of the following stages to handle this issue: The
+ﬁrst stage consists of the online clustering algorithm that
+computes the O(k log n) centers that operates on packets in
+epoch i. The second stage consists of the oﬄine clustering
+which will result in k centers by consuming these O(k log n)
+centers. Finally, we cluster the packets in epoch i+2 depend-
+ing on the closest center that matches the packet’s latency
+in the ﬁnal stage. Since these stages operate in a pipelined
+fashion, the centers computed will be based on the dynam-
+ics of packets computed two epochs back. Assuming some
+amount of stationarity across measurement intervals (our
+evaluation shows holds true in practice), this pipelined ap-
+proach should work well. However, to cover for the worst
+case where these centers may be signiﬁcantly dissimilar to
+each other, we propose a hybrid clustering approach that
+combines static allocation with dynamic allocation, which
+we explain next.
+Hybrid clustering. The basic idea of hybrid clustering
+is to choose k/2 centers with logarithmic clustering and re-
+maining k/2 centers are computed by streaming k-medians
+algorithm. To enable hybrid clustering algorithm, we make
+two more modiﬁcations in the online version of clustering
+algorithm explained earlier. First, at the online clustering
+stage, the centers chosen by the logarithmic clustering are
+always selected as a new center in each phase and the num-
+ber of data points added to the centers is incremented by
+one. Second, when O(k log(np)) candidate centers (where p
+is sampling rate) need to be processed at the oﬄine cluster-
+ing stage, we exclude the k/2 centers picked by the logarith-
+mic clustering from O(k log(np)) centers, the rest candidate
+centers are fed into the oﬄine algorithm, and ﬁnally k/2
+centers are obtained. While we choose to split the total
+number of centers equally between static and dynamic allo-
+cation schemes, this equal split is somewhat arbitrary and
+other variants (e.g., 2/3-1/3 split) could also work equally
+well (although we have not explored this thoroughly yet).
+3.3 Storage provisioning
+
+So far, we have reduced the problem of storing < s, l > tu-
+ple to < s, ci > where l is the actual latency of packet s and
+ci is the ith center (0 ≤ i < k). Once the k representative
+
+delays are selected by the clustering algorithm, we need to
+determine how much storage is required to store packet la-
+tencies. Depending on the data structure that one uses, the
+actual required memory size can be diﬀerent. Note that the
+goal of the data structures is essentially to store and look up
+the center id corresponding to a packet; the actual latency
+value corresponding to the center will need to be looked up
+in a separate table. During the lookup phase, instead of re-
+turning the static latency value corresponding to the center,
+we can dynamically return the actual mean of all the packets
+that map to a given center. Implementing this would require
+essentially two additional counters per center (latency sum
+and packet counts). We call these reﬁned latency estimates.
+
+3.3.1 Naive approach: PBF
+Given these k cluster centers, we can now simply match
+each incoming packet latency value to determine the right
+center, and for each center maintain a separate Bloom ﬁlter
+(BF) in which we record the packet’s presence. This naive
+and intuitive data structure called Partitioned Bloom Filter
+(PBF) as shown in Figure 3(a).
+
+Insert To store a packet and its latency, it ﬁnds the right
+BF corresponding to the latency value by performing a clos-
+est center match in parallel (shown in Figure 3(a)). Since
+the number of centers k is quite small, doing this in parallel
+in hardware should be relatively easy to do. It then accesses
+the BF corresponding to this center, and inserts it into the
+BF just like a regular BF insert, i.e., by hashing using mul-
+tiple hash functions and setting the bits indexed by the hash
+values to 1. Since BF inserts are O(1), PBF insert time is
+O(1), ignoring the small hardware cost for parallel match of
+the packet latency with the various centers.
+
+Lookup To look up the latency of a packet, PBF checks
+whether the packet is present in any of the BFs; the delay
+represented by the BF that returns a match is the estimated
+latency of the queried packet. Clearly, the complexity of the
+lookup operation is O(k) since k BFs need to be consulted.
+
+Limitations A big problem with PBF is that, PBF needs
+to allocate storage for each of the k groups diﬀerently since
+the frequency counts for each group could be diﬀerent. Of
+course, PBF could use the estimated frequency counts, but
+since our centers are calculated based on packets two epochs
+back, these estimates may not be accurate. Thus, the only
+options are to allocate higher amounts of storage per BF
+than necessary, or once the capacity of a BF is reached, it
+stops adding packets, leading to false negatives.
+
+3.3.2 Prior approach: COMB
+The second option we explore is using a recent generic
+data structure called combinatorial Bloom ﬁlters (COMB)
+designed for supporting multiset membership testing [20].
+While PBF strictly partitions all BFs, COMB uses a single
+BF, but represents diﬀerent groups using diﬀerent subsets of
+hash functions. COMB contains three parameters, an f -bit
+vector in which θ bits are set to 1 to indicate the code for
+a group, and h diﬀerent hash functions for each bit-position
+(in total h · f hash functions).
+Insert For given center ci, it ﬁrst looks up the code C(ci)
+corresponding to the group; for each bit position that is set
+(θ bits will be set in each code), it picks the corresponding
+set of hash functions to index into the BF, and sets the
+
+105(a) PBF, O(1) insert, O(k) lookup
+
+(b) COMB, O(1) insert, O(f ) lookup
+
+(c) SVBF, O(1) insert, O(1) lookup
+
+Figure 3: Diﬀerent variants of Bloom ﬁlters with diﬀerent insert and lookup and O(f ) lookup where f is
+the size of bit vector. SVBF has O(1) insert and O(1) lookup assuming reading the k vector takes 1 memory
+access.
+
+appropriate bits to 1 (just like a regular BF insert). Thus,
+for each packet, it requires setting up to h· θ bits in the BF.
+Lookup For each packet, it tests the positions indexed
+by hashing the packet with h · f hash functions. The f -
+bit code is formed by setting a bit position to 1, only if all
+bits indexed by the hash functions associated with the bit
+position indicate a 1 in the BF. The code then indicates the
+center.
+Limitations The biggest advantage of COMB is that, un-
+like PBF, it does not need to know the number of packets
+in each group. However, storage requirement increases as
+θ increases, which decreases storage eﬃciency (as we shall
+compare shortly). Another limitation is that lookup com-
+plexity is high since all the h · f hash functions need to be
+queried, and all these bits are randomly located.
+3.3.3 Our new data structure: SVBF
+In the philosophy of maintaining one BF for all the groups,
+we could consider another, perhaps simpler alternative. Here,
+instead of storing packet s directly, we can store its concate-
+nation with the group id, ci, i.e., s(cid:48) = s ⊕ ci, where ⊕ is a
+concatenation operator. Inserts are fast, but lookups (that
+involve querying a packet with all concatenations of group
+ids, i.e. k queries) are quite slow. Further, these cannot be
+parallelized since all the bits are scattered all across the BF.
+To address this problem, we propose a new data structure
+called SVBF that essentially preserves the simplicity of a
+single BF, but reduces the lookup complexity signiﬁcantly.
+Speciﬁcally, we store the bits corresponding to diﬀerent de-
+lay values for the same packet close-by so that during queries
+we can read all the bits in a burst instead of reading them
+sequentially from various bit positions.
+Insert The insert operation is quite similar to a regular BF,
+except for a small modiﬁcation. In regular BF, each packet
+is hashed using multiple hash functions, and bits at those
+indices are set to 1. In SVBF, we use the center’s index of
+the packet as an oﬀset into a vector of delay values. Thus,
+we set the bit corresponding to (hj(s) + i) mod m, where j
+is the hash function index, i ∈ [0, k − 1] is the center index
+of the packet, and m is the size of SVBF. We do this for all
+hash functions. This is shown in Figure 3(c) where a packet
+that matches the second center c1 (center index 1) is added
+into the BF using hash functions H1 and H2. The oﬀset at
+which the bit is set is 1 for this second center.
+Lookup Given packet s, we ﬁrst hash the packet to ob-
+tain various hash indices hj(s) mod m. From each of these
+bases, we read the next set of k bits, i.e., hj(s) mod m to
+(hj(s) + k − 1) mod m, to obtain bitmap Bj. We compute
+
+Data structure #Hash Capacity (m/n)
+
+Insert
+
+Lookup
+
+hashtable
+
+PBF
+
+COMB(50, 1)
+COMB(11, 2)
+COMB(8, 3)
+
+SVBF
+
+1
+9
+9
+7
+6
+9
+
+147 bits/pkt
+12.8 bits/pkt
+12.8 bits/pkt
+18.5 bits/pkt
+24.2 bits/pkt
+12.8 bits/pkt
+
+1
+9
+9
+14
+18
+9
+
+1
+
+450
+450
+77
+48
+27
+
+Table 1: Example of complexity of storage data
+structures for single port memory. 32 bit word is
+assumed for lookup in SVBF. Classiﬁcation failure
+rate pcf = 0.1 and k = 50. hashtable is tuned for
+pfc = 0.02. The unit for insertion and lookup is the
+number of memory accesses.
+
+the bit-wise AND across all these bitmaps, B = B1&B2& . . ..
+In the ﬁnal bitmap (B), the oﬀset where a bit is set to 1 is
+the center index.
+
+While SVBF looks like a simple BF, there are two ma-
+jor diﬀerences. First, a BF only supports a membership
+check of a single sort, but SVBF supports multiset member-
+ship check. Second, the biggest advantage of this scheme is
+that, it relies on ‘burst reads’ which are simpler than ran-
+dom reads that COMB and BF suﬀer from. Thus, instead
+of k memory accesses, we need at most (cid:100)k/w(cid:101) + 1 memory
+accesses for each hash index as shown in Table 2. For ex-
+ample, for k = 50, we can obtain the bit maps in a total
+of 3 × h memory accesses assuming a 32-bit machine word,
+and h is the number of hash functions. In Table 1, we show
+an example that outlines the storage complexity, lookup and
+insert times of SVBF compared to other data structures.
+
+3.3.4 Classiﬁcation failures
+BFs are known to suﬀer from false positives occasionally,
+in which case a given element is not in the BF, but the BF
+returns with a positive answer. In PBF, this translates to a
+classiﬁcation failure problem, since two (or more) BFs, one
+legitimate and one (or more) false positive may both (all)
+indicate a hit—the question is which one to trust. Similarly,
+COMB too may suﬀer from classiﬁcation failures where more
+than θ bits in the bit vector are set to one. Even SVBF
+may suﬀer from classiﬁcation failure, since the bitmap B
+described above may have more than one position set to 1
+occasionally. We formally analyze this in §3.4.
+Tie-breaking heuristic One option when classiﬁcation
+fails due to the false positives, is to just not return an an-
+swer; this may be an acceptable choice given the system in-
+herently trades oﬀ some amount of accuracy in order to scale
+
+c0c1c48c49Closest centermatch in parallelPacketlatency110100101111001110111101Different Bloom filters for different centersc0c1c48c491101001011Closest centermatch in parallelSingle Bloom filter, Different sets of hash functionsPacketlatency10101001111001010Group CodeH1H2H3H4H5H6H7H80101c0c1c48c491101001011Closest centermatch in parallelSingle Bloom filter, Same hash functionsPacketlatency1Offset is the number of the matched centerH1H2106Data structure
+
+PBF
+
+COMB
+
+SVBF
+
+#Hash functions
+
+hPBF = − log2(1 − (1 − pcf)1/(k−1))
+hCOMB = − log2(1 − (1 − pcf)1/(f−θ))
+hSVBF = − log2(1 − (1 − pcf)1/(k−1))
+
+Capacity (m/n)
+≥ hPBF/ log 2
+θ × hCOMB/ log 2
+
+Insert
+hPBF
+
+θ × hCOMB
+
+Lookup
+k × hPBF
+f × hCOMB
+
+hSVBF/ log 2
+
+hSVBF
+
+((cid:100)k/w(cid:101) + 1) × hSVBF
+
+Note
+
+lookup can be parallelized
+random access for lookup
+serial burst read in the
+unit of word
+
+Table 2: Complexity of storage data structures for single port memory. w is the size of memory word. log is
+natural log.
+
+better. We can also choose to resolve such conﬂicts using the
+following tie-breaking heuristic. When a packet can poten-
+tially match many groups, we report the latency value of the
+group with the largest number of packets among all conﬂict-
+ing groups. For identifying this, we assume we can store run-
+ning packet counts for each group in an extra counter. This
+approach now can introduce false classiﬁcation because the
+decisions can be wrong. But, we observed that this heuris-
+tic works well when the distribution of the cardinalities of
+BFs is skewed (e.g., long tailed, heavy tailed), and can im-
+prove accuracy in many cases. However, as we mention in
+§4, the result of a query will be explicitly tagged so that the
+application which uses this data can be informed about the
+‘guess’ing nature of the answer.
+3.4 Analysis of PLS
+
+Now we discuss why simple hash table cannot scale in
+terms of space requirement while achieving O(1) insert and
+lookup, and analyze the dependence of collision performance
+of the proposed data structures on storage dimensioning.
+
+3.4.1 Hash table
+While hash tables are typically simple, at a minimum they
+require the packet hash (32 bits) and group id (6 bits for 50
+centers), thus requiring at least 38 bits per packet. Colli-
+sion avoidance schemes present a further challenge for scal-
+ing. Thus, in order to perform a comparison with a BF,
+we consider a simpler hash table with no collision avoid-
+ance scheme, in which the packet digest is used to address
+a memory location in which the group id is stored (col-
+lisions will override the group id). For our analysis we
+consider n packets whose digest values are distributed in-
+dependently and uniformly across m locations. Following
+§3.3.4, the false classiﬁcation probability pfc is proportion
+of packets allocated to already occupied locations: pfc =
+n (1−(1−1/m)n); see e.g. Section 3.3.2 of [25]. Although
+1− m
+the required capacity m is not given as an explicit function of
+a target pfc, we have the approximation pfc ≈ n/(2m) when
+n (cid:28) m. For example, when pfc = 0.02 (a median false clas-
+siﬁcation rate that SVBF achieves in §5.3) then m = 24.6n.
+Considering k = 50, each bucket is 6 bits. Then, m/n = 147
+bits/packet, even higher than the regular hash tables. Thus,
+this simple variant does not scale.
+
+3.4.2 Collision analysis & storage dimensions
+We now analyze the frequencies of classiﬁcation failures
+due to storage collisions for queries on the PBF, COMB
+and SVBF data structures. First, it is convenient to iden-
+tify a generic collision analysis that applies to each storage
+method. Following the terminology of §3.3, the false pos-
+itive probability pfp denotes a probability that a given set
+of storage locations pertaining to a single delay group are
+occupied. Then, classiﬁcation failure for a packet in delay
+
+cf = 1 −(cid:81)
+
+group i occurs if it has a false positive in any other delay
+group j: p(i)
+
+j(cid:54)=i(1 − p(j)
+fp ).
+
+Consider now speciﬁcally a BF with m locations and h
+hash functions. We assume an independent hash digest dis-
+tribution over all packets. For simplicity, we assume that the
+query packet is mapped by the hash functions to h distinct
+locations1. As is well known, the false positive probability
+that a set of h bits are all set after the insertion of n back-
+ground objects is pfp = p(m, n, h) = (1 − (1 − 1/m)nh)h.
+Collisions in PBF Each delay group i has capacity mi
+i mi = m) and ni background packets allocated to it
+i ni = n). Given a classiﬁcation failure probability for a
+packet in a delay group i, by averaging over all n packets in
+their respective delay groups, we have
+
+((cid:80)
+((cid:80)
+
+(1 − p(mi, ni, h))
+
+(1)
+
+pcf = 1 −(cid:88)
+
+nj
+n
+
+j
+
+(cid:89)
+
+i(cid:54)=j
+
+Since the operational allocations mi and ni are not known in
+advance, for design purposes one would assume uniformity,
+in which case (1) reduces to (3) below.
+
+Collisions in COMB All delay group locations for the
+query ﬂow may be set by any of the background ﬂows. Since
+COMB uses θ bits to denote a group id in a code, it is
+equivalent to virtually put θ·n items into m locations. Hence
+
+pcf = 1 − (1 − p(m, θ · n, h))f−θ
+
+(2)
+
+Collisions in SVBF All delay group locations for the
+query ﬂow may be set by any of the background ﬂows. Hence
+
+pcf = 1 − (1 − p(m, n, h))k−1
+
+(3)
+
+When all BF sizes mi are equal, a standard convexity argu-
+ment shows that pcf(SVBF) ≤ pcf(PBF) for any {ni}.
+Storage Dimensioning We use the foregoing analysis to
+show how to dimension SVBF for given target classiﬁca-
+tion failure rate pcf. For large, n, p(m, n, h) ≈ q(n/m, h)
+where q(α, h) = (1 − e−αh)h. As is well known, α (cid:55)→
+q(α, h) is minimized at when h = α−1 log(2), in which case,
+pcf(SVBF) = 1 − (1 − 2−h)k−1. Thus, given a target pcf
+of ε > 0, we must choose h and α−1 log 2 to be bounded
+below by − log2(1 − (1 − ε)1/(k−1)). The lower bound for h
+and upper bound for α compatible with two possible target
+classiﬁcation failure rates ε = 10−1 and 10−5 are displayed
+as a function of the number k of delay groups in Figure 4.
+Observe that, due to the logarithmic dependence, after an
+initial phase, the curves are relatively ﬂat as a function of
+k. They do not depend very strongly on the target rate:
+decreasing ε by 4 orders of magnitude changes the bounds
+by only about half an order of magnitude. Table 2 provides
+1This happens with probability m−hm!/(m − h)! ≥ 1 −
+h2/(2m)
+
+107random d-byte strings, this is the only way to form the ag-
+gregate unfortunately. We can reduce the query bandwidth
+by potentially querying only a sample corresponding to the
+aggregate as opposed to all the packets, that may represent
+a trade-oﬀ between query bandwidth and accuracy. While
+exploring this trade-oﬀ is outside the scope of this paper, we
+brieﬂy describe an idea next that has the potential to reduce
+the query bandwidth signiﬁcantly.
+
+Query using ﬂow key and IP identiﬁer. We can reduce
+query bandwidth overhead with the help of a range search
+capability. Since packet hashes do not lend themselves to
+this range search easily, we consider an alternate scheme.
+Instead of storing the packet hash, we store the concatena-
+tion of the packet’s ﬂow key and the IP identiﬁer (IPID)
+ﬁeld. Since IPID ﬁeld is typically implemented to increment
+IPIDs of packets linearly in most operating systems, the use
+of IPID ﬁeld allows us to support ﬂow-level (or sub-ﬂow
+level) queries quite easily. We believe that in data center
+environments orchestrated by a single organization, enforc-
+ing such de facto implementation can be possible. Note that
+we evaluate this scheme against intact packet traces with no
+modiﬁcation on IPID ﬁeld collected from a tier-1 ISP link
+and two links in data centers in §5.4.
+
+The client in this case can query packets using the tuple
+(fk, [IP idi, IP idj]). Note that this does not stipulate that
+all packets that belong to a ﬂow will need to have contiguous
+IDs. But since TCP transmits packets in bursts usually, we
+can break down a ﬂow in to several tuples
+
+fk = (fk, [IP idi1, IP idi2]), (fk, [IP idi3, IP idi4]), . . . ,
+
+and chain them together in one message. This reduces the
+query bandwidth signiﬁcantly, almost by a factor of 17× in
+our evaluation (§5.4). The receiving router will sequentially
+query all packets (fk, IP idi1), (fk, IP idi1+1), ..., (fi, IP idi2).
+Further, we can make the query interface specify whether it
+wants the individual latency values or the aggregate values,
+so that the router can send either individual packet latency
+values or aggregate them in its response. This will also re-
+duce the response overhead signiﬁcantly.
+
+Query timing. For both types of queries, we need the
+client to mention a rough time of the packet as part of the
+query, so that the router can look up the appropriate SVBF
+data structure corresponding to the time when the packet
+may have gone through the router. Given the fact that PLS
+resets the SVBF’s every epoch, it is important to make sure
+that the previous epoch and the next epoch are also queried
+for the packet in order to make sure there are no fringe
+eﬀects, i.e., the timing is close to the start/end of an epoch
+and it may lie before or after the epoch.
+
+Querying clients. MAPLE is largely oblivious to who
+originates the query. In some environments, we could en-
+vision end hosts could be the clients. For example, an end
+host that is running a low-latency trading application or
+a high-performance computing application, whenever it de-
+tects packet delays exceed some level, may originate a query
+packet to determine which router is responsible for the higher
+delay. Similarly, we can consider private datacenter owners
+such as Google, Microsoft, etc., that may want to debug
+their systems may provide this ability for individual hosts
+to query routers periodically for obtaining latency statistics.
+We can also consider public cloud environments such as
+Amazon EC2 where customers may demand certain SLAs on
+
+Figure 4: Dimensioning SVBF:
+lower bound on
+#hash functions h, and upper bound on load α =
+n/m, as function of #delay groups k, for two target
+pcf classiﬁcation failure rates ε = 10−1 and 10−5.
+
+overview of insert and lookup complexities and storage re-
+quirements of the three data structures. Given ε = 10−1,
+parameter tuning examples are shown in Table 1.
+
+4. LATENCY QUERY INTERFACE
+
+In this section, we describe the packet latency query inter-
+face that allows a ‘querying client’ (henceforth, just client)
+to query routers for speciﬁc packet latency measurements.
+In the very basic query, a
+Query using packet hash.
+client can request a particular router for latency of a given
+packet identiﬁed by the packet hash. This implicitly as-
+sumes that the packets are ﬁrst hashed using the invariant
+ﬁelds in a packet header (e.g., IP addresses, IP id, port
+numbers) and the packet payload (a few bytes is often suﬃ-
+cient [17]) before inserting into the SVBF. We also assume
+that the client knows that the path taken by the packet;
+otherwise, the client needs to ask all the routers in the net-
+work which may increase the number of bogus queries. We
+assume that it will be possible to determine this based on
+the forwarding tables. In cases where multiple parallel paths
+are exploited (e.g., ﬂow-based VLB in VL2 [19] or ECMP), a
+selected path for a ﬂow at random in VL2 needs to be stored
+or hash functions for ECMP computation needs to be pub-
+lished. When centralized controllers (e.g., Hedera [6]) are
+involved in forwarding, such forwarding information can be
+saved for oﬄine-queries. We leave this issue as part of our
+future work.
+
+The switch then performs a lookup operation of the packet
+in the SVBF to return the latency estimate to the client. Be-
+cause of classiﬁcation failure possibility in SVBF, we return
+latency estimates with a 2-bit type that identiﬁes one of
+three types: (1) Match that indicates that the packet was
+uniquely identiﬁed in the SVBF. (2) Multi-Match indicat-
+ing that multiple matches were reported, but the latency
+estimate corresponds to the answer using the tie-breaking
+heuristic we discussed in §3.3.4. (3) No-Match that indicates
+the packet’s latency estimate could not be located.
+
+If the host wishes to obtain ﬂow-level (or any other aggre-
+gate) latency statistics, it needs to send all packet digests of
+a particular ﬂow of interest to the particular switch/router
+it believes the packets may have traversed along the path
+from the source to the destination. Sending one packet for
+querying each packet to the switch may lead to too many
+packets. Luckily, packet digests could be easily batched in
+one query message (about 375 32-bit labels can be embedded
+within one 1500 byte query packet). Since packet hashes are
+
+ 0.01 0.1 1 10 100 0 20 40 60 80 100#groups kh; ε=10-5h; ε=10-1α; ε=10-1α; ε=10-5108network performance. We could imagine the cloud provider
+installing a debugging stub-module within the host hyper-
+visor (similar to other recent works [36]) that essentially, at
+the signal of a management host controlled by the network
+operator, can start storing each packet’s hash that matches
+a given hurting application, or a hurting customer. It can
+then query these packets along the route to its destination
+to determine its latency. In this case, it makes sense to put
+this stub module within the hypervisor since it is the one
+that knows which packets are going out of its system; the
+management host cannot possibly know how to query for
+the packets since it does not know either the packet hash or
+the IP id sequence.
+
+In the ﬁrst usage scenario, we essentially trust the end
+host to not overwhelm the switch by injecting too many
+queries. This is possible in a tightly controlled datacenter
+or cluster environment, but may not be, for example, possi-
+ble in a public cloud environment such as Amazon EC2 (the
+second scenario).
+In such cases, we need some other pro-
+tection mechanisms (e.g., charging models, rate limiting) to
+ensure the number of queries to switches does not exceed
+some limit.
+
+5. EVALUATION
+
+In this section, we evaluate the practicality of our MAPLE
+architecture. Speciﬁcally, our experiments are designed to
+answer the following questions.
+(1) How do the diﬀerent
+clustering algorithms perform ?
+(2) How do the various
+data structures we discussed in §3.3 compare in terms of
+their accuracy for a given storage budget ? (3) How eﬃ-
+cient is the query interface in terms of latency estimates of
+arbitrary aggregates, bandwidth reduction and inaccuracies
+in query timing ? (4) How does it compare with previous
+approaches such as RLI ? We ﬁrst describe our experimental
+setup before answering these questions.
+5.1 Experimental setup
+
+While we envision the eventual deployment to be in the
+form of a hardware prototype, for the purposes of evaluation,
+we prototyped various pieces, notably the streaming clus-
+tering algorithm and the storage data structure, of MAPLE
+in software. We implemented the online portion of the k-
+medians algorithm from scratch (about 300 lines of C++
+code), while we used the C clustering library [5] for the
+oﬄine part. However, the library had to be modiﬁed to
+support clustering data with weight (i.e., count of entries
+clustered to a candidate center at the online stage). For
+most of the experiments, we use 50 centers (k = 50) that, as
+we shall show, represent a good balance between accuracy
+and complexity.
+
+In our setup, we feed several packet traces (real router as
+well as using synthetic queueing models) into the software
+prototype to study its eﬃcacy. We can however easily re-
+place the packet traces with live traﬃc in our environment.
+For the most part, we kept our evaluation setup very sim-
+ilar to prior work [27]. We also used the same traces—a
+tier-1 trace (ISP) collected at an OC-192 link and a real
+router trace (RR)—as the authors of [27] to facilitate a fair
+comparison with prior work. Benson et al. [9] have recently
+published data center traces (UNIV1 and UNIV2) that be-
+long to a university data center edge router. However, the
+data center traces are not suﬃcient workloads (data rates
+of 2-60Mbps) for testing the scalability of our architecture.
+
+Nevertheless, since the traces reﬂect real ﬂow size distribu-
+tion in data centers, we use them in §5.4 to evaluate query
+bandwidth saving that can be achieved by the range query
+mechanism discussed in §4.
+
+The RR trace was collected at a pair of ingress and egress
+interfaces in a real router. Therefore, it contains two times-
+tamps of every packet that passes the router; and this im-
+mediately allows us to compute real delays of packets. On
+the other hand, the ISP trace was collected at a single inter-
+face, which means that it only has one timestamp of every
+packet arriving at the interface. Thus, to facilitate our ex-
+periments with this trace, we simulate the delays of packets;
+we subject packets to a simple, synthetic queueing model
+with open-loop RED queue management strategy with pa-
+rameters conﬁgured similar to the setup in [27]. We conﬁg-
+ure the packet processing time in terms of byte/second and
+queue length in the model. Real packet lengths and inter-
+arrival distribution govern dynamics of packet delay values
+and losses.
+
+The ISP trace we used in our setup has about 22.4M
+packets in a period of 60s. We divide the 60s period into
+60 measurement epochs each with 1s duration. Recall that
+our architecture operates in epochs and freezes the storage
+for lookup after every epoch. The number of packets in
+an epoch ranges from 358K to 404K. We ﬁnd about 40K
+hosts and 4.2M ﬂows (considering same ﬂow key across two
+epochs as two diﬀerent ﬂows) on average in each epoch. We
+also conducted experiments using an RR trace set that con-
+tains two diﬀerent traces; one has 2.6 million packets for 5
+minutes achieving 53% utilization of an OC-3 link, and the
+other has 4.0 million packets during the same period (88%
+link utilization). The traﬃc source is artiﬁcial in that, it is
+generated by Harpoon traﬃc generator, but all packets were
+subject to latency factors in a real router. Qualitatively, we
+found consistent results across both ISP and RR traces and
+hence we do not discuss the results on RR traces any further.
+
+5.2 Performance of clustering algorithms
+
+We ﬁrst compare static (logarithmic), dynamic (pipelined
+k-medians) and the hybrid strategy that combines the two.
+For reference we also include a hypothetical non-pipelined
+k-medians (called oracle) approach, that essentially runs
+the k-medians on the data directly, determines the centers,
+and then clusters the packets into these centers. In all al-
+gorithms, we assume a perfect data structure for storing
+the approximate delays, i.e., no Bloom ﬁlters to introduce
+any interference. This gives us a baseline for comparison.
+As mentioned before, we compare these schemes assuming
+k = 50 centers. While we conduct experiments with three
+traces of diﬀerent link utilization scenarios to comprehen-
+sively understand the tradeoﬀs, we omit showing all the
+curves due to space limitations. We show the absolute error
+CDF for only the high (85 %) utilization case in Figure 5(a).
+In our experiments, we observe that oracle achieves the
+smallest absolute error at higher quartiles among all meth-
+ods across all link utilization scenarios as it minimizes the
+summation of absolute distance between entries and their
+closest centers, which is exactly the absolute error. Since
+its objective is to decrease the absolute error, it may allo-
+cate centers that may increase the relative error for some
+packets, particularly the low-latency packets. We observe
+a similar trend in the k-medians clustering method as well.
+Logarithmic clustering generally achieves higher accuracy
+
+109diﬀerence between the diﬀerent absolute error CDFs (and
+hence, refrain from showing the actual plots) between the
+sampled and unsampled variants. One could imagine this
+happens because most packet delays are clustered to stati-
+cally chosen centers instead of those close to the k-medians.
+However, this is not the case, as only 53% and 1.5% packets
+are clustered to those static centers at high and low levels
+of link utilization respectively. The actual reason is that
+the k centers output by the algorithm are similar even when
+we sample packets. We observe that the cosine similarity
+(deﬁned as cos ϕ = A·B|A||B| ) between two vectors A and B
+of k centers output by sampled and unsampled k-medians
+algorithm is over 0.98 for sampling rates as low as 1%.
+
+Number of centers vs. running time. The running
+time of the oﬄine algorithm depends on the ﬁnal number of
+centers required, i.e., k, and the number of candidate centers
+output by the online clustering stage. As k increases, the
+running time of the algorithm increases, but the resulting
+error also decreases. This is the main trade-oﬀ involved in
+choosing an appropriate value of k. Figure 5(b) explores this
+trade-oﬀ under moderate (58%) link utilization scenario as
+k is increased from 10 to 100. (We only plot the curve corre-
+sponding to the sampling rate 0.1 here, but other sampling
+rates also exhibited similar trends.) From the plot, we can
+clearly observe the sweet spot that represents a reasonable
+trade-oﬀ between running time and average absolute error
+is k = 50. We can possibly choose up to 70 or 80 centers as
+well as the running time is less than the epoch interval (1s).
+Of course, depending on the target platform and computa-
+tional resources we can expect on the processor, the number
+of centers may vary. But this trade-oﬀ implies we can easily
+determine the value of k appropriate for the target platform.
+5.3 Comparison of data structures for PLS
+
+Next, we compare the performance of various data struc-
+tures for PLS—SVBF, PBF and COMB. For fair compar-
+isons, we conﬁgure all of these with the same 5Mbit memory
+in total. It is not easy to ﬁx the amount of memory in PBF
+since the total memory needs to be explicitly partitioned
+across all the BFs. We split the total memory across each
+BF proportional to the number of packets that are mapped
+to a given BF (according to the frequency counts two epochs
+back). For the others, we derive the optimal parameter con-
+ﬁgurations, such as number of hash functions, for diﬀerent
+data structures using the formulae in §3.4. For this memory,
+the theoretical analysis suggests using 9 hash functions for
+SVBF and PBF. For COMB, there are two other param-
+eters, θ (number of bits that need to be set in the group
+code) and f (length of the code). Out of feasible combina-
+tions to support k = 50 groups, we choose the conﬁguration
+with f =8 and θ=3 that has the smallest lookup time (that is
+proportional to f ). By ﬁxing these parameters, the number
+of hash functions per bit, h needs to be set to 3 according
+to the analysis in §3.4. Thus, all in all, we ensured that
+the comparisons are as fair as possible between the various
+schemes.
+
+In our comparisons, we mainly study the classiﬁcation fail-
+ure rate, false classiﬁcation rate, and ﬁnally the impact of
+these on the accuracy of latency estimates. We search laten-
+cies of all packets for 58 epochs (the ﬁrst 2 epochs are used
+for clustering only). For false classiﬁcation rate, we use the
+tie-breaking heuristic described in §3.3.4 and compute the
+rate at which the heuristic leads to an incorrect answer.
+
+(a) Clustering schemes
+
+(b) Tradeoﬀ in deciding centers
+
+Figure 5: Comparing diﬀerent clustering schemes
+and exploring trade-oﬀ between average error and
+maximum running time for oﬄine stage.
+
+than other methods in terms of relative error because its
+centers are placed at equal distances within each sub-range
+(e.g., 1-10µs and 10-100µs). On the contrary, analyses on
+absolute error suggest that the logarithmic clustering suf-
+fers from inaccurate estimates at higher percentiles. For in-
+stance, k-medians clustering is almost twice more accurate
+than logarithmic clustering at 90 %ile (35µs absolute error
+in k-medians and 67µs in logarithmic) in Figure 5(a). This
+basically stems from the logarithmic clustering’s failing to
+adjust its centers as packet delays vary. This may further
+worsen its accuracy as conﬁgurations such as link capacity
+may change in future. Comparatively, the other schemes
+adapt to this trend quickly and place more centers close to
+where the actual delays are, leading to better accuracy.
+
+The k-medians clustering method has the similar perfor-
+mance that the oracle has in terms of both absolute and rel-
+ative errors under low and moderate utilization cases, and
+even till the 3rd quartile of high utilization case. At top
+25 %ile of high utilization scenario (Figure 5(a)), accuracy
+of the k-medians is worse than that of oracle because of
+the inherent variations across epochs; this is in essence the
+price we pay for an online clustering algorithm. Finally, we
+observe that the hybrid clustering approach balances both
+absolute and relative errors by inheriting the good proper-
+ties of static and dynamic center determination approaches.
+For instance, in Figure 5(a), we see how the hybrid scheme
+inherits the better accuracy of logarithmic approach up to
+50 %ile and better accuracy of k-medians at top 50 %ile.
+Henceforth, unless otherwise mentioned, we use the hybrid
+scheme in the rest of the paper.
+Impact of packet sampling. In §3.2, we discussed that
+we employ packet sampling in the clustering phase to reduce
+the processing overhead. We now study the impact of vary-
+ing the sampling rate on the accuracy of the per-packet la-
+tency estimates. In our experiments, we found virtually no
+
+ 0 0.2 0.4 0.6 0.8 1100101102103CDFAbsolute error (µs)oraclehybridk-medianslogarithmic 0 0.5 1 1.5 2 2.5 3 3.5 10 30 50 70 90 0 0.3 0.6 0.9 1.2 1.5 1.8 2.1Avg. abs. error (µs)Max runtime (sec.)Number of centersAverage errorRuntime110(a) Classiﬁcation failure
+
+(b) False classiﬁcation
+
+(c) Estimation accuracy
+
+Figure 6: Analysis of classiﬁcation failure, false classiﬁcation, and estimation accuracy.
+
+Classiﬁcation failure and false classiﬁcation rates.
+We show the classiﬁcation failure rate of each data struc-
+ture in Figure 6(a). SVBF and PBF (as expected) achieve
+least classiﬁcation failure rate of about 10% at most across
+all epochs, while COMB obtains 50% at most—almost 5×
+higher than SVBF. Note that for PBF due to the fact that
+for a given BF, the number of packets may exceed the capac-
+ity, we observed almost 24% of packets could not be admit-
+ted altogether (false negatives). Applying the tie-breaking
+heuristic results in a false classiﬁcation rate that is lower
+than the classiﬁcation failure rate, but not by much. Still,
+as shown in the Figure 6(b), the median false classiﬁcation
+rate of COMB is almost 12× higher than SVBF. This shows
+the eﬃcacy of our SVBF compared to existing data struc-
+tures such as COMB. As shown in Table 1, COMB requires
+almost twice the number of bits per packet to achieve the
+classiﬁcation failure rates as SVBF. We next study how this
+decrease in classiﬁcation failure eﬀects the actual delay es-
+timation.
+
+Accuracy of per-packet latency estimation. Figure 6(c)
+shows absolute errors of per-packet latency estimates for
+three data structures. In addition to them, there is an ad-
+ditional curve titled ‘Clustering’ that essentially assumes a
+perfect data structure, but does not use the reﬁned latency
+estimates (described in §3.3) using the observed mean of the
+data packets. (We can always plot that too, and that would
+strictly be better than the rest, but we chose this as a nice
+reference point to see the eﬀects of the reﬁnement.)
+
+We show mainly the upper quartile in this graph where the
+diﬀerence is the most pronounced. Clearly, at lower than 75
+%ile, either SVBF or COMB would return the same (correct)
+group id if the packet is not misclassiﬁed; it is only for the
+misclassiﬁed packets that the accuracy is likely to be worse
+since the tie-breaking heuristic may pick the wrong latency
+estimate for the packet. (If we choose not to report them,
+then they will be counted as false negatives.) We can notice
+that COMB and PBF suﬀer from much higher discrepancies
+as early as the 70 %ile onwards, while in contrast we can see
+that the Clustering and SVBF have an absolute error that is
+signiﬁcantly lower in comparison. For example the 85 %ile
+absolute error for COMB is close to 116µs while SVBF has
+an error of 19µs at the same percentile. From the ﬁgure, we
+can see that not until almost the 98 %ile onward do we see
+any diﬀerence between Clustering and SVBF.
+
+Insert and lookup time complexity. We study the com-
+plexity of insert and lookup time of each data structure.
+We tested 0.4 million packets for insert and lookup using
+
+(a) Insert
+
+(b) Lookup
+
+Figure 7: Comparison of insert and lookup times.
+
+a Linux machine with 2.66GHz Intel CPU. Figure 7 shows
+the complexity in microsecond precision. From the ﬁgure,
+we observe that SVBF works faster than COMB in both
+insert (45% gain on average) and lookup (28%) operations.
+These experimental gains of SVBF are close to the theoreti-
+cal ones which are 50% ((18-9)/18) for insert and 44% ((48-
+27)/48) for lookup based on the number of memory accesses
+in Table 1. While PBF achieves the same performance of
+SVBF for insert operation, PBF is four times slower than
+SVBF for lookup operation on average. Note that SVBF
+is implemented as software and can be optimized further in
+hardware platform.
+5.4 Query interface
+
+Since our architecture can support querying any packet, it
+can allow the querying host to compute aggregate statistics
+across arbitrary traﬃc sub-populations.
+
+Accuracy of aggregate statistics. We ﬁrst verify the ac-
+curacy of obtained aggregate statistics (by querying packets
+that belong to that aggregate) at diﬀerent levels–sub-ﬂow,
+ﬂow, host, and preﬁx/16. By performing ﬂow-level aggrega-
+tion, i.e., by grouping packets with the same ﬂow key, our
+
+ 0 0.2 0.4 0.6 0.8 110-210-1100CDFClassiﬁcation failure rateSVBFCOMBPBF 0 0.2 0.4 0.6 0.8 110-210-1100CDFFalse classiﬁcation rate 0.7 0.75 0.8 0.85 0.9 0.95 1101102103104CDFAbsolute error (µs)SVBFCOMBPBFClustering 0 0.2 0.4 0.6 0.8 1100101CDFTime (microsecond)SVBFCOMBPBF 0 0.2 0.4 0.6 0.8 1100101102CDFTime (microsecond)111(a) Accuracy of aggregates
+
+(b) Query bandwidth compression
+
+(c) Impact of query timing
+
+Figure 8: Average latency statistics at diﬀerent aggregation levels, query message compression ratio depend-
+ing on ﬂow size, and impact of query timing using high utilization scenario.
+
+architecture achieves similar functionality as previous work
+RLI [27]. However, perhaps more unique to our architecture,
+due to the fact that it stores measurements on a per-packet
+basis, we can choose to aggregate at sub-ﬂow level, while
+RLI cannot easily achieve this. We compute the average
+delay of 10 consecutive packets within the same ﬂow key
+(among large ﬂows whose size is more than 10 packets) as
+the sub-ﬂow average delay. Such a feature could be useful,
+for instance, to understand which set of packets within a
+large ﬂow are exhibiting abnormal latencies.
+
+Figure 8(a) shows the aggregate statistics in terms of rela-
+tive error for the high link utilization scenario. We also draw
+a curve for packet latencies as a reference curve. From the
+ﬁgure, we observe that as aggregation level becomes higher,
+relative error reduces. Latency estimates at sub-ﬂow level,
+however, have the least relative errors. This is not inconsis-
+tent, since many ﬂow/host/preﬁx-level statistics, although
+aggregated with packets within a given epoch, are computed
+with only a single packet (46% ﬂows, 41% hosts, and 13%
+preﬁx/16), while sub-ﬂow statistics are computed for ﬂows
+that at least have 10 packets. Thus, sub-ﬂow latency esti-
+mates get more inﬂuence on canceling individual errors out
+by aggregation. Speciﬁcally, median relative error is 5.5%
+at packet level, 3.9% at ﬂow level, 3.6% at host level, 2.1%
+at preﬁx/16 level and 1.9% at sub-ﬂow level. Similar trends
+are found under low and moderate utilization scenarios.
+
+In terms of absolute errors, we observe that preﬁx/16 av-
+erage latency is more accurate than other aggregation levels,
+at low link utilization. As link utilization increases, however,
+we ﬁnd little diﬀerence in absolute error among all four ag-
+gregation levels. We omit graphs for brevity, but we observe
+a 95 %ile absolute error of less than 0.05µs, 2µs and 55µs
+across all four aggregation levels.
+
+Compression of query bandwidth with IP ids. We
+study the query bandwidth saving using the IPID idea out-
+lined in §4. For each ﬂow within an epoch, we compare the
+bandwidth of range query messages with individual packet
+queries. Figure 8(b) shows the bar graph of compression ra-
+tio depending on ﬂow size for 60 epochs with ISP, UNIV1
+and UNIV2 traces. The bar denotes average compression
+ratio and the whisker bar means 75 %ile value from the
+ﬁgure. We observe that as ﬂow size increases, higher query
+bandwidth saving is achieved (for ﬂows with more than 1000
+packets in UNIV1, average compression ratio is 6%—17×
+less bandwidth than the naive packet query method). We
+also observe that more compression at larger ﬂow sizes is
+achieved with data center traces compared to ISP trace.
+
+Figure 9: Comparison of ﬂow estimates with RLI.
+
+Impact of inaccurate query timing. We evaluate the
+impact of inaccurate query timing when clients issue per-
+packet latencies. In the experiments, all packet queries in
+an epoch i are asked to a SVBF of that epoch (true SVBF)
+and additional b number of SVBFs of previous epochs i − b
+(bogus SVBFs). Multiple matches are resolved using the
+same tie-breaking heuristic.
+In Figure 8(c), we show the
+results for 2 bogus SVBFs. Clearly, as the number of epochs
+considered increases, the accuracy decreases slightly. For
+instance, 95 %ile absolute error shifts from 70 to 89 to 125µs
+as bogus SVBFs are added, but the 75 %ile errors are not
+that impacted, increasing the error from 10.7 to 12.2µs.
+5.5 Comparison with prior architecture
+
+We now compare our MAPLE architecture with RLI [27],
+that also averages approximate latencies of packets (obtained
+via latency interpolation) that belong to a ﬂow. MAPLE
+uses accurate packet latencies (using timestamps) but stores
+them approximately in the SVBF data structure. MAPLE
+can also use RLI-approximated latency for each packet, but
+this leads to two sets of approximations (we denote this as
+MAPLE-RLI). We study these various eﬀects in Figure 9.
+(For brevity, we only show the high utilization curve; the
+trends for the other two utilizations were similar.)
+
+We make two observations in Figure 9. First, there is lit-
+tle diﬀerence in absolute error between MAPLE-RLI and
+RLI, while RLI has slightly higher accuracy than MAPLE-
+RLI, which is expected. Speciﬁcally, under high utilization
+scenario, RLI has 76µs absolute error at 95 percentile, but
+MAPLE-RLI has 102µs at the same percentile. Median er-
+ror by RLI is 15µs and the error of MAPLE-RLI is 17µs.
+The second observation is that MAPLE (with true laten-
+cies) achieves much higher (half to one order of magnitude
+
+ 0 0.2 0.4 0.6 0.8 110-310-210-1100CDFRelative errorPreﬁx /16HostFlowSub-ﬂowPacket 0 0.2 0.4 0.6 0.8 11-1011-100101-1000>1000 Compression ratioFlow sizeISPUNIV1UNIV2 0.7 0.75 0.8 0.85 0.9 0.95 1101102103104CDFAbsolute error (µs)SVBF-B0SVBF-B1SVBF-B2 0 0.2 0.4 0.6 0.8 110-1100101102103CDFAbsolute error (µs)MAPLERLIMAPLE-RLI112higher) accuracy than RLI. For instance, about 90% ﬂows
+have less than 1µs absolute error with MAPLE, but RLI
+only has 50% ﬂows with such absolute error under moderate
+utilization scenario (not shown for brevity). Put diﬀerently,
+in Figure 9, MAPLE achieves 5× less median error than
+RLI. This shows that MAPLE, if implemented, may provide
+more accurate latency estimates than RLI, even with the
+approximations in the storage data structure. Of course, if
+actual packet latencies are available to RLI, there is no need
+for interpolation in RLI, and per-ﬂow latencies are trivially
+obtained with 100% accuracy. So, we do not discuss the
+obvious case.
+
+6.
+
+IMPLEMENTATION
+
+We envision that the streaming k-medians algorithm will
+be implemented in software. We assume there is an ad-
+ditional processor (or core) devoted to implementing this
+architecture. We assume that this core will perform the
+streaming k-medians on the sampled data. There have been
+some prior eﬀorts [29] on implementing k-medians directly in
+hardware that we can also leverage. In environments where
+there is not enough processing capacity, we can rely on the
+static clustering approach we discussed in §3. This will how-
+ever yield worse accuracy than the hybrid clustering.
+
+The actual storage data structure (SVBF) outlined in
+Figure 2, will need to be implemented in hardware in high-
+speed SRAM. Bloom ﬁlters in general require simple hashing
+operations and updating bit maps and thus are amenable to
+high-speed implementations (see [38] for example). For im-
+plementing the hash functions, we can use the H3 [34] hash
+functions or the BOB [24] ones that are amenable to easy
+hardware implementations. We need to also maintain two
+extra counters per center, one for tracking number, and the
+other for sum of delays of all packets that map to a given
+center. These counters will enable the reﬁned latency es-
+timate heuristic (in §3.3) and the tie-breaking heuristic (in
+§3.3.4). The SVBF data structure needs to be ﬂushed every
+epoch to an oﬀ-chip storage, which can be either DRAM
+or SSDs. Along with each SVBF, the associated k centers
+for that particular epoch need to be stored. For smaller k,
+this is only a small amount of extra storage. Depending on
+the technological constraints such as the amount of available
+high-speed memory and link speeds, the epoch size could be
+determined.
+
+Assuming an OC-192 interface, we have roughly 5 mil-
+lion packets per second, for which we will require about 60
+Mbits of memory per second (assuming 12 bits/packet). Of
+course, this is assuming the interface is running at full capac-
+ity, which is often not the case. Rather, latency spikes are
+often generated by microburst typically occurring under low
+average utilization [9]. Thus, if we assume 20% utilization,
+we only require 12 Mbits of memory per second to capture
+such latency spikes. 16 GB of DRAM (which is commodity
+today) could be used to store packet latencies for almost 3
+hours. Flash memory densities are even higher; today 256
+GB SSDs are possible which will enable storing packet la-
+tency state for 47 hours, which is enough time for network
+operators to debug and process the information. Even for
+100% utilization, the DRAM and SSD can sustain for 36
+minutes and 9.5 hours respectively.
+
+Queries will need to be handled in software. For each
+query, depending on the approximate time of the packet in
+the query, the appropriate SVBF (and the two neighbors just
+
+in case) will be queried by the processor (or core) (perhaps
+shared with the k-medians implementation). Only the words
+corresponding to the hash indexes will need to be fetched
+from the secondary memory (SSD or DRAM), which are
+then looked up according to the algorithm outlined in §3.3.3.
+
+7. RELATED WORK
+
+There exists a lot of research in measuring per-hop laten-
+cies, although in the wide-area context, where ISPs typi-
+cally rely on injecting active probes and obtaining link or
+hop latency statistics using tomographic approaches [14, 16,
+39]. These approaches do not satisfy any of our high-ﬁdelity
+measurement requirements in §2.1 and thus we need high-
+ﬁdelity passive measurement mechanisms. In this regard, we
+already discussed three prior approaches relevant to ours—
+LDA [26], RLI [27] and Consistent NetFlow [28].
+
+The idea of storing packet-level information has been pur-
+sued in other prior contexts; trajectory sampling for identi-
+fying packet trajectories in [17] and SPIE for IP traceback
+in [37]. Neither provides latency estimates unfortunately,
+although trajectory sampling could be augmented with a
+timestamp, but only a small number of packets are sam-
+pled at each router (see [26, 27] for comparison of these
+approaches with trajectory sampling). SPIE on the other
+hand stores only packets and not their associated times-
+tamps; thus, a simple Bloom ﬁlter was suﬃcient there, while
+we needed the clustering and SVBF in our setting.
+
+The idea of ‘in-band’ diagnosis was proposed in NetRe-
+play [8] and Orchid [33]. NetReplay proposes the idea of
+replaying packets to collect feedback from the network. Or-
+chid [33] also proposes the idea of in-band network trou-
+bleshooting, where packets collect feedback from routers along
+the path. Our approach, however is more focused on esti-
+mating, storing and retrieving packet-level latency measure-
+ments, and is complementary to these approaches.
+
+Song et al. propose fast hash table [38] to provide constant
+lookup time by exploiting counting bloom ﬁlter. Fast hash
+table does not address large space requirement because of an
+extra counting bloom ﬁlter and the need to store both packet
+digest and its delay. Supporting membership check across
+multiple groups is non-trivial for Bloom ﬁlter. Several data
+structures [11, 13, 20] have been proposed to address this
+problem. COMB [20] is a multi-group membership check
+data structure that is highly relevant to our work and hence,
+we discussed this in §3.3.
+
+Our SVBF data structure shares some similarity with the
+bit slicing idea proposed in the database community [35, 18].
+Speciﬁcally, the concept of colocating bits corresponding to
+diﬀerent centers to which a packet may potentially match
+is similar to laying out bits corresponding to records in a
+document on the disk, one of which a given keyword may
+match to. The bit slicing idea may be applied to PBF to
+make the lookup time complexity close to SVBF’s, but it
+needs BF sizes to be uniform. One may think of normalizing
+the sizes of all BFs, but that means each BF needs to be the
+size of the largest BF, which is all packets in the worst case.
+This is clearly a considerable wastage.
+
+8. CONCLUSION
+
+This paper proposed a scalable and ﬂexible measurement
+architecture called MAPLE. The core of the architecture
+consists of two novel mechanisms; a streaming clustering
+
+113algorithm to cluster packet latencies into small number of
+latency clusters in a streaming fashion, and a data structure
+called SVBF to store packet latencies eﬃciently in a router.
+In addition, it provides a ﬂexible query interface for net-
+work operators to query the latency of individual packets.
+Together, the architecture provides both ﬁne-grained as well
+as ﬂexible latency measurements to help network operators
+manage low-latency applications eﬃciently. Our evaluations
+using a software prototype indicate that our architecture can
+scale eﬃciently both in terms of storage needs as well as in
+terms of query bandwidth.
+
+Acknowledgments
+The authors are indebted to Aditya Akella, our shepherd,
+and the anonymous reviewers for comments on previous ver-
+sions of this manuscript. This work was supported in part
+by NSF Award CNS 0831647 and 1054788.
+
+9. REFERENCES
+[1] Cut-through and store-and-forward ethernet switching for
+
+low-latency environments.
+http://www.cisco.com/en/US/prod/collateral/switches/
+ps9441/ps9670/white_paper_c11-465436.html.
+
+[2] Data Center Fabric with Nanosecond Accuracy - Use
+
+IEEE1588 PTP on Nexus 3000 Switches. http:
+//www.cisco.com/en/US/prod/collateral\/switches/
+ps9441/ps11541/white_paper_c11-690975.html.
+
+[3] FocalPoint TDM Support. http://www.fulcrummicro.com/
+
+product_library/applications/TDM_App_Note.pdf.
+
+[4] OpenRTB API Speciﬁcation Version 2.0.
+
+http://www.iab.net/media/file/OpenRTB_API_
+Specification_Version2.0_FINAL.PDF.
+
+[5] The C Clustering Library. http://bonsai.hgc.jp/
+
+~mdehoon/software/cluster/software.htm.
+
+[6] M. Al-Fares, S. Radhakrishnan, B. Raghavan, N. Huang,
+
+and A. Vahdat. Hedera: Dynamic ﬂow scheduling for data
+center networks. In USENIX/ACM NSDI, 2010.
+
+[7] M. Alizadeh, A. Greenberg, D. A. Maltz, J. Padhye,
+
+P. Patel, B. Prabhakar, S. Sengupta, and M. Sridharan.
+Data center TCP (DCTCP). In ACM SIGCOMM, 2010.
+
+[8] A. Anand and A. Akella. NetReplay: a new network
+
+primitive. ACM SIGMETRICS Performance Evaluation
+Review, 37, 2010.
+
+for direct traﬃc observation. In IEEE/ACM Transactions
+on Networking, 2000.
+
+[18] C. Faloutsos and S. Christodoulakis. Signature Files: an
+
+Access Method for Documents and Its Analytical
+Performance Evaluation. ACM Transactions on
+Information Systems, 2(4):267–288, Oct. 1984.
+
+[19] A. Greenberg, J. R. Hamilton, N. Jain, S. Kandula,
+
+C. Kim, P. Lahiri, D. A. Maltz, P. Patel, and S. Sengupta.
+VL2: a scalable and ﬂexible data center network. In ACM
+SIGCOMM, 2009.
+
+[20] F. Hao, M. Kodialam, T. Lakshman, and H. Song. Fast
+multiset membership testing using combinatorial bloom
+ﬁlters. In IEEE Infocom, 2009.
+
+[21] P. Indyk. A Sublinear Time Approximation Scheme for
+
+Clustering in Metric Spaces. In IEEE FOCS, 1999.
+
+[22] P. Indyk. Sublinear Time Algorithms for Metric Space
+
+Problems. In ACM STOC, 1999.
+
+[23] A. K. Jain and R. C. Dubes. Algorithms for clustering
+
+data: Prentice-Hall, 1981.
+
+[24] B. Jenkins. Algorithm alley. Dr. Dobb’s Journal, September
+
+1997.
+
+[25] D. E. Knuth. The Art of Computer Programming, Volume
+
+II: Seminumerical Algorithms, 2nd Edition.
+Addison-Wesley, 1981.
+
+[26] R. R. Kompella, K. Levchenko, A. C. Snoeren, and
+G. Varghese. Every MicroSecond Counts: Tracking
+Fine-grain Latencies Using Lossy Diﬀerence Aggregator. In
+ACM SIGCOMM, 2009.
+
+[27] M. Lee, N. Duﬃeld, and R. R. Kompella. Not All
+
+Microseconds are Equal: Fine-Grained Per-Flow
+Measurements with Reference Latency Interpolation. In
+ACM SIGCOMM, 2010.
+
+[28] M. Lee, N. Duﬃeld, and R. R. Kompella. Two Samples are
+Enough: Opportunistic Flow-level latency estimation using
+Netﬂow. In IEEE Infocom, 2010.
+
+[29] M. Leeser, J. Theiler, M. Estlick, and J. Szymanski. Design
+
+tradeoﬀs in a hardware implementation of the k-means
+clustering algorithm. In Sensor Array and Multichannel
+Signal Processing Workshop, 2000.
+
+[30] S. Lloyd. Least squares quantization in PCM. Information
+Theory, IEEE Transactions on, 28(2):129–137, Mar. 1982.
+[31] R. Martin. Wall street’s quest to process data at the speed
+
+of light.
+http://www.informationweek.com/news/infrastructure/
+showArticle.jhtml?articleID=199200297.
+
+[32] A. Meyerson. Online Facility Location. In IEEE FOCS,
+
+2001.
+
+[9] T. Benson, A. Akella, and D. A. Maltz. Network traﬃc
+
+[33] M. Motiwala, A. Bavier, and N. Feamster. Network
+
+characteristics of data centers in the wild. In
+ACM/USENIX IMC, 2010.
+
+[10] B. H. Bloom. Space/time trade-oﬀs in hash coding with
+
+allowable errors. Communications of the ACM, 1970.
+
+[11] F. Chang, F. Chang, and W. chang Feng. Approximate
+
+Caches for Packet Classiﬁcation. In IEEE INFOCOM, 2004.
+
+[12] M. Charikar, L. O’Callaghan, and R. Panigrahy. Better
+Streaming Algorithms for Clustering Problems. In ACM
+STOC, 2003.
+
+[13] B. Chazelle, J. Kilian, R. Rubinfeld, and A. Tal. The
+
+bloomier ﬁlter: an eﬃcient data structure for static support
+lookup tables. In ACM SODA, 2004.
+
+troubleshooting: An in-band approach. In USENIX NSDI,
+2007.
+
+[34] M. Ramakrishna, E. Fu, and E. Bahcekapili. Eﬃcient
+
+hardware hashing functions for high performance
+computers. IEEE Transactions on Computers, 46(12), Dec.
+1997.
+
+[35] C. S. Roberts. Partial-Match Retrieval via the Method of
+
+Superimposed Codes. Proceedings of the IEEE,
+67(12):1624–1642, Dec. 1979.
+
+[36] A. Shieh, S. Kandula, A. Greenberg, and C. Kim. Seawall:
+
+performance isolation for cloud datacenter networks. In
+USENIX HotCloud, 2010.
+
+[14] Y. Chen, D. Bindel, H. Song, and R. H. Katz. An Algebraic
+
+[37] A. C. Snoeren, C. Partridge, L. A. Sanchez, C. E. Jones,
+
+Approach to Practical and Scalable Overlay Network
+Monitoring. In ACM SIGCOMM, 2004.
+
+[15] T. H. Cormen, C. E. Leiserson, R. L. Rivest, and C. Stein.
+
+Introduction to Algorithms. The MIT Press, 2nd edition,
+2001.
+
+[16] N. Duﬃeld. Simple network performance tomography. In
+
+ACM/USENIX IMC, 2003.
+
+[17] N. G. Duﬃeld and M. Grossglauser. Trajectory sampling
+
+F. Tchakountio, B. Schwartz, S. T. Kent, and W. T.
+Strayer. Single-packet IP traceback. IEEE/ACM
+Transactions on Networking (ToN), 10, 2002.
+
+[38] H. Song, S. Dharmapurikar, J. Turner, and J. Lockwood.
+
+Fast Hash Table Lookup Using Extended Bloom Filter: An
+Aid to Network Processing. In ACM SIGCOMM, 2005.
+
+[39] Y. Zhao, Y. Chen, and D. Bindel. Towards unbiased
+
+end-to-end network diagnosis. In ACM SIGCOMM, 2006.
+
+114

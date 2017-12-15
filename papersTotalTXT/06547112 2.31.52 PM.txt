@@ -1,0 +1,2025 @@
+2013 IEEE Symposium on Security and Privacy
+
+A hybrid architecture for interactive veriﬁable computation
+
+Victor Vu, Srinath Setty, Andrew J. Blumberg, and Michael Walﬁsh
+
+The University of Texas at Austin
+
+Abstract—We consider interactive, proof-based veriﬁable computa-
+tion: how can a client machine specify a computation to a server,
+receive an answer, and then engage the server in an interactive
+protocol that convinces the client that the answer is correct, with
+less work for the client than executing the computation in the ﬁrst
+place? Complexity theory and cryptography offer solutions in prin-
+ciple, but if implemented naively, they are ludicrously expensive.
+Recently, however, several strands of work have reﬁned this the-
+ory and implemented the resulting protocols in actual systems. This
+work is promising but suffers from one of two problems: either it
+relies on expensive cryptography, or else it applies to a restricted
+class of computations. Worse, it is not always clear which protocol
+will perform better for a given problem.
+
+We describe a system that (a) extends optimized reﬁnements of
+the non-cryptographic protocols to a much broader class of compu-
+tations, (b) uses static analysis to fail over to the cryptographic ones
+when the non-cryptographic ones would be more expensive, and (c)
+incorporates this core into a built system that includes a compiler
+for a high-level language, a distributed server, and GPU accelera-
+tion. Experimental results indicate that our system performs better
+and applies more widely than the best in the literature.
+1 Introduction
+We are interested in veriﬁable computation:1 how can a client
+outsource computation to a more powerful but potentially un-
+reliable machine (or machines) and receive assurance that the
+computation was performed correctly? This problem has re-
+ceived renewed attention lately due to the rise of cloud com-
+puting and other third-party computing models [1, 3]: even if
+the third-party performer is not malicious, the client still has
+concerns about the integrity of data and computations.
+
+The systems community has a long tradition of work on
+protocols that solve this problem but make strong assump-
+tions about the usage model or focus on a restricted class of
+computations. For instance, solutions assume that failures are
+uncorrelated [3, 14, 34], that there is a chain of trust establish-
+ing faith in the computation [40, 42], or that the computation
+produces intermediate results amenable to checking [35].
+
+It has also long been known that in principle, deep re-
+sults in complexity theory [5–7, 24, 32, 48] and cryptogra-
+phy [13, 19, 27–29] yield protocols that are general-purpose
+and assume nothing about potential server misbehavior other
+than standard cryptographic hypotheses. These protocols in-
+volve a client, or veriﬁer, that makes queries to a server, or
+prover. The details differ among these protocols, but broadly,
+the prover commits to a proof that the computation was ex-
+ecuted correctly (usually, this proof is an execution trace of
+the computation, in some model of computation). Then, the
+veriﬁer applies a randomized algorithm to ask unpredictable
+
+1Our use of the term veriﬁable computation is broader than its formalization
+in [19], which emphasized non-interactivity. See Section 8 for discussion.
+
+1081-6011/13 $26.00 © 2013 IEEE
+DOI 10.1109/SP.2013.48
+
+223
+
+questions of the prover, and applies efﬁcient tests to the re-
+sponses. The protocols are constructed so that if the prover is
+honest, its responses pass the tests, while if the prover com-
+puted incorrectly, the veriﬁer’s tests exhibit an inconsistency,
+with high probability.
+
+Despite the theoretical promise of these protocols, there
+was little attention to implementation, as performance was
+believed to be infeasibly poor. For instance, veriﬁable com-
+putation makes sense only if the cost of the protocol is less
+than the cost to the client of simply executing the computa-
+tion locally—and it was not clear that this is true for many of
+the protocols in the literature. In fact, it turns out that naive
+implementations require hundreds of trillions of CPU years
+to verify matrix multiplication [45].
+
+However, in the last few years there has been interest in
+building systems using this theory [16, 43]. Also, new the-
+oretical works have emerged that emphasize amenability to
+potential implementation [9, 10, 20]. Moreover, several re-
+search groups have produced running code and measured per-
+formance [16, 44, 45, 47, 49].
+
+The implementations follow two major approaches. The
+ﬁrst is an interactive protocol (without cryptography) due to
+Cormode et al. [16] and derived from a protocol of Gold-
+wasser et al. [23]; we will refer to this protocol as CMT and
+its base as GKR. The second is an efﬁcient argument system
+(that uses cryptographic commitments) that we developed in
+prior work [44, 45, 47], building on Ishai et al. [27]; in fact,
+there are two protocols, Zaatar and Ginger, that will be rele-
+vant for our purposes. Both lines of work (CMT and Zaatar-
+Ginger) reﬁne the original theory to make performance plau-
+sible, if not truly practical.
+
+Of the two, the CMT protocol would initially appear to
+have greater long-term potential, as it does not rely on cryp-
+tography (which measurements indicate is a substantial frac-
+tion of the cost [44, 45, 47]). Moreover, Zaatar and Ginger
+work in the batching model, which means that they assume
+that the user is verifying many instances of the same compu-
+tation, on different inputs. In contrast, CMT does not require
+batching.
+
+However, on closer examination, the comparison is not so
+clear-cut. First, measured performance results [45, §7] are
+equivocal: CMT does not appear to do much better than the
+cryptographic protocols and sometimes does worse. Second,
+CMT is substantially less general-purpose than one would
+like—it works only for computations that can be expressed
+by highly regular circuits. In fact, these restrictions are severe
+enough that it is not clear how to produce compliant circuits
+automatically. Third, batching is actually a very reasonable
+
+model for cloud computation; for instance, it matches data
+parallel computations (e.g., the Map portion of MapReduce
+computations).
+
+The purpose of this paper is to reduce the restrictions on
+
+CMT and then leverage both approaches:
+1. We develop CMT-slim, a reﬁnement of CMT (in the non-
+batched model) that eliminates a source of overhead and
+improves performance (Section 3).
+
+2. We develop CMT-batching, which substantially extends
+the reach of CMT (and CMT-slim) to more general com-
+putations in the batching model (Section 4).
+
+3. We build a system, Allspice (Section 5). Allspice takes
+the input program and employs a static analyzer to de-
+termine which protocol to use. On top of CMT-slim, we
+apply novel optimizations and produce a robust imple-
+mentation (the ﬁrst system based on CMT and GKR that
+we are aware of). For Zaatar-Ginger, we use existing in-
+frastructure, which supports GPU acceleration and par-
+allel hardware [47, §5]. Our combined system compiles
+a high-level language (with standard features like condi-
+tionals, loops, ﬂoating-point data types, and so forth) to
+executables that implement the client and server.
+
+4. We perform detailed analysis and measurements to under-
+stand in depth the comparisons among the different pro-
+tocols; these relationships are subtle, and we expect that
+this work will be useful for understanding when to deploy
+different approaches (Section 6).
+The end result of all of this work is a built system for
+general-purpose interactive veriﬁable computation that, to our
+knowledge, has the best performance and applicability in the
+literature: (1) Allspice (via CMT-slim) improves over CMT
+by a factor of 2 or 3; (2) Allspice (via CMT-batching) applies
+a non-cryptographic (and hence cheaper) protocol to a much
+wider class than CMT, in some cases far outperforming the
+cryptographic protocols (Zaatar and Ginger); for instance, the
+break-even batch size for matrix multiplication under CMT-
+batching is orders of magnitude smaller than under the next-
+best protocol, Zaatar; and (3) Allspice (via Zaatar) applies to
+general-purpose computations.
+
+Serious research hurdles remain. The computational mod-
+els that we use, circuits and constraints, are not well-suited to
+representing general-purpose programs, notably loops. The
+ﬂoating-point representation is simulated in ﬁnite ﬁelds and
+so has poor performance compared to native operations and
+does not handle rounding.
+
+Nonetheless, we are encouraged by the results that we re-
+port here, as they represent continued progress towards a sys-
+tem that is truly practical. The current limitations are consis-
+tent with certain cloud computing scenarios: batching is con-
+sistent with data-parallel setups; a restriction on loops is pre-
+cisely the discipline imposed by MapReduce; and an expen-
+sive prover is less of a problem when there is an abundance
+of CPU cycles.
+
+Figure 1—Proof-based interactive veriﬁable computation. Step :
+V and P represent a computation Ψ as an arithmetic circuit or set of
+constraints (denoted C), and P returns an answer y in response to in-
+put x. Step : P identiﬁes a satisfying assignment z = (z1, . . . , zn);
+the existence of z implies that y = Ψ(x). Step : V queries P, and
+the responses prove to V that a satisfying assignment exists.
+2 Approach, tools, and background
+This section describes the building blocks of Allspice. We
+ﬁrst state the problem that we are trying to solve and give
+the high-level contours of the solution (§2.1). Next, we de-
+scribe the CMT protocol (§2.2); this description is intended
+to be self-contained (but concise) and to give context for the
+reﬁnements that we describe. Finally, we describe Zaatar and
+Ginger at a high level (§2.3), as necessary context.
+
+2.1 Problem statement and framework
+The following description of our problem statement and
+framework borrows heavily from our prior treatments [44,
+47].
+Problem statement. We wish to build a system in which one
+machine, a veriﬁer V, speciﬁes a computation Ψ and input x
+to a prover P. The prover P computes an output y and re-
+turns it to V. If y = Ψ(x), then a correct P should be able
+to convince V of y’s correctness; otherwise, V should reject
+y with high probability. This protocol should be cheaper for
+V than executing Ψ locally, though we are willing to work in
+an amortized cost model (i.e., V saves work only when out-
+sourcing a number of computations); this is consistent with
+some cloud computing scenarios. We are also willing to ac-
+cept some overhead for P, as we expect this type of assurance
+to have a price.
+Finally, the protocol can make standard cryptographic as-
+sumptions about the limits of P’s computational power, but it
+should not make other assumptions about P; for instance, we
+cannot assume that P follows the protocol.
+Framework. The solutions that we present below (§2.2–
+§2.3) consist of three steps, depicted in Figure 1.
+First, V and P represent the computation Ψ as either an
+arithmetic circuit (a generalization of Boolean circuits) or
+constraints (a system of equations); the subsections below
+give more detail on these models, but broadly, the circuit and
+constraints are constructed so that they have a satisfying as-
+signment if and only if Ψ executed correctly. In the circuit
+context, a satisfying assignment is a labeling of the circuit
+
+224
+
+Ψ, xyqueriesprover (P) responsesverifier (V) testsΨ Ψ z1, z2, ...accept/reject11233CCwires for which: the input is x, the labels correspond to the
+correct circuit execution on input x, and the output is 0. In the
+constraint context, a satisfying assignment is a solution to the
+constraints.
+Second, P computes Ψ(x). In so doing, P identiﬁes a sat-
+
+isfying assignment.
+
+Third, using interactive proofs (IPs) [7, 24, 32, 48] or prob-
+abilistically checkable proofs (PCPs) [5, 6] (more accurately,
+using machinery [23, 27–29, 49] derived from this theory), P
+proves that it is holding a satisfying assignment. Of course,
+the statement “there is a satisfying assignment to this cir-
+cuit (or these constraints)” admits a simple classical proof:
+the satisfying assignment itself, z. The trouble is that for V
+to read and check all of z would require executing the circuit,
+or checking the constraints, which would be as much work as
+carrying out Ψ.
+Surprisingly, the theory implies that, by following a ran-
+domized algorithm and querying a prover P, V can “check”
+z efﬁciently—without having to receive it! The properties of-
+fered by the theory are as follows; for the sake of simplicity,
+we state these properties loosely:
+• Completeness. If y = Ψ(x) (in which case a satisfying
+assignment to the circuit or constraints exists), then if P
+follows the protocol, Pr{V accepts} = 1, where the prob-
+ability is over V’s random choices.
+• Soundness. If y (cid:54)= Ψ(x), (in which case no satisfying as-
+signment exists and any purported proof must be spuri-
+ous), then Pr{V accepts} < , where  is small, and the
+probability is over V’s random choices.
+The nature of the soundness guarantee depends on context.
+Under the machinery described next, the soundness guarantee
+is unconditional: even a computationally unlimited P cannot
+fool V with probability greater than . Under the machinery
+presented in Section 2.3, the soundness guarantee is predi-
+cated on the semantic security of a homomorphic cryptosys-
+tem (in this case, ElGamal [17]) and thus ultimately on a stan-
+dard cryptographic hardness assumption.
+2.2 The CMT protocol
+This section describes the CMT protocol [16, 49], which re-
+ﬁnes the GKR protocol [23]. Full details of GKR are in Roth-
+blum [41, §3.2–3.3]. Our description below is inﬂuenced by
+these sources, though our notation sometimes diverges.
+
+We consider computations Ψ that can have multiple inputs
+and outputs, so we represent the input x and output y as vec-
+tors. This protocol represents computations as arithmetic cir-
+cuits, meaning a network of add and multiply gates, each with
+two input “wires” and one output “wire”, where each wire can
+take values in a large ﬁnite ﬁeld F. CMT requires that F = Fp
+(the integers mod a prime p). The CMT protocol requires that
+the circuit (a) is layered;2 and (b) has a regular structure. We
+
+will discuss the implications of these requirements in Sec-
+tion 4 and for now take them as givens.
+
+The protocol numbers the circuit layers from 0 to d (for
+depth) and presumes a single output gate at layer 0; the input
+gates are at level d. To represent the computation y = Ψ(x),
+the circuit includes −y in its input, computes Ψ(x) and adds it
+to −y, and returns the sum. Thus, we say that the computation
+was executed correctly (meaning P claimed the correct y) if
+the circuit evaluates to 0 when given input x(cid:48) = (x,−y).
+At a high level, the protocol works as follows. Based on
+the structure of the circuit (which V is assumed to know),
+the protocol, with P’s help, proves to V that the output gate
+evaluates to 0 if and only if the gates at layer 1 satisfy a par-
+ticular algebraic statement. While V could in principle verify
+this statement (by executing the circuit from layer d right up
+through layer 1 and then checking the statement explicitly),
+that would be too expensive. Instead, the protocol, again re-
+lying on P’s help and V’s knowledge of the circuit structure,
+proves to V that the algebraic statement about layer 1 holds if
+and only if another algebraic statement, this time about layer
+2, holds. Again, this statement is too expensive for V to check
+explicitly, so the protocol continues until V has in hand a par-
+ticular algebraic statement about the inputs x(cid:48). At that point,
+V checks the statement with no assistance from P.
+
+The protocol provides two guarantees. (1) If the prover
+computes the circuit correctly and participates in the proto-
+col correctly, then V accepts. (2) If the prover computes the
+circuit incorrectly (i.e., the circuit’s true output is not zero),
+then with high probability, the algebraic statements that the
+protocol claims to be equivalent are indeed equivalent—and
+hence all false. Thus, when V checks the ﬁnal statement, V
+observes the falsehood, and rejects.
+Details. We number the gates at each layer from 0, write
+them in binary, and assume (for ease of exposition) that ev-
+ery layer has the same number of gates, G. Let b = (cid:100)log2 G(cid:101).
+Deﬁne a set of evaluator functions V0, . . . , Vd, one for each
+2 → F. (F2 is the ﬁeld consisting of {0, 1}.) Each
+layer: Vi : Fb
+Vi maps the gates at layer i to their values; if (cid:96) ≥ G, then
+Vi((cid:96)) = 0. Observe that each Vi implicitly depends on the
+input x(cid:48), and that Vd(j) returns the jth input element itself.
+
+Motivation and straw man. At a high level, we want to re-
+duce a claim that V0(0) = 0 (i.e., that the circuit computed
+correctly) to a claim about V1 and in turn to a claim about V2
+and so on, until P makes a claim about the input layer that
+V can check directly (since it supplies the input). Thus, we
+are motivated to write V0 in terms of V1(·) and more gener-
+ally Vi−1(·) in terms of Vi(·). Deﬁne two functions, called the
+wiring predicates by Cormode et al. [16]: addi(g1, g2, g3) re-
+turns 1 if gate g1 at layer i − 1 is the sum of the outputs of
+gates g2, g3 at layer i; it returns 0 otherwise. multi(g1, g2, g3)
+is analogous but returns 1 when g1 at layer i − 1 is the prod-
+
+2Loosely, this means that the gates can be partitioned into sets (called layers),
+
+where the only wires in the circuit connect adjacent layers (versus skipping
+over them).
+
+225
+
+write V0(0) =(cid:80)
+
+uct of the outputs of gates g2, g3 at layer i. Now, we can
+j1,j2∈{0,1}b add1(0, j1, j2)·(V1(j1) + V1(j2))+
+(cid:88)
+mult1(0, j1, j2) · V1(j1) · V1(j2). More generally,
+
+addi(g, j1, j2) · (Vi(j1) + Vi(j2))
+
+Vi−1(g) =
+
+j1,j2∈{0,1}b
+
++ multi(g, j1, j2) · Vi(j1) · Vi(j2).
+
+The form above (that Vi−1(g) is a collection of sums) mo-
+tivates the use of sum-check protocols [32, 48]; see also [4,
+§8.3.1] and [41, §3.2.3]. Such protocols are interactive, and
+consist of a veriﬁer VSC and a prover PSC. VSC begins with
+some value K and a polynomial f : Fm → F of degree δ in
+each of its m variables. VSC asks PSC to prove that K equals
+the sum of the evaluations of f over all bit combinations:
+
+(cid:88)
+
+(cid:88)
+
+··· (cid:88)
+
+t1∈{0,1}
+
+t2∈{0,1}
+
+tm∈{0,1}
+
+K =
+
+f (t1, t2, . . . , tm).
+
+(1)
+
+As usual, if the statement is true, PSC can convince VSC; oth-
+erwise, VSC is highly unlikely to be convinced. This process
+is vastly more efﬁcient for VSC than computing the sum itself.
+A naive straw man would be to attempt to run one instance
+of the sum-check protocol for each Vi−1(g), that is, each gate.
+However, this would be more work for the veriﬁer (to say
+nothing of the prover) than simply executing the circuit. The
+technical details below get around this problem and permit
+the protocol to work with only d instances of the sum-check
+protocol. Though we do not have space to motivate all of
+the details, we nonetheless include them, to communicate the
+structure and mechanics of the protocol.
+
+The protocol. Because sum-check protocols work with
+polynomials, the protocol extends the functions Vi to poly-
+nomials ˜Vi. Deﬁne a multilinear extension ˜g of a function
+2 → F as follows: ˜g agrees with g everywhere that g
+g: Fm
+is deﬁned, but ˜g is deﬁned over Fm (instead of Fm
+2 ), and ˜g is a
+polynomial of degree at most one in each of the m variables.
+The signature of ˜Vi, then, is ˜Vi : Fb → F. Notice that the
+polynomial ˜Vd(·) is the extension of the function Vd(j) = x(cid:48)
+j,
+where x(cid:48)
+j is the jth input. For i = 1, . . . , d, GKR show [23, 41]
+that ˜Vi−1(·) can be written as
+˜Vi−1(q) =
+
+˜E(q, g) ·(cid:16) ˜addi(g, j1, j2) ·(cid:0)˜Vi(j1) + ˜Vi(j2)(cid:1)
+(cid:17)
+
+g,j1,j2∈Fb
+
++ ˜multi(g, j1, j2) · ˜Vi(j1) · ˜Vi(j2)
+
+2
+
+=
+
+fq(g, j1, j2),
+
+(2)
+
+(cid:88)
+(cid:88)
+
+g,j1,j2∈Fb
+
+2
+
+which is in a form suitable for the sum-check protocol (see
+equation (1)), since fq : F3b → F is a polynomial, deﬁned as
+fq(u1, u2, u3) = ˜E(q, u1)·( ˜addi(u1, u2, u3)·(˜Vi(u2)+ ˜Vi(u3))+
+˜multi(u1, u2, u3)· ˜Vi(u2)· ˜Vi(u3)). ˜E is a polynomial deﬁned in
+Appendix A.1, and ˜addi and ˜multi are multilinear extensions
+of addi and multi.
+
+226
+
+?
+= ˜Vi(qi)
+
+?
+= ˜Vi(w2)
+
+?
+= ˜Vi(w1), v2
+
+?
+= ˜Vi(w2) to ai
+
+?
+= ˜Vi(w1), v2
+// reduce ai−1
+(v1, v2, w1, w2) ← SUMCHECK(i, qi−1, ai−1)
+
+q0 ← (cid:126)0 ∈ Fb
+a0 ← 0
+d ← c.depth
+for i = 1, . . . , d do
+?
+= ˜Vi−1(qi−1) to v1
+
+1: function VERIFYCMTGKR(Circuit c)
+2:
+3:
+4:
+5:
+6:
+7:
+8:
+9:
+10:
+11:
+12:
+13:
+14:
+15:
+16:
+17:
+18:
+19:
+20:
+21:
+22:
+23:
+Figure 2—Pseudocode for V in the GKR and CMT protocol [16, 23,
+41]. The protocol proceeds in layers, reducing the claim that ai−1 =
+˜Vi−1(qi−1) to a claim that ai = ˜Vi(qi). SUMCHECK is deﬁned in
+Appendix A. See Rothblum [41] for explanation of all details.
+
+// reduce v1
+h0, h1, . . . , hb ← GetFromProver()
+// above, correct prover returns b + 1 ﬁeld elements,
+// speciﬁcally H(0), H(1), . . . , H(b) ∈ F, where
+// H = ˜Vi ◦ γ, for γ : F → Fb, γ(t) = (w2 − w1)t + w1
+if h0 (cid:54)= v1 or h1 (cid:54)= v2 then
+return reject
+R←− F
+τ
+qi ← γ(τ )
+ai ← H∗(τ ) // H∗ is poly. interpolation of h0, . . . , hb
+SendToProver(τ)
+if ad = ˜Vd(qd) then
+
+// requires computing ˜Vd(qd)
+
+return accept
+
+return reject
+
+Pseudocode for the protocol is in Figure 2. V wants to be
+convinced that ˜V0(0) = 0; this equality is tantamount to es-
+tablishing that the circuit evaluates to 0 and hence that Ψ
+was carried out correctly. To this end, the protocol starts with
+q0 = 0 and a0 = 0, and in each iteration i = 1, . . . , d, the
+protocol produces some ai ∈ F and qi ∈ Fb and a statement:
+“you should believe that ai−1 = ˜Vi−1(qi−1) if and only if you
+can establish that ai = ˜Vi(qi)” (lines 7–19). The guarantees of
+each iteration are: (1) If the iteration begins with a true state-
+ment, i.e., if ai−1 = ˜Vi−1(qi−1), then if P behaves correctly,
+the protocol produces another true statement, i.e., for the ai
+and qi that it returns, ai = ˜Vi(qi). (2) If the iteration begins
+with a false statement, i.e., if ai−1 (cid:54)= ˜Vi−1(qi−1), then the pro-
+tocol produces another false statement with high probability,
+i.e., for the ai and qi that it returns, ai (cid:54)= ˜Vi(qi).
+The process ends with telling V “ ... if and only if you can
+establish that ad = ˜Vd(qd),” at which point V performs that
+check directly (line 21). By composing the iterations together,
+we see that if the protocol begins with a true statement, a cor-
+rect P makes V accept. On the other hand, if the protocol
+begins with a false statement—an incorrect claim that the cir-
+cuit evaluates to 0—then with high probability the protocol
+produces an ad such that ad (cid:54)= ˜Vd(qd); as a result, V rejects.
+
+Guarantees and costs. The protocol described above satis-
+ﬁes completeness and soundness (§2.1), with  ≤ 7· b· d/|F|;
+see Rothblum [41, §3.3.3] for a derivation. Since |F| is astro-
+nomical (§6.1), this error can be neglected in practice.
+
+V incurs one of its principal costs inside the sum-check
+protocol: in each iteration, V must compute ˜addi(w0, w1, w2)
+and ˜multi(w0, w1, w2), for random w0, w1, w2 ∈ Fb (see Ap-
+pendix A.1). Thus, for the protocol to be efﬁcient for V, the
+circuit must admit an efﬁcient computation of ˜addi and ˜multi,
+a restriction that we return to in Section 4. Assuming (as CMT
+does) that computing ˜addi and
+˜multi is O(polylog(G)), the
+veriﬁer’s running time is O(|x(cid:48)| log|x(cid:48)| + d · polylog(G)) =
+O((|x| + |y|) · log (|x| + |y|) + d · polylog(G)).
+Regarding P, the innovations of Cormode et al. [16] make
+the sum-check protocol efﬁcient for P, resulting in overall
+running time for P of just O(d · G · log G): not much more
+than executing the d · G gates of the computation.
+
+2.3 Zaatar and Ginger
+
+This section gives an overview of Zaatar [44] and Ginger [47].
+We will abstract most details, as our intent is only to describe
+the structure of these protocols for context.
+The computational model. These protocols represent com-
+putations as constraints, meaning a system of equations, over
+a ﬁnite ﬁeld F, with one or more distinguished input variables
+(which we denote loosely as X) and one or more distinguished
+output variables (denoted loosely as Y). These protocols re-
+quire constraints to be total degree 2, meaning that the sum-
+mands in each constraint are either variables or products of
+two variables. A set of constraints is satisﬁable if there is a
+setting of the variables that makes all of the equations hold.
+We write C(X=x, Y=y) to mean the resulting equations when
+X and Y are set to respective values x and y. We say that a
+set of constraints C is equivalent to a computation Ψ if: for
+all x and y, we have C(X=x, Y=y) is satisﬁable if and only if
+y = Ψ(x). As an example, the computation multiply-by-5 is
+equivalent to {5 · Z − Y = 0, Z − X = 0}.
+
+Ginger shows how to transform standard program con-
+structs (logical operations, inequality comparisons, if/else,
+etc.) into this “assembly language” of degree-2 constraints;
+see [47][46, Apdx. C] for details. Most of the resulting con-
+straints are very concise; an exception is inequalities, which
+require ≈ log2 |F| constraints per operation (intuitively, the
+inequality constraints separate a number into its bits and glue
+it back together for the rest of the computation). Another lim-
+itation of the constraint formalism is it is necessary to unroll
+loops, requiring bounds to be known at compile time.
+
+Zaatar and Ginger incorporate compilers that perform
+this transformation automatically (the two protocols require
+slightly different forms). The compilers are derived from the
+Fairplay compiler [33] and take as input programs expressed
+in SFDL, the language of Fairplay. SFDL is a high-level lan-
+guage that supports conditional control ﬂow, logical expres-
+sions, and inequality comparisons; Ginger extends the lan-
+guage with a primitive ﬂoating-point data type.
+alent constraints to Ψ, which we denote C.
+
+In the rest of the section, we will take as a given the equiv-
+
+The veriﬁcation machinery. Given a set of constraints C,
+input x, and output y, Zaatar and Ginger start with a prob-
+abilistically checkable proof (PCP) that a satisfying assign-
+ment to C(X=x, Y=y) exists. However, the “textbook” PCPs
+that would admit a straightforward implementation (see [36,
+§7.8] and [4, §11.5]) are too big to be sent over the network to
+V. Instead, Zaatar and Ginger use an efﬁcient argument pro-
+tocol [27–29]; the idea is for P to cryptographically commit
+to the contents of the PCP, after which V queries P, ensuring
+that the responses are consistent with the commitment. This
+is where the computational assumptions on P enter: provided
+P cannot break the commitment primitive, then P is forced
+to behave like an oracle, which allows V to proceed as though
+the (enormous) PCP were available for inspection.
+How can P commit to an enormous PCP? Ishai et al. [27]
+demonstrate that if the PCP is a linear function π, then the
+server can commit to the contents of the proof without ma-
+terializing the entire thing. This primitive leverages addi-
+tively (not fully) homomorphic encryption (for instance, Pail-
+lier [37] and ElGamal [17]), as follows. Loosely, V homomor-
+phically encrypts a secret, r, and sends Enc(r) to P; using
+the linearity of π and the homomorphic property of Enc(·),
+P returns Enc(π(r)), which V decrypts. Later, in response
+to V’s PCP queries q1, . . . , qµ, V ensures that the responses
+π(q1), . . . , π(qµ) are consistent with π(r). Instead of materi-
+alizing π (which is an exponentially-sized table), P can con-
+cisely represent the proof as some vector u.
+
+Ginger (and its predecessor Pepper [45]) apply a series of
+reﬁnements to make the above approach vastly more efﬁcient
+than the original theory. By default, Ginger uses the classi-
+cal linear PCP of Arora et al. [5], in which the vector u is
+quadratically larger than the number of variables in the satis-
+fying assignment. Thus, making Ginger’s performance plau-
+sible usually requires hand-tailoring the contents of u and the
+query protocol.
+
+Zaatar, however, makes the above approach plausible in
+general, using a novel linear PCP based on QAPs [20]. Com-
+pared to Ginger, Zaatar is more concise asymptotically—the
+vector u is now linear in the size of the computation—though
+there is some additional overhead. For most computations,
+Zaatar is far more efﬁcient than Ginger; when it is less efﬁ-
+cient, the difference is bounded [44, §4]. However, for both
+protocols, the cryptographic operations are still a signiﬁcant
+expense.
+Amortization and costs. To amortize the query generation
+cost, V works over multiple instances of a given computa-
+tion Ψ at once. Speciﬁcally, V has in hand parallel inputs
+x(1), . . . , x(β). V also has values y(1), . . . , y(β) that purport
+to be Ψ(x(1)), . . . , Ψ(x(β)). Then, V extracts a cryptographic
+commitment to proofs π(1), . . . , π(β) and submits the same
+queries to these β proofs.
+Zaatar’s costs are as follows. If the constraint set C has
+|Z| variables, |C| constraints, and K additive terms, then V’s
+query generation work has running time O(|Z| + |C| + K) for
+
+227
+
+the batch.3 In amortized terms, V’s per-instance running time
+is O(|x| + |y| + (|Z| + |C| + K)/β). The running time of P is
+O(|Z| + |C| · log2 |C|). See [44] for a detailed analysis of the
+constants and a Zaatar-Ginger comparison.
+3 Reﬁning CMT: CMT-slim
+CMT veriﬁes single-output circuits C; the veriﬁcation pro-
+cedure establishes that on input x, C(x) = 0 (§2.2). Thus, to
+apply CMT to checking whether y = Ψ(x), we need a circuit
+that (a) takes input x(cid:48) = (x,−y) and (b) includes machinery to
+squeeze the output to one bit. This approach incurs overhead,
+as we explain in the ﬁrst part of this section.
+
+The second part of this section presents CMT-slim, our
+reﬁned protocol. CMT-slim substantially changes the circuit
+structure; this in turn requires a slight change in the veriﬁ-
+cation procedure. The combined result is a signiﬁcant cost
+reduction.
+Details of CMT’s circuit structure. Under CMT, circuits
+have a particular structure; they are composed of three parts:
+1. The compute circuit. This part computes Ψ.
+2. The output propagation circuit. This part is conceptually
+
+next to the compute circuit, making the circuit wider.
+
+3. The comparison circuit. This part sits atop the prior two,
+making the circuit taller; its purpose is to return 0 if and
+only if the purported and correct outputs are equal.
+We now detail each of these parts. The compute circuit
+takes as input Ψ’s inputs x = (x1, x2, . . . , x|X|) and computes
+the correct output ˆy = (ˆy1, ˆy2, . . . , ˆy|Y|). The output propa-
+gation circuit takes as input the additive inverses of the pur-
+ported outputs y = (y1, . . . , y|Y|), as well as 0, and propagates
+−y to the layer where y appears.
+The purpose of the comparison circuit is to return 0 if and
+only if yi = ˆyi for all i ∈ [1,|Y|]. This part begins with a layer
+that computes δi = yi − ˆyi, for i ∈ [1,|Y|]. If |Y| = 1, we are
+done: the circuit returns δ1, which equals 0 if and only if y1 =
+ˆy1. However, if there are multiple outputs, the circuit cannot
+simply sum the δi, since that sum could incorrectly overﬂow
+to 0. Instead, the circuit leverages Fermat’s Little Theorem
+(FLT) to turn each δi into a 0-1 value: because we are working
+over a ﬁnite ﬁeld Fp for some large prime p, δp−1
+evaluates to
+1 if δi is non-zero and 0 otherwise. Thus, the remainder of the
+, which does not overﬂow. In
+particular, S ∈ {0, 1, . . . ,|Y|}, and S = 0 if and only if yi = ˆyi
+for all i ∈ [1,|Y|], as desired.
+
+circuit computes S =(cid:80)|Y|
+
+i=1 δp−1
+
+i
+
+Overhead. As stated in Section 2.2, a circuit with depth
+d and a maximum of G gates at each layer induces a run-
+ning time of O(d · polylog(G)) for V and O(d · G · log G)
+for P, where the polylog(G) term is the cost of evaluating
+˜mult. The compar-
+the circuit’s wiring predicates: ˜add and
+ison circuit requires (cid:100)log2 |F|(cid:101) layers to compute δp−1
+(via
+
+i
+
+i
+
+repeated squaring),4 each layer requires 2|Y| gates, and its
+wiring predicates require O(log2 |Y|) to compute (see [16,
+Apdx. A.4.1] for details). In total, then, the comparison circuit
+adds O(log2 |F|· log2 |Y|) running time for V and O(log2 |F|·
+|Y| · log2 |Y|) for P. This overhead can be signiﬁcant, as ob-
+served empirically in Section 6.2 and in [47, §7].
+Details of the reﬁnements. Our principal modiﬁcation to
+CMT is to shed two of the three circuit components described
+above, so the protocol works with the compute circuit di-
+rectly. This modiﬁcation requires us to change the veriﬁca-
+tion algorithm slightly: it is now initialized based on the low-
+degree extension of the purported output y, rather than 0.
+Speciﬁcally, we change lines 2–3 in Figure 2 to initialize q0 to
+a random vector in F(cid:100)log2 |Y|(cid:101), and set a0 ← ˜Vy(q0). Here, ˜Vy
+is the multilinear extension of Vy, where Vy(j) returns the jth
+purported output, yj. As shown in Appendix A.2, this modiﬁ-
+cation preserves completeness, and soundness error increases
+only minorly: from  (which is CMT’s soundness error, quan-
+tiﬁed in Section 2.2) to (cid:48) =  + (cid:100)log2 |Y|(cid:101)/|F|.
+
+Although these modiﬁcations are straightforward,
+
+they
+provide substantial beneﬁts, as depicted in Figure 3 (the ﬁg-
+ure depicts other cost savings that result from implementation
+optimizations that we describe in Section 5).
+4 Extending CMT’s reach: CMT-batching
+CMT (and hence CMT-slim) is promising: it has the potential
+to be extremely efﬁcient for V (as it requires no cryptographic
+operations and little network cost), and its mechanics are rel-
+atively straightforward. However, it has three limitations that
+conﬂict with general-purposeness (see also Section 2.2):
+1. It represents computations as arithmetic circuits. Arith-
+metic circuits cannot, to our knowledge, represent com-
+putations with inequality comparisons (<, <=, >, >=) and
+not-equal (!=) tests, except by degenerating to far more
+verbose Boolean circuits.
+
+2. These circuits must be regular, in the sense that ˜addi and
+˜multi should be efﬁciently computable. This limits com-
+putations to those where the programmer can represent
+the structure of the computation with a concise mathe-
+matical expression.
+
+3. These circuits must be efﬁciently parallel: “wide” but not
+
+“tall”. Of course, not all computations are this way.
+The rest of the section describes reﬁnements that partially
+ease the limitations above and considers when those reﬁne-
+ments apply. First, Section 4.1 describes our modiﬁed cir-
+cuits, which take auxiliary inputs (or advice), supplied by
+the prover. These circuits-with-advice extend CMT’s compu-
+tational model to a larger class of computations; in fact we
+can automatically compile from the high-level language in
+the Zaatar-Ginger framework (§2.3) to a concise circuit-with-
+
+3We are not explicitly charging for the cost of working in F.
+
+4This ignores some additional layers for computing S. However, these layers
+induce few costs and can be neglected; see [16, §3.2] for details.
+
+228
+
+V’s running time
+f · (|X| + |Y|) · log2 (|X| + |Y|) + dΨ · I(GΨ,prop) + 5 · f · deq · log2 Geq
+
+protocol
+CMT
+CMT-slim f · (|X| + |Y|) · 4 + dΨ · I(GΨ)
+|X|: number of elements (from F) in input to Ψ
+|Y|: number of elements (from F) in output of Ψ
+GΨ: width of (max. # of gates in) each layer of compute circuit
+GΨ,prop (= GΨ + |Y|): width of each layer of compute+propagate circuit
+I(G): Cost to check P’s responses (f · log2
+
+P’s running time
+24·f ·(dΨ·GΨ,prop·log2 GΨ,prop +deq·Geq·log2 Geq)
+24 · f · dΨ · GΨ · log2 GΨ
+
+Geq (= 2|Y|): width of (# gates in) comparison circuit
+deq (= (cid:100)log2 |F|(cid:101)): depth of (# layers in) comparison circuit
+dΨ: depth of (# layers in) circuit to compute Ψ
+f : cost of ﬁeld multiplication
+
+assuming width G.
+
+2 G + 27 · f · log2 G; see Fig. 2, line 19 and Fig. 11, line 14), and compute ˜add and ˜mult (Fig. 11, line 24),
+Figure 3—Running times of V and P in CMT and CMT-slim, when verifying a computation Ψ. The changes include replacing the factor
+log2(|X| + |Y|) with 4, owing to an implementation optimization that is described in Section 5.1. The remaining improvements result from
+shedding the propagation circuit (reﬂected in the drop from GΨ,prop to GΨ) and the comparison circuit (reﬂected in dropping the deq and Geq
+terms). The ﬁgure leaves unspeciﬁed the cost of computing ˜add and ˜mult, but CMT and GKR require circuits for which this is efﬁcient.
+
+advice. While this reﬁnement (partially) addresses the ﬁrst
+limitation above, it exacerbates the second one, of regularity.
+However, Section 4.2 describes how we can tolerate irregular-
+ity and non-parallelism, using batching in the Zaatar-Ginger
+style (§2.3); we call the resulting protocol CMT-batching.5
+
+Finally, Section 4.3 analyzes the applicability of CMT-
+batching. The high-level ﬁnding is that CMT-batching is most
+useful when there are not many comparisons or not-equal op-
+erations, as a fraction of the total number of operations. In
+particular, if the number of comparisons scales with the com-
+putation’s running time (as is the case for sorting, searching,
+etc.), then CMT-batching does not save work for V.
+4.1 Beyond arithmetic circuits
+Our goal in this subsection is to transform computations ex-
+pressed in a high-level language to arithmetic circuits. (For
+now, we are not trying to achieve efﬁciency for V relative to
+local execution.) A natural attempt would be to use the com-
+piler of Zaatar-Ginger (§2.3). However, its “assembly lan-
+guage” is constraints, not circuits. What is involved in trans-
+forming to arithmetic circuits? An analysis of the compiler in-
+dicates that most of the programming constructs (if/else, etc.)
+have a natural representation in constraints or circuits.
+
+The problematic constructs are the not-equal operation
+(!=) and inequality comparisons (<, <=, >, >=): no arith-
+metic circuit that we are aware of directly and efﬁciently com-
+putes these.6 The constraint representation of these constructs
+sidesteps this issue by including auxiliary variables that P
+sets [47, §4][46, Apdx. C].
+The idea of our ﬁrst reﬁnement, then, is to have P do the
+required computations “out-of-band” and to supply the out-
+come to V. This requires reformulating the circuit to (a) ac-
+cept as input (advice) the outcome of all inequality and not-
+equal operations and (b) check that these inputs are correct.
+
+5CMT [16] and GKR [23] suggest circumventing the protocol limitations by
+moving some of the work ofﬂine. However, this does not change the total
+work for V; it simply changes when the cost is incurred. By contrast, our
+approach can save work for V, and we analyze when that happens.
+6One could use FLT to compute not-equal, but as noted in Section 3, that
+approach has undesirable overhead.
+
+229
+
+Details. Let (X(!=), X(<), M(!=), M(<)) denote a vector of ad-
+vice supplied by P to V. Here, X(!=) denotes the claimed 0-1
+outcome of all not-equal checks; X(<) denotes the claimed 0-1
+outcome of all inequality comparisons; and M(!=) and M(<)
+are, loosely speaking, witnesses that those claimed outcomes
+are indeed the correct ones (more speciﬁcally, M(!=) and M(<)
+are the auxiliary variables in the Zaatar-Ginger constraints).
+The following circuit structure is created by our compiler; it
+consists of two parts:
+• The compute-advised circuit. This part computes Ψ, tak-
+ing as advice the claimed outcome of all not-equal and
+inequality operations. Speciﬁcally, the inputs here are
+(X, X(!=), X(<)), and the output is Y, where X and Y are
+the inputs to, and outputs of, Ψ. This part assumes that its
+advice is correct.
+
+• The check-advice circuit. This part checks that X(!=) and
+X(<) are correct. It takes as input (X(!=), X(<), M(!=), M(<))
+and returns 0 if and only if X(!=) and X(<) are correct.
+The check-advice circuit essentially recapitulates the
+Zaatar-Ginger constraints for not-equal and inequality com-
+parisons, taking as input the values of all auxiliary variables.
+For example, say that the ith not-equal operation in Ψ is
+
+Z1 != Z2.
+
+i
+
+i
+
+i
+
+.
+
+i
+
+and M(!=)
+) · (Z1 − Z2)
+
+Then, the compute-advised circuit includes wires for Z1 and
+Z2. Labeling the ith elements of the prover-supplied X(!=) and
+M(!=) as X(!=)
+, the check-advice circuit computes:
+i − X(!=)
+(1 − X(!=)
+By inspection, the output of both of these operations is 0 if
+are set correctly by P; in partic-
+and only if X(!=)
+ular, if Z1(cid:54)=Z2, then the correct setting of M(!=)
+is the multi-
+plicative inverse of Z1 and Z2.
+
+(Z1 − Z2) · M(!=)
+
+and M(!=)
+
+and
+
+The approach for inequality comparisons is similar: we
+have an operation in the circuit for each Zaatar-Ginger con-
+straint. There are (cid:98)log2(F)(cid:99) + 7 such constraints (see [46,
+Apdx. C] for details).
+
+Thus, the total cost of the check-advice circuit is as fol-
+lows. We add Gck gates to each layer and to the output, where
+
+i
+
+i
+
+i
+
+2 G + 27 · log2 G)
+
+P’s running time
+N/A
+24 · f · dΨ · GΨ,ck · log2 GΨ,ck
+
+V’s running time
+f · dΨ · GΨ
+f · dΨ · GΨ,ck · 11/β + 4 · f · (|X| + |Y| + 2 · Gck) + dΨ · CheckResp(GΨ,ck)
+
+depth, width of compute-advised circuit
+
+baseline
+CMT-batching
+dΨ, GΨ
+Gck = 2 · |X(!=)| + ((cid:98)log2(F)(cid:99) + 7) · |X(<)| width of check-advice circuit
+GΨ,ck = GΨ + Gck
+width of full circuit, under CMT-batching
+CheckResp(G) = f · (log2
+per-layer cost to check P’s responses (Fig. 2, line 19 and Fig. 11, line 14), assuming width G
+Figure 4—Running times of V and P in CMT-batching when verifying a computation Ψ, compared to the baseline of evaluating the com-
+putation. Some of the terminology and notation is borrowed from Figure 3. The estimate of the baseline presumes that local inequality and
+not-equal operations are free, which is a reasonable approximation. The computation is compiled into a compute-advised and a check-advice
+circuit, which together include inputs for prover-supplied advice (of length Gck). Because the protocol applies to arbitrary layered circuits,
+computing ˜add and ˜mult may be expensive, but it amortizes over the batch (see the ﬁrst summand in V’s costs). By contrast, the approach to
+advice does not necessarily scale; see text (§4.3).
+Gck = 2 · |X(!=)| + ((cid:98)log2(F)(cid:99) + 7) · |X(<)|. We say “each
+layer” because the outputs of the individual checks are not
+necessarily at the output layer, necessitating dummy gates to
+propagate these outputs to the top (this is similar to the output
+preservation circuit that we shed; see Section 3).
+
+soundness error as CMT-slim (namely (cid:48) = 7 · b · d/|F| +
+(cid:100)log2 |Y|(cid:101)/|F|; see Section 3), a claim that is proved in Ap-
+pendix A.2.
+4.3 Applicability
+CMT-batching mitigates the three limitations, compared to
+the base protocol. We say “mitigates” instead of “eliminates”
+because V does not always save work versus executing the
+computation locally. We now analyze CMT-batching, focus-
+ing on when it does save work for V.
+Figure 4 depicts the costs of CMT-batching, comparing it
+to local execution. There are two signiﬁcant costs for V. The
+ﬁrst is computing ˜addi and ˜multi. This costs 11 · f · d · (GΨ +
+Gck) because the circuit is not regular, so we must compute
+from the general expression for ˜addi and ˜multi (given in Ap-
+pendix A). While this task can be as or more costly than ex-
+ecuting all d · GΨ gates in the computation, it amortizes over
+β instances.
+
+The second source of costs is processing the advice. These
+costs correspond to work done to verify a circuit component
+that does not execute “real work”; worse, these costs do not
+amortize, so they could make the protocol more expensive
+for V than executing locally. Notice the term Gck. The key
+comparison is between 8 · f · Gck (the work done by V to
+process the advice) and f · d· GΨ (the cost of local execution).
+If Gck < d· GΨ/8 (ignoring some constants), then V can gain
+from outsourcing, and the smaller Gck, the smaller the batch
+size at which V breaks even.
+Thus, CMT-batching works well—in the sense of saving V
+work versus computing locally—when Gck is small. Such val-
+ues of Gck correspond to computations with few not-equal op-
+erations and inequality comparisons. In particular, the num-
+ber of such operations should scale sub-linearly in the running
+time of the computation, and the actual ceiling could be very
+small indeed, depending on the constants.
+5
+Allspice uses the Ginger implementation from [46]. Allspice
+optimizes the Zaatar prover by constructing the proof vector
+u (§2.3) using the fast Fourier transform (FFT), a suggestion
+
+Implementation details
+
+4.2 Amortization to sidestep regularity
+Although the reﬁnement above (partially) addresses the ﬁrst
+limitation, it has made the regularity issue worse: it seems
+difﬁcult to build a circuit automatically and to obtain an ef-
+ﬁciently computable ˜add and ˜mult for each layer. Moreover,
+even if the compiler could produce a regular compute-advised
+circuit, the check-advice circuit is unlikely to be regular.
+
+Our solution is to give up on regularity. Instead, we will pay
+for the irregularity and then amortize this cost over multiple
+instances of the computation, similar to the way that Zaatar
+and Ginger amortize their query generation cost. Speciﬁcally,
+the cost of computing ˜add and ˜mult (see Sections 2.2 and 3)
+is now permitted to be much larger. This approach also ad-
+dresses the third limitation: the amortization means that V
+saves work for a much larger class of circuits, allowing for
+veriﬁcation of circuits with smaller layers (fewer gates) and
+larger depth (more layers) than under CMT-slim.
+
+y(1), . . . , y(β).
+for all instances k ∈ {1, . . . , β}.
+
+We call the resulting protocol CMT-batching. It consists
+of β parallel instances of Figure 2, resulting in the following
+structure:
+1. V and P exchange inputs x(1), . . . , x(β) and outputs
+2. V randomly generates q0 and computes a(k)
+0 = ˜Vy(k) (q0)
+3. In each iteration, V uses the same randomness (for ex-
+ample, τ in Figure 2, line 17) for all instances.
+4. P responds separately for each instance, and V checks
+each instance independently. Importantly, this means V
+can compute ˜addi and ˜multi once for all instances.
+d (qd) for all k;
+throughout, if V rejects any instance, it rejects them all.
+CMT-batching satisﬁes completeness. Its soundness prop-
+erty is that each instance, viewed individually, has the same
+
+5. At the end, V checks whether a(k)
+
+d = ˜V (k)
+
+230
+
+CMT-slim removes an additive overhead that scales with the output size of the computation. For m × m matrix multiplication with
+m=128 and compared to CMT, the CMT-slim veriﬁer is 2× less expensive, the CMT-slim prover is 1.7× less expensive, and the
+network costs reduce by about 30%.
+CMT-batching enhances the types of computations that can be efﬁciently outsourced, relative to CMT-slim. For instance, CMT-
+batching applies to root ﬁnding by bisection, which has control ﬂow and inequalities while CMT-slim does not.
+CMT-batching has far better performance compared to the cryptographic sub-protocols in Allspice (Ginger and Zaatar) for quasi-
+straightline computations. For these computations, the per-instance cost to the prover in CMT-batching can be cheaper than Ginger
+by 1–2 orders of magnitude and is comparable to Zaatar. The break-even batch sizes (and network costs) under CMT-batching are
+1–4 orders of magnitude smaller relative to Ginger and 1–2 orders of magnitude smaller relative to Zaatar.
+
+§6.2
+
+§6.3
+
+§6.3
+
+Figure 5—Summary of main evaluation results.
+
+of Gennaro et al. [20]. As a result, P’s per-instance running
+time drops from O(|Z| +|C|·log2 |C|) to O(|Z| +|C|·log|C|).
+Below, we describe the CMT portion of Allspice and the
+
+static analyzer that decides which protocol to use.
+5.1 CMT and CMT-slim
+Using the CMT implementation [16] as a reference, we im-
+plemented the base CMT protocol as a C++ veriﬁer and
+prover; they run as separate processes that communicate via
+Open MPI [2]. Our implementation is 5533 lines of base
+code, with roughly 615 lines required for each new compu-
+tation (recall that CMT circuits are manually constructed). In
+the process, we made a number of optimizations that have a
+substantial impact on performance (see Section 6.2).
+
+The most signiﬁcant optimization applies to the prover in
+the sum-check protocol, saving approximately 15-20% of the
+prover’s work; Appendix A.1 gives the details.
+We also reduce the cost of computing ˜Vd(qd), from
+O(|X| log|X|) to O(|X|). (This applies to Figure 2, line 21.)
+We use memoization, as follows.7 There are |X| gates in the
+input layer. Let n = (cid:100)log2(|X|)(cid:101). As in the base protocol [16,
+Apdx. A.2.2], deﬁne χ0(τ ) = 1 − τ and χ1(τ ) = τ. Then ˜Vd
+can be written as follows:
+
+˜Vd(τ1, . . . , τn) =
+
+χti(τi)
+
+· Vd(t1, . . . , tn),
+
+(cid:88)
+
+(cid:32) n(cid:89)
+
+(t1,...,tn)∈Fn
+
+2
+
+i=1
+
+(cid:33)
+
+if we have the value of(cid:81)k−1
+, then computing(cid:81)k
+requires 2k multiplications. Thus, computing(cid:81)n
+2 takes(cid:80)n
+skipping the computation of(cid:81)n
+
+where Vd is deﬁned in Section 2.2. Naive evaluation of this
+sum requires 2n· (n +1) multiplications. However, notice that
+i=1 χti(τi) for all (t1, . . . , tk−1) ∈
+i=1 χti(τi) for all (t1, . . . , tk) ∈ Fk
+Fk−1
+2
+2
+i=1 χti(τi) for
+all (t1, . . . , tn) ∈ Fn
+i=1 2i < 2 · 2n multiplications.
+After we have computed all of these values, computing ˜Vd
+requires only an additional 2n multiplications, bringing us to
+3 · 2n multiplications. Since |X| ≤ 2n < 2 · |X|, the total cost
+to compute ˜Vd is between 3·|X| and 6·|X| multiplications. By
+i=1 χti(τi) in the cases where
+Vd(t1, . . . , tn) = 0 (e.g., when (t1, . . . , tn) is not a valid input
+gate label), we can bring the upper bound down to 4 · |X|.
+
+7This optimization does not apply in the streaming context, which was the
+original focus of CMT [16].
+
+231
+
+5.2 CMT-batching
+Using the Zaatar compiler [44], we implemented a backend
+compiler that targets the CMT-batching protocol, as described
+in Section 4. Speciﬁcally, our compiler takes as input a set
+of constraints generated by the Zaatar compiler and converts
+them to a circuit of the required form. This compiler contains
+2381 lines of C++ code.
+
+5.3 Compiler and static analyzer
+Using static analysis, Allspice selects the optimal protocol
+among CMT-batching, Ginger, and Zaatar. The analysis tool
+is a 300-line Python script that takes as input a program ex-
+pressed in SFDL (§2.3), the size of the program’s inputs, mi-
+crobenchmark information about the costs of various low-
+level operations (e.g., encryption and decryption), and vari-
+ous cost models (developed in [44, 47] and Section 4). It can
+be conﬁgured to optimize for the prover’s overhead or for the
+veriﬁer’s costs (resulting in lower break-even batch sizes).
+
+The tool ﬁrst runs the Ginger compiler to get Ginger con-
+straints, the Zaatar compiler to get Zaatar constraints, and the
+CMT-batching compiler to get an arithmetic circuit (see §5.2
+above). Then, it parameterizes the cost models with the mi-
+crobenchmarks and applies the resulting quantiﬁed model to
+the compiler’s output in order to predict the costs to the veri-
+ﬁer and prover under each sub-protocol at the requested input
+size. Finally, the tool chooses the most favorable sub-protocol
+for the consideration in question (e.g., break-even batch size),
+and outputs executables for the veriﬁer and the prover in the
+chosen protocol.
+
+6 Experimental evaluation and comparison
+We experiment with the base CMT protocol and CMT-slim
+to evaluate our reﬁnements to CMT. Then, we experimentally
+evaluate Allspice with a set of benchmark problems to under-
+stand the regimes of applicability of each of the sub-protocols
+(namely Ginger, Zaatar, and CMT-batching). Figure 5 sum-
+marizes the results.
+
+6.1 Method and setup
+Our evaluation uses the following benchmark computations:
+• m × m matrix multiplication,
+• evaluation of a degree-2 polynomial in m variables,
+
+(a) Per-instance running time of the prover
+
+(b) Per-instance running time of the veriﬁer.
+
+(c) Per-instance network costs.
+
+Figure 6—Per-instance running times and network costs of CMT-opt and CMT-slim, for matrix multiplication at m=64 and m=128. CMT-
+slim improves the CPU and network costs versus CMT-opt. The bar heights are normalized to CMT-slim.
+
+• the longest common subsequence problem with two
+
+strings of length m,
+
+• clustering a set of m data points, where each data point has
+
+d dimensions, using PAM clustering,
+
+• ﬁnding the roots of a degree-2 polynomial in m variables
+
+using bisection,
+
+• Floyd-Warshall all-pairs shortest paths in a graph with m
+
+vertexes, and
+
+• Hamming distance between a pair of strings of length m.
+The inputs to our computations are 32-bit integers except
+in polynomial evaluation, root ﬁnding by bisection, and all-
+pairs shortest paths. For polynomial evaluation and all-pairs
+shortest paths, we use ﬂoating-point rationals with 32-bit nu-
+merators and 32-bit denominators; for root ﬁnding by bisec-
+tion, we use ﬂoating-point rationals with 32-bit numerators
+and 5-bit denominators (using the representation of this data
+type from [47]). We use a ﬁnite ﬁeld with a prime modulus
+of size 128 bits for the integer computations and size 220 bits
+for the ﬂoating-point computations.
+
+For Ginger [47] and Zaatar [44], we use ElGamal encryp-
+tion [17] with key size of 1024 bits. For a pseudorandom gen-
+erator, we use the ChaCha stream cipher [11].
+
+We will report the prover’s CPU costs, network costs, and
+break-even batch sizes: the minimum number of instances of
+a computation at which the total CPU cost to the veriﬁer is
+less than the CPU cost to execute those instances locally. Our
+baseline for local computation is the GMP library. We com-
+pute the break-even batch size for a computation by running
+one instance locally (regarding all costs as variable) and one
+instance under veriﬁcation (separating its costs into ﬁxed and
+variable); we then solve for the point β at which β instances
+of the latter are cheaper than β instances of the former.
+
+Our experiments run on two machines in the same local
+area network. Each has an Intel Xeon processor E5540 2.53
+GHz with 48GB of RAM.8 We use getrusage to measure
+the CPU time of the prover and the veriﬁer; we also record
+the count of the application-level bytes transferred between
+the veriﬁer and the prover, reporting this count as the network
+costs. We report the mean of results from three experiments
+
+8Our largest experiments require approximately 40% of the available RAM.
+
+232
+
+(standard deviations are less than 10% of the means).
+
+An exception to the previous paragraph is that it is some-
+times infeasible to run with Ginger; in those cases (we will
+note them), we estimate costs using a model from [46], pa-
+rameterized with microbenchmark results from [44, §5.1].
+
+6.2 Performance of CMT and CMT-slim
+Our analysis in Section 3 (see Figure 3) implies that, relative
+to CMT, CMT-slim saves an additive cost. This cost is pro-
+portional to the number of outputs in the computation and the
+relative size of the comparison circuit that is removed.
+
+We conﬁrm this analysis by measuring CMT-opt (an op-
+timized version of the CMT-GMP implementation that we
+use in [47], which is about 30–40% faster) and CMT-slim
+on the example of matrix multiplication with varying input
+sizes (m=64, 128). We report the prover’s running time, the
+veriﬁer’s running time, the baseline cost of doing the compu-
+tation locally, and the network costs. The running times are
+CPU costs and ignore protocol latency.
+Figure 6 depicts the results. At m=64, the CMT-slim
+prover is about 2× less expensive compared to CMT-opt, the
+veriﬁer is about 5× less expensive, and the network costs
+halve. As we increase input sizes, the gains diminish; at
+m=128, the CMT-slim prover is 1.7× less expensive, the ver-
+iﬁer is 2× less expensive, and the network costs drop by about
+30%. This phenomenon occurs because the size of the com-
+pute circuit (§3) grows with m3, while the size of the com-
+parison circuit grows only with m2; thus, asymptotically, the
+time spent checking the compute circuit dominates the time
+spent checking the comparison circuit.
+
+We also experimented with Hamming distance (at input
+sizes m=32,768 and m=65,536). Because the output is a
+scalar, not a vector, the comparison optimization does not
+save work, so CMT-opt and CMT-slim perform the same.
+
+6.3 Comparison
+We experiment with the computations listed in Section 6.1.
+We run matrix multiplication with m=128; polynomial
+evaluation with m=512; root ﬁnding by bisection with
+m=256, L=8; PAM clustering with m=20, d=128; longest
+common subsequence (LCS) with m=300; and all-pairs
+
+01234m = 64m = 128normalized running time(lower is better)CMT-optCMT-slim2.1 min14.3 min50.0 s8.3 min012345678m = 64m = 128normalized running time(lower is better)localCMT-optCMT-slim16.2 ms139.4 ms70.0 ms110.6 ms13.3 ms57.7 ms0123m = 64m = 128normalized network costs(lower is better)CMT-optCMT-slim0.4 MB0.9 MB0.2 MB0.7 MB(a) Per-instance running time of the prover under Allspice’s sub-protocols
+for matrix multiplication (m=128), polynomial evaluation (m=512), and
+root ﬁnding by bisection (m=256, L=8). The y-axis is log-scaled.
+
+(b) Per-instance running time of the prover under Ginger and Zaatar, for
+PAM clustering (m=20, d=128), longest common subsequence (m=300),
+and all-pairs shortest paths (m=25). The y-axis is log-scaled.
+
+Figure 7—When applicable (i.e., when the veriﬁer has a break-even batch size), the CMT-batching prover’s performance is similar to the
+Zaatar prover’s and signiﬁcantly better than the Ginger prover’s (except for the polynomial evaluation benchmark, in which the Ginger prover
+is faster, but the CMT-batching prover is still competitive). When CMT-batching is not applicable, Zaatar’s prover dominates.
+
+Figure 8—Break-even batch sizes
+for matrix multiplication
+(m=128), polynomial evaluation (m=512), and root ﬁnding by
+bisection (m=256, L=8) under the three sub-protocols. The bar
+heights are normalized to those of CMT-batching (an off-scale bar is
+truncated at the maximum height). The y-axis is log-scaled. When-
+ever CMT-batching enables breaking even, it has the lowest break-
+even batch size; otherwise, Zaatar does (this is not depicted but ap-
+plies to PAM clustering, LCS, and all-pairs shortest paths).
+
+Figure 9—Total network costs of each of the sub-protocols in All-
+spice at the break-even batch sizes (Figure 8) for matrix multiplica-
+tion (m=128), polynomial evaluation (m=512), and root ﬁnding by
+bisection (m=256, L=8). The bar heights are normalized to those
+of CMT-batching. The y-axis is log-scaled. When applicable (i.e.,
+when the veriﬁer has a break-even batch size), CMT-batching has
+the lowest network costs; otherwise, Zaatar does (this is not depicted
+but applies to PAM clustering, LCS, and all-pairs shortest paths).
+
+shortest paths with m=25. We report three end-to-end perfor-
+mance metrics: the prover’s per-instance costs, the break-even
+batch sizes, and network costs.
+
+First, note that the veriﬁcation protocols save work for the
+veriﬁer only if the computation is at least superlinear; we
+therefore exclude Hamming distance here.
+
+For all of the remaining benchmarks, the Zaatar veriﬁer
+saves work at some batch size. The CMT-batching veriﬁer,
+however, saves work only for some of our benchmarks (ma-
+trix multiplication, polynomial evaluation, and root ﬁnding
+by bisection); for the others (PAM clustering, longest com-
+mon subsequence, and all-pairs shortest paths), the CMT-
+batching veriﬁer does not save work, as the prover supplies
+a quantity of auxiliary inputs that is proportional to the run-
+ning time of the computation (see Section 4).
+
+We experiment with all three protocols when appropriate
+and exclude CMT-batching when it does not break even. In
+the case of Ginger, we estimate its costs for matrix multipli-
+cation and root ﬁnding by bisection, and measure its costs for
+polynomial evaluation.
+
+For computations where CMT-batching is appropriate, Fig-
+ure 7(a) depicts the per-instance running times of each sub-
+protocol’s prover normalized to the running time of the CMT-
+batching prover. The prover’s overhead in the CMT-batching
+protocol is roughly the same (within several factors) as that
+of the most optimal prover. For the remaining computations,
+Figure 7(b) depicts the per-instance running times of each
+prover normalized to the running time of the Zaatar prover.
+In these experiments, Zaatar dominates Ginger.
+
+Figure 8 depicts the break-even batch sizes. Whenever
+CMT-batching is applicable, it has the best break-even batch
+size. Again, Zaatar dominates Ginger in all cases (this is not
+depicted, but see [44]).
+
+At the break-even batch sizes, the total network costs (in-
+cluding the cost of transferring inputs and outputs) follow
+the same pattern as the break-even batch sizes; see Figure 9.
+When CMT-batching is applicable, it has the lowest network
+costs among the three sub-protocols; when it is not applica-
+ble, Zaatar does (not depicted; see [44]).
+
+233
+
+100103106matrix multiplicationpolynomialevaluationroot findingby bisectionrunning time (seconds)GingerZaatarCMT-batching34.8 hr50.6 s1.3 hr17.1 min3.2 min6.5 min8.4 min1.8 min12.7 min1001031061091012PAM clusteringlongest commonsubsequenceall-pairs shortest pathsrunning time (seconds)Ginger Zaatar15 yr55 yr6.4 yr8.7 min18.3 min8.9 min100101102103matrix multiplicationpolynomialevaluationroot findingby bisectionnormalized break-even batch sizes(lower is better)GingerZaatarCMT-batching2 million1809500440028021047715100102104106matrix multiplicationpolynomialevaluationroot findingby bisectionnormalized network costs(lower is better)GingerZaatarCMT-batching0.3 TB0.1 GB9.1 GB6.8 GB0.3 GB0.5 GB33.4 MB0.4 MB3.6 MB7 Discussion
+Based on the estimates (which are validated by our measure-
+ments), Allspice will choose CMT-batching for matrix mul-
+tiplication, polynomial evaluation, and root ﬁnding; it will
+choose Zaatar for everything else.
+
+It is useful to extract the general moral here: namely, CMT-
+batching is superior for quasi-straight-line computations (i.e.,
+very simple control ﬂow), while for general-purpose compu-
+tations, one has to pay for cryptography and use Zaatar.
+
+Of course, the term “general-purpose” should be taken with
+a grain of salt. Although SFDL is a high-level language, the
+underlying constraint and circuit formalisms impose a num-
+ber of unattractive limitations. Loop bounds need to be known
+at compile time (as loops are unrolled), both branches of con-
+ditionals are executed, and dynamic array access is expensive.
+Moreover, since the base protocols operate over ﬁnite ﬁelds,
+ﬂoating-point operations are expensive and do not implement
+IEEE rounding. These problems are pervasive in the area, as
+ﬁnite ﬁelds and circuit models of computation are standard in
+interactive and cryptographic protocols.
+
+Finally, we note that the compilation process in Allspice
+is quite expensive; the examples we reported on took hours
+to compile. Although some of this is intrinsic, we believe
+that much of the cost is a function of an unoptimized im-
+plementation; optimization plus techniques described else-
+where [26, 30] should lead to signiﬁcant improvements.
+
+8 Other related work
+We now review recent cryptographic and complexity-
+theoretic work on veriﬁable computation that we have not yet
+discussed. Some work targets particular classes of computa-
+tions [18, 38], including matrix operations and polynomial
+evaluation; for a survey, see [45]. While special-purpose pro-
+tocols may be more efﬁcient for particular computations, we
+are interested in mechanisms that apply generally (§1). More-
+over, special-purpose protocols that admit highly efﬁcient im-
+plementations and are amenable to automatic compilation can
+be incorporated into our sub-protocol selection logic (§5.3).
+The general-purpose protocols can be roughly classiﬁed
+into three groups: fully-homomorphic encryption (FHE),
+short PCPs, and succinct arguments. Using FHE [21] as
+a building block, GGP [19] formalized veriﬁable computa-
+tion (VC) as non-interactive protocols (P sends its output
+and a proof to V) that are permitted a one-time setup cost.
+FHE itself was woefully impractical (and unfortunately still
+is, despite massive improvements [22]), a characteristic in-
+herited by GGP and other noninteractive VC protocols based
+on FHE [15]. In this paper, we adopt a broader notion of veri-
+ﬁable computation that includes interactive protocols, consis-
+tent with informal motivation in the complexity theory litera-
+ture (e.g., [8]).
+
+Indeed, complexity theory has long used “checking com-
+putations” as a motivation for PCPs, and recent theoreti-
+
+234
+
+P’s overhead
+V’s per-instance costs
+Setup costs
+Setup amortizes over
+Setup ﬂexibility
+
+Non-interactivity
+Zero-knowledge
+Public veriﬁability
+Assumptions
+
+Soundness error
+
+Zaatar
+(2e + 500f ) · |C|
+e + 3f · (|x| + |y|)
+(2e + 500f ) · |C|
+batch
+V must incur
+no
+no
+no
+DDH (and R.O. to
+save network costs)
+< 1/220
+
+Pinocchio [20, 39]
+8e · |C|
+12e + e · (|x| + |y|)
+8e · |C|
+all instances of Ψ
+anyone can incur
+
+yes
+yes
+yes
+q-PKE, q-PDH, q-SDH
+
+< 1/2128
+
+Figure 10—Comparison of Zaatar and Pinocchio [20, 39] for a com-
+putation Ψ with |C| constraints. The comparison is meant to be
+illustrative not deﬁnitive: e stands in for any ciphertext operation
+in the respective protocol (e.g., exponentiation in a bilinear group,
+scalar multiplication in an ElGamal group), and f stands in for any
+plaintext operation (e.g., ﬁeld multiplication). In the protocols that
+we have examined, e is several orders of magnitude larger than f .
+Broadly, Pinocchio has higher cryptographic overhead, in return for
+more properties.
+
+cal work aims to make PCPs and related constructs efﬁcient
+enough to be used in practice [9, 10]. However, it is not clear
+from the analysis how this work will actually perform, and to
+date there are no experimental results, so it is not yet possible
+to perform a meaningful comparison.
+
+The ﬁnal strand of general-purpose work is succinct non-
+interactive arguments [25, 31]. A major advance in this area
+was recently achieved by GGPR [20], who give an efﬁcient
+circuit encoding (QAPs) that induces roughly linear overhead
+for the prover and couple it with sophisticated cryptography.
+Although GGPR does not explore the connection between
+QAPs and PCPs, the relationship is explored in [12] and [44].
+Zaatar exploits this connection by incorporating QAPs (as
+noted in Section 2.3) but not GGPR’s cryptography.
+
+Thus, a natural question is how Allspice (via Zaatar) com-
+pares to GGPR. We now compare Zaatar to a recent reﬁne-
+ment and implementation of GGPR, called Pinocchio [39].
+To simplify a bit, whereas most Zaatar queries are formu-
+lated and responded to in the clear, Pinocchio uses carefully
+wrought cryptography to allow a similar query procedure
+to take place over encrypted values. On the one hand, this
+brings some expense (small constant factors), in terms of the
+prover’s costs and the veriﬁer’s per-instance costs (although
+heroic optimizations have resulted in surprisingly small over-
+head for the cryptography in Pinocchio). On the other hand,
+the cryptography buys public veriﬁability, zero-knowledge
+proofs, and unlimited query reuse. This latter property allows
+Pinocchio to amortize its per-computation setup costs over all
+instances of the computation; by contrast, Zaatar amortizes its
+per-computation costs only over a batch. We give more details
+in Figure 10.
+
+9 Conclusion
+This paper describes Allspice, a system for veriﬁable com-
+putation. Allspice incorporates substantial improvements to
+CMT [16, 24, 41]. Optimizations to the basic CMT protocol
+coupled with an extension to a broader class of computations
+(in the batched model) result in a version of CMT that applies
+to many realistic computations and requires break-even batch
+sizes several orders of magnitude smaller than other measured
+implementations of veriﬁable computation.
+
+The batched version of CMT does not require expensive
+cryptography. Furthermore, the batched model and the class
+of computations to which CMT-batching apply are very plau-
+sible in the cloud computing scenario—the MapReduce id-
+iom in effect forces programmers to express computations in
+a form that is well-suited for this protocol!
+
+Further, using the careful cost analysis that accompanied
+the optimization of CMT, we were able to build a static an-
+alyzer that allows Allspice to select the best protocol among
+the implemented protocols in the literature (Ginger, Zaatar,
+and CMT). The resulting system brings us a step closer to
+practical and usable system for veriﬁable computation in the
+data-parallel cloud computing model.
+
+that
+
+A CMT: Details and reﬁnements
+This appendix provides further details of CMT and proves
+the correctness of our reﬁnements. We also provide general
+expressions for ˜addi and ˜multi, for use in CMT-batching (§4).
+A.1 Original CMT
+In this section, we ﬁll in details of the CMT protocol that
+were left out of Section 2.2. We give the veriﬁer’s sum-check
+pseudocode and provide the missing deﬁnition of ˜E.
+The Sum-Check Veriﬁer. Recall
+in each round of
+CMT, V uses a sum-check protocol to verify that ai−1 =
+˜Vi−1(qi−1). Figure 11 depicts the veriﬁer’s pseudocode for
+doing so. There is one major difference between this proto-
+col and a standard sum-check protocol [4, §8.3.1]. A stan-
+dard sum-check protocol requires V to evaluate fqi−1 at a sin-
+gle point (w0, w1, w2), randomly chosen from F3b. However,
+that would require evaluating ˜Vi(w1) and ˜Vi(w2), which V
+cannot do because it does not know the values of the gates
+at layer i. Instead, V “cheats” and asks P for the values of
+˜Vi(w1) and ˜Vi(w2). This “hint”—together with V’s computa-
+tion of ˜add(w0, w1, w2), ˜mult(w0, w1, w2), and ˜E(qi−1, w0)—
+is enough for V to compute fqi−1 (w0, w1, w2) = ˜E(qi−1, w0) ·
+( ˜addi(w0, w1, w2) · (˜Vi(w1) + ˜Vi(w2)) + ˜multi(w0, w1, w2) ·
+˜Vi(w1) · ˜Vi(w2)).
+We deﬁned ˜addi and ˜multi in Section 2.2; we now deﬁne ˜E.
+The polynomial ˜E : F2b → F is the multilinear extension of
+the function E : F2b
+
+(cid:40)
+2 → F, where
+1,
+0,
+
+E(q, g) =
+
+if q = g
+otherwise
+
+235
+
+return reject
+
+SendToProver(rj)
+e = Fj(rj)
+
+r R←− F3b
+SendToProver(“layer i”)
+e ← ai−1
+for j = 1, 2, . . . , 3b do
+
+Fj(·) ← GetFromProver()
+// P returns Fj(·) as {Fj(0), Fj(1), Fj(2)}, which
+// is sufﬁcient to reconstruct Fj because Fj is degree-2
+if Fj(0) + Fj(1) (cid:54)= e then
+
+1: function SUMCHECK(i, qi−1, ai−1)
+2:
+3:
+4:
+5:
+6:
+7:
+8:
+9:
+10:
+11:
+12:
+13:
+14:
+15:
+16:
+17:
+18:
+19:
+20:
+21:
+22:
+23:
+24:
+25:
+26:
+27:
+Figure 11—V’s side of the sum-check protocol in CMT [16] and
+fqi−1 (g, j1, j2); see equa-
+tion (2) in Section 2.2. b=(cid:100)log2 G(cid:101) is the number of bits needed to
+represent a gate label. The inputs are i (the current layer number),
+ai−1, and qi−1; the protocol returns (v1, v2, w1, w2). The protocol’s
+guarantee is that, with high probability, ai−1=˜Vi−1(qi−1) if and only
+if v1=˜Vi(w1) and v2=˜Vi(w2).
+
+// notation
+w0 ← (r1, . . . , rb)
+w1 ← (rb+1, . . . , r2b)
+w2 ← (r2b+1, . . . , r3b)
+// P is supposed to set v1 = ˜Vi(w1) and v2 = ˜Vi(w2)
+v1, v2 ← GetFromProver()
+a(cid:48) ← ˜E(qi−1, w0)( ˜add(w0, w1, w2) · (v1 + v2)+
+if a(cid:48) (cid:54)= e then
+
+GKR [23, 41], for ˜Vi−1(qi−1)=(cid:80)
+
+˜mult(w0, w1, w2) · v1 · v2)
+
+return reject
+
+return (v1, v2, w1, w2)
+
+g,j1,j2∈Fb
+2
+
+We can write a closed-form expression for ˜E:
+
+˜E(q1, . . . , qb, g1, . . . , gb) =
+
+((1 − qj) · (1 − gj) + qj · gj) .
+
+j=1
+
+To see that this is the expression for ˜E, note that all of the
+2b variables in this expression have degree 1. Also, assume
+q, g ∈ Fb
+2. Then the expression equals 1 if and only if qj = gj
+for all j ∈ {1, . . . , b} (i.e., if and only if q = g); otherwise,
+the expression equals 0. Since the expression is of appropri-
+ate degree, and since it agrees with E on E’s domain, it must
+equal ˜E.
+The Sum-Check Prover. In the sum-check protocol, P’s
+fundamental job is to compute evaluations of Fj(·) at points
+in {0, 1, 2} (Figure 11, line 6), and to do so efﬁciently. Cor-
+mode et al. [16, Apdx. A.2] describe how to make P run in
+time O(G · log G).
+
+We further improve their scheme. Notice that
+the sum-check protocol, P must
+
+in it-
+eration j of
+return
+(Fj(0), Fj(1), Fj(2)). However, P knows that Fj(0) + Fj(1) =
+Fj−1(rj−1). Thus, P computes Fj(1) and Fj(2); it also com-
+
+b(cid:89)
+
+putes Fj−1(rj−1) by interpolating a degree-2 polynomial from
+the values Fj−1(0), Fj−1(1), Fj−1(2), which it has computed
+in iteration j − 1. Finally, P computes Fj(0) = Fj−1(rj−1) −
+Fj(1). This process, including the interpolation, is much more
+efﬁcient than computing Fj(0) directly.
+A.2 Correctness of the reﬁnements
+In this section, we prove the correctness (soundness and com-
+pleteness) of CMT-slim (§3) and CMT-batching (§4).
+
+Lemma A.1. CMT-slim is complete and has soundness error
+ +b0/|F|, where b0 = (cid:100)log2 |Y|(cid:101) and  is the soundness error
+of CMT (which is quantiﬁed in Section 2.2).
+Proof. Let ˜V0(·) represent the extension of V0 for the circuit,
+if the circuit were computed correctly.
+Completeness: If y = C(x), then ˜Vy = ˜V0 (by deﬁnition).
+Thus, a0 = ˜Vy(q0) = ˜V0(q0) for all q0 ∈ Fb0. Since a0 =
+˜V0(q0) is a true statement, P need only follow the protocol
+to ensure that V accepts. The protocol thus satisﬁes (perfect)
+completeness.
+Soundness: If y (cid:54)= C(x), then Vy (cid:54)= V0 (they differ on
+at least one point in their domains). Thus, ˜Vy and ˜V0 are
+not the same polynomial, and in fact ˜Vy(q) = ˜V0(q) for at
+most a b0/|F| fraction of the values of q ∈ Fb0. (This is
+because ˜V0 and ˜Vy are polynomials in b0 variables, where
+each variable has degree at most 1 in any term; thus, we
+can apply the Schwartz-Zippel lemma.) If V chooses a q0
+for which ˜Vy(q0) = ˜V0(q0), then the protocol incorrectly ac-
+cepts. If V chooses a q0 for which ˜Vy(q0) (cid:54)= ˜V0(q0), then
+the protocol is attempting to prove a false statement, namely
+that a0 = ˜V0(q0). By the soundness of CMT, this succeeds
+with probability ≤ . A standard union bound establishes the
+claimed error.
+
+The
+
+completeness of CMT-batching follows
+
+from
+CMT-slim’s completeness: if the prover returns the correct
+answers for all instances in the batch, the veriﬁer (which can
+be seen as β instances of the CMT-slim veriﬁer that all make
+the same random choices) will always accept. We now prove
+the soundness of CMT-batching.
+
+Lemma A.2. Fix a circuit C, batch size β,
+inputs
+x(1), . . . , x(β), and purported outputs y(1), . . . , y(β). For any
+instance i, if y(i) (cid:54)= C(x(i)), then the probability of the veriﬁer
+accepting that instance is ≤ (cid:48), where (cid:48) is the soundness of
+CMT-slim.
+
+Proof. We prove this lemma by reducing CMT-batching to
+CMT-slim.
+Suppose toward a contradiction that CMT-batching has
+soundness error > (cid:48). This means that there exists some cir-
+cuit C, some set of inputs x(1), . . . , x(β), and a prover P∗ for
+CMT-batching such that, when given x(1), . . . , x(β) as inputs,
+P∗ returns y(i) (cid:54)= C(x(i)), yet the veriﬁer V(cid:48) still accepts with
+probability > (cid:48). Assume WLOG that i = 1.
+
+236
+
+We construct a CMT-slim prover, P, for the circuit C as
+follows:
+1. At the beginning, P receives x from V, the CMT-slim
+veriﬁer. It sends (x, x(2), . . . , x(β)) to P∗, getting back
+(y, y(2), . . . , y(β)). It sends y to V.
+2. In each round, P receives a message from V. It forwards
+the message to P∗ and receives β responses. It sends the
+response from P∗ for instance 1 to V.
+We want to show that when y (cid:54)= C(x), P can get V to accept
+with probability > (cid:48) (thus contradicting the soundness of
+CMT-slim).
+Recall that, while the CMT-batching veriﬁer V(cid:48) shares the
+same randomness between instances, it otherwise treats all
+instances independently when verifying. Thus, we can think
+of V(cid:48) as a collection of β CMT-slim veriﬁers that all generate
+the same randomness. V(cid:48) accepts for iteration i if and only if
+the ith CMT-slim veriﬁer accepts. Since P∗ can get the 1st
+CMT-slim veriﬁer in V(cid:48) to accept with probability more than
+> (cid:48) (by our assumption), P can get V to accept with the same
+probability, and we get the desired contradiction.
+
+χgj(τj),
+
+and
+
+χgj(τj).
+
+(g1,...,g3b)∈Smulti
+
+j=1
+
+(g1,...,g3b)∈Saddi
+
+j=1
+
+˜addi(τ1, . . . , τ3b) =
+
+˜multi(τ1, . . . , τ3b) =
+
+A.3 General expressions for ˜mult and ˜add
+This section describes general expressions for ˜mult and ˜add
+that can be applied to every layer.
+Let Saddi = {(g1, . . . , g3b) ∈ F3b
+| addi(g1, . . . , g3b) = 1}
+2
+and similarly for Smulti. Furthermore, let χ0(τ ) = 1 − τ and
+χ1(τ ) = τ. The general expressions for ˜addi and ˜multi are
+3b(cid:89)
+(cid:88)
+3b(cid:89)
+(cid:88)
+2 , then (cid:81)3b
+
+Note that if (τ1, . . . , τ3b) ∈ F3b
+j=1 χgj(τj) = 1 if
+(τ1, . . . , τ3b) = (g1, . . . , g3b) and equals 0 otherwise. Thus,
+˜addi(τ1, . . . , τ3b) = 1 if (τ1, . . . , τ3b) ∈ Saddi and equals 0
+otherwise (similarly for ˜multi and Smulti). These expressions
+agree with addi and multi wherever addi and multi are de-
+ﬁned, and they are polynomials of appropriate degree. Thus,
+they must equal ˜addi and ˜multi.
+Acknowledgments
+Productive conversations with Justin Thaler, and careful read-
+ing by Justin and Bryan Parno improved our thinking and this
+draft. We thank Zuocheng Ren for helpful suggestions and
+the anonymous reviewers for their helpful comments. The re-
+search was supported by AFOSR grant FA9550-10-1-0073,
+NSF grants 1055057 and 1040083, a Sloan Fellowship, and
+an Intel Early Career Faculty Award.
+
+References
+[1] Berkeley Open Infrastructure for Network Computing (BOINC).
+[2] Open MPI (http://www.open-mpi.org).
+[3] D. P. Anderson, J. Cobb, E. Korpela, M. Lebofsky, and D. Werthimer.
+SETI@home: An experiment in public-resource computing. CACM,
+45(11):56–61, Nov. 2002.
+
+[4] S. Arora and B. Barak. Computational Complexity: A modern
+
+approach. Cambridge University Press, 2009.
+
+[5] S. Arora, C. Lund, R. Motwani, M. Sudan, and M. Szegedy. Proof
+veriﬁcation and the hardness of approximation problems. J. of the
+ACM, 45(3):501–555, May 1998.
+
+[6] S. Arora and S. Safra. Probabilistic checking of proofs: a new
+
+characterization of NP. J. of the ACM, 45(1):70–122, Jan. 1998.
+[7] L. Babai. Trading group theory for randomness. In STOC, 1985.
+[8] L. Babai, L. Fortnow, L. A. Levin, and M. Szegedy. Checking
+
+computations in polylogarithmic time. In STOC, 1991.
+
+[9] E. Ben-Sasson, A. Chiesa, D. Genkin, and E. Tromer. Fast reductions
+from RAMs to delegatable succinct constraint satisfaction problems.
+In ITCS, Jan. 2013.
+
+[10] E. Ben-Sasson, A. Chiesa, D. Genkin, and E. Tromer. On the
+
+concrete-efﬁciency threshold of probabilistically-checkable proofs. In
+STOC, June 2013.
+
+[11] D. J. Bernstein. ChaCha, a variant of Salsa20.
+
+http://cr.yp.to/chacha.html.
+
+[12] N. Bitansky, A. Chiesa, Y. Ishai, R. Ostrovsky, and O. Paneth.
+
+Succinct non-interactive arguments via linear interactive proofs. In
+IACR TCC, Mar. 2013.
+
+[13] G. Brassard, D. Chaum, and C. Cr´epeau. Minimum disclosure proofs
+
+of knowledge. J. of Comp. and Sys. Sciences, 37(2):156–189, 1988.
+
+[14] M. Castro and B. Liskov. Practical Byzantine fault tolerance and
+
+proactive recovery. ACM Trans. on Comp. Sys., 20(4):398–461, Nov.
+2002.
+
+[15] K.-M. Chung, Y. Kalai, and S. Vadhan. Improved delegation of
+
+computation using fully homomorphic encryption. In CRYPTO 2010.
+
+[16] G. Cormode, M. Mitzenmacher, and J. Thaler. Practical veriﬁed
+
+computation with streaming interactive proofs. In ITCS, 2012.
+
+[17] T. ElGamal. A public key cryptosystem and a signature scheme based
+on discrete logarithms. IEEE Trans. on Info. Theory, 31(4):469–472,
+1985.
+
+[18] D. Fiore and R. Gennaro. Publicly veriﬁable delegation of large
+
+polynomials and matrix computations, with applications. In ACM
+CCS, 2012.
+
+[19] R. Gennaro, C. Gentry, and B. Parno. Non-interactive veriﬁable
+
+computing: Outsourcing computation to untrusted workers. In
+CRYPTO, 2010.
+
+[20] R. Gennaro, C. Gentry, B. Parno, and M. Raykova. Quadratic span
+
+programs and succinct NIZKs without PCPs. In EUROCRYPT, May
+2013.
+
+[21] C. Gentry. A fully homomorphic encryption scheme. PhD thesis,
+
+[22] C. Gentry, S. Halevi, and N. Smart. Homomorphic evaluation of the
+
+Stanford University, 2009.
+
+AES circuit. In CRYPTO, 2012.
+
+[23] S. Goldwasser, Y. T. Kalai, and G. N. Rothblum. Delegating
+computation: Interactive proofs for muggles. In STOC, 2008.
+
+[24] S. Goldwasser, S. Micali, and C. Rackoff. The knowledge complexity
+of interactive proof systems. SIAM J. on Comp., 18(1):186–208, 1989.
+
+[25] J. Groth. Short pairing-based non-interactive zero-knowledge
+
+arguments. In ASIACRYPT, 2010.
+
+[26] Y. Huang, D. Evans, J. Katz, and L. Malka. Faster secure two-party
+
+computation using garbled circuits. In USENIX Security, 2011.
+[27] Y. Ishai, E. Kushilevitz, and R. Ostrovsky. Efﬁcient arguments
+
+without short PCPs. In Conference on Computational Complexity
+(CCC), 2007.
+
+[28] J. Kilian. A note on efﬁcient zero-knowledge proofs and arguments
+
+(extended abstract). In STOC, 1992.
+
+[29] J. Kilian. Improved efﬁcient arguments (preliminary version). In
+
+CRYPTO, 1995.
+
+[30] B. Kreuter, abhi shelat, and C. hao Shen. Billion-gate secure
+
+computation with malicious adversaries. In USENIX Security, Aug.
+2012.
+
+[31] H. Lipmaa. Progression-free sets and sublinear pairing-based
+
+non-interactive zero-knowledge arguments. In IACR TCC, 2011.
+
+[32] C. Lund, L. Fortnow, H. J. Karloff, , and N. Nisan. Algebraic methods
+
+for interactive proof systems. J. of the ACM, 39(4):859–868, 1992.
+
+[33] D. Malkhi, N. Nisan, B. Pinkas, and Y. Sella. Fairplay—a secure
+
+two-party computation system. In USENIX Security, 2004.
+
+[34] D. Malkhi and M. Reiter. Byzantine quorum systems. Distributed
+
+Computing, 11(4):203–213, 1998.
+
+[35] F. Monrose, P. Wycko, and A. D. Rubin. Distributed execution with
+
+[36] R. Motwani and P. Raghavan. Randomized Algorithms. Cambridge
+
+remote audit. In NDSS, 1999.
+
+University Press, 1995.
+
+[37] P. Paillier. Public-key cryptosystems based on composite degree
+
+residuosity classes. In EUROCRYPT, 1999.
+
+[38] C. Papamanthou, E. Shi, and R. Tamassia. Signatures of correct
+
+computation. In IACR TCC, Mar. 2013.
+
+[39] B. Parno, C. Gentry, J. Howell, and M. Raykova. Pinocchio: Nearly
+
+practical veriﬁable computation. In IEEE Symposium on Security and
+Privacy, May 2013.
+
+[40] B. Parno, J. M. McCune, and A. Perrig. Bootstrapping Trust in
+
+Modern Computers. Springer, 2011.
+
+[41] G. N. Rothblum. Delegating Computation Reliably: Paradigms and
+Constructions. PhD thesis, Massachusetts Institute of Technology,
+2009.
+
+[42] A.-R. Sadeghi, T. Schneider, and M. Winandy. Token-based cloud
+computing: secure outsourcing of data and arbitrary computations
+with lower latency. In TRUST, 2010.
+
+[43] S. Setty, A. J. Blumberg, and M. Walﬁsh. Toward practical and
+
+unconditional veriﬁcation of remote computations. In HotOS, 2011.
+[44] S. Setty, B. Braun, V. Vu, A. J. Blumberg, B. Parno, and M. Walﬁsh.
+Resolving the conﬂict between generality and plausibility in veriﬁed
+computation. In EuroSys, Apr. 2013.
+
+[45] S. Setty, R. McPherson, A. J. Blumberg, and M. Walﬁsh. Making
+
+argument systems for outsourced computation practical (sometimes).
+In NDSS, 2012.
+
+[46] S. Setty, V. Vu, N. Panpalia, B. Braun, M. Ali, A. J. Blumberg, and
+
+M. Walﬁsh. Taking proof-based veriﬁed computation a few steps
+closer to practicality (extended version). Cryptology ePrint Archive,
+Report 2012/598, 2012.
+
+[47] S. Setty, V. Vu, N. Panpalia, B. Braun, A. J. Blumberg, and
+
+M. Walﬁsh. Taking proof-based veriﬁed computation a few steps
+closer to practicality. In USENIX Security, 2012.
+
+[48] A. Shamir. IP = PSPACE. J. of the ACM, 39(4):869–877, 1992.
+[49] J. Thaler, M. Roberts, M. Mitzenmacher, and H. Pﬁster. Veriﬁable
+computation with massively parallel interactive proofs. In USENIX
+HotCloud Workshop, 2012.
+
+237
+
+

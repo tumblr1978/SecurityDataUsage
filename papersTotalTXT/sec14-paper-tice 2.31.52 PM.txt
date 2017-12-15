@@ -1,0 +1,2117 @@
+Enforcing Forward-Edge Control-Flow Integrity  
+
+in GCC & LLVM
+
+Caroline Tice, Tom Roeder, and Peter Collingbourne, Google, Inc.; Stephen Checkoway, 
+
+Johns Hopkins University; Úlfar Erlingsson, Luis Lozano, and Geoff Pike, Google, Inc.
+
+https://www.usenix.org/conference/usenixsecurity14/technical-sessions/presentation/tice
+
+This paper is included in the Proceedings of the 23rd USENIX Security Symposium.August 20–22, 2014 • San Diego, CAISBN 978-1-931971-15-7Open access to the Proceedings of  the 23rd USENIX Security Symposium is sponsored by USENIXEnforcing Forward-Edge Control-Flow Integrity in GCC & LLVM
+Stephen Checkoway
+Caroline Tice
+Google, Inc.
+
+Tom Roeder
+Google, Inc.
+
+Johns Hopkins University
+
+Peter Collingbourne
+
+Google, Inc.
+
+Úlfar Erlingsson
+
+Google, Inc.
+
+Luis Lozano
+Google, Inc.
+
+Geoff Pike
+Google, Inc.
+
+Abstract
+Constraining dynamic control transfers is a common tech-
+nique for mitigating software vulnerabilities. This de-
+fense has been widely and successfully used to protect
+return addresses and stack data; hence, current attacks
+instead typically corrupt vtable and function pointers to
+subvert a forward edge (an indirect jump or call) in the
+control-ﬂow graph. Forward edges can be protected us-
+ing Control-Flow Integrity (CFI) but, to date, CFI im-
+plementations have been research prototypes, based on
+impractical assumptions or ad hoc, heuristic techniques.
+To be widely adoptable, CFI mechanisms must be inte-
+grated into production compilers and be compatible with
+software-engineering aspects such as incremental compi-
+lation and dynamic libraries.
+
+This paper presents implementations of ﬁne-grained,
+forward-edge CFI enforcement and analysis for GCC and
+LLVM that meet the above requirements. An analysis
+and evaluation of the security, performance, and resource
+consumption of these mechanisms applied to the SPEC
+CPU2006 benchmarks and common benchmarks for the
+Chromium web browser show the practicality of our ap-
+proach: these ﬁne-grained CFI mechanisms have signif-
+icantly lower overhead than recent academic CFI proto-
+types. Implementing CFI in industrial compiler frame-
+works has also led to insights into design tradeoffs and
+practical challenges, such as dynamic loading.
+1
+The computer security research community has developed
+several widely-adopted techniques that successfully pro-
+tect return addresses and other critical stack data [13, 20].
+So, in recent years, attackers have changed their focus
+to non-stack-based exploits. Taking advantage of heap-
+based memory corruption bugs can allow an attacker to
+overwrite a function-pointer value, so that arbitrary ma-
+chine code gets executed when that value is used in an
+indirect function call [6]. Such exploits are referred to as
+forward-edge attacks, as they change forward edges in
+the program’s control-ﬂow graph (CFG).
+
+Introduction
+
+To make these attacks more concrete, consider a C++
+program that makes virtual calls and has a use-after-free
+bug involving some object. After the object is freed, an
+
+attacker can reallocate the memory formerly occupied by
+the object, overwriting its vtable pointer. Later virtual
+calls through this object get the attacker’s vtable pointer
+and jump to a function from the attacker’s vtable. Such
+exploits are becoming commonplace, especially for web
+browsers where the attacker can partially control executed
+JavaScript code [14, 23].
+
+Control-Flow Integrity (CFI) [1] guards against these
+control-ﬂow attacks by verifying that indirect control-
+ﬂow instructions target only functions in the program’s
+CFG. However, although CFI was ﬁrst developed over a
+decade ago, practical CFI enforcement has not yet been
+adopted by mainstream compilers. Instead, CFI imple-
+mentations to date are either ad-hoc mechanisms, such
+as heuristic-driven, custom binary rewriting frameworks,
+or experimental, academic prototypes based on simpli-
+fying assumptions that prevent their use in production
+compilers [1, 9, 12, 29, 31–34].
+
+In this paper, we present implementations of two mech-
+anisms that provide forward-edge CFI protection, one
+in LLVM and one in GCC. We also provide a dynamic
+CFI analysis tool for LLVM which can help ﬁnd forward-
+edge control-ﬂow vulnerabilities. These CFI implemen-
+tations are fully integrated into their respective compil-
+ers and were developed in collaboration with their open
+source communities. They do not restrict compiler opti-
+mizations, operation modes, or features, such as Position-
+Independent Code (PIC) or C++ exceptions. Nor do they
+restrict the execution environment of their output binaries,
+such as its use of dynamically-loaded libraries or Address
+Space Layout Randomization (ASLR).
+
+The main contributions of this paper are:
+• We present the ﬁrst CFI implementations that are
+fully integrated into production compilers without
+restrictions or simplifying assumptions.
+
+• We show that our CFI enforcement is practical and
+highly efﬁcient by applying it to standard bench-
+marks and the Chromium web browser.
+
+• We identify, discuss, and resolve the main challenges
+in the development of a real-world CFI implemen-
+tation that is compatible with common software-
+engineering practices.
+
+All our mechanisms verify targets of forward-edge in-
+
+USENIX Association  
+
+23rd USENIX Security Symposium  941
+
+1
+
+direct control transfers but at different levels of preci-
+sion, depending on the type of target and the analysis
+applied. For example, C++ indirect-control transfers con-
+sist mostly of virtual calls, so one of our approaches
+focuses entirely on verifying calls through vtables. Our
+security analyses show that our CFI mechanisms protect
+from 95% to 99.8% of all indirect function calls. They are
+also highly efﬁcient, with a performance penalty (after
+optimizations) ranging from 1% to 8.7%, as measured on
+the SPEC CPU2006 benchmark suite and on web browser
+benchmarks.
+
+Most notably, our CFI mechanisms compare favorably
+to recent CFI research prototypes. The security guarantees
+of our work differ from these prototypes, but a compari-
+son is nonetheless instructive, since our attack model is
+realistic, and our defenses give strong guarantees.
+
+MIP [28] and CCFIR [34] state efﬁciency as their main
+innovation. In particular, on the SPEC Perl benchmarks
+(where they both were slowest), CCFIR reports 8.6% over-
+head, and MIP reports 14.9% to 31.3% overhead. Our
+mechanisms have a corresponding overhead of less than
+2%, as we report in Section 7.2. For C++ benchmarks,
+which perform indirect calls more frequently, the perfor-
+mance differences can be even greater. Another recent
+CFI implementation, bin-CFI [35], reports overheads of
+12% on the SPEC Perl benchmarks, but 45% for the C++
+benchmark omnetpp, while the overhead is between -1%
+and 6.5% for omnetpp compiled using our mechanisms.
+Even the most recent CFI implementation, SAFEDIS-
+PATCH [19], must sacriﬁce software-engineering practi-
+cality and use proﬁle-driven, whole-program optimization
+to achieve overheads comparable to ours (roughly 2% for
+all three of their Chromium benchmarks).
+2 Attacks and Compiler-based Defenses
+Software is often vulnerable to attacks that aim to subvert
+program control ﬂow in order to control the software’s
+behavior and assume its privileges. Typically, successful
+attacks exploit software mistakes or vulnerabilities that
+allow corruption of low-level state.
+
+To thwart these low-level attacks, modern compilers,
+operating systems, and runtime libraries protect software
+integrity using a variety of techniques, ranging from
+coarse-level memory protection, through address-space
+layout randomization, to the ﬁne-grained type-safety guar-
+antees of a high-level language. In particular, machine-
+code memory is commonly write protected, and thread
+execution stacks are protected by placing them at ran-
+dom, secret locations, and by checking that secret values
+(a.k.a. canary values) remain unmodiﬁed. This guards re-
+turn addresses and other stack-based control data against
+unintended overwriting [7, 13].
+
+As a result of such compiler-based defenses becoming
+widely used, corruption of the execution stack or machine
+
+code has become a far less common means of successful
+attack in well-maintained, carefully-written software such
+as web browsers [20]. However, there has been a corre-
+sponding increase in attacks that corrupt program-control
+data stored on the heap, such as C++ vtable pointers (in-
+side objects) [14], or function pointers embedded in data
+structures; these attacks subvert indirect control trans-
+fers and are known as “return-to-libc” or return-oriented
+programming [3, 8, 22, 25–27, 30].
+
+In this paper we present three compiler-based mech-
+anisms for further protecting the integrity of program
+control data. Focusing on the integrity of control-transfer
+data stored on the heap, two of our mechanisms enforce
+forward-edge CFI by restricting the permitted function
+pointer targets and vtables at indirect call sites to a set
+that the compiler, linker, and runtime have determined
+to be possibly valid. The third mechanism is a runtime
+analysis tool designed to catch CFI violations early in
+the software development life-cycle. Our mechanisms
+are efﬁcient and practical and have been implemented as
+components of the GCC and LLVM production compiler
+toolchains. While they differ in their details, and in their
+security — such as in how precisely the program’s CFG
+is enforced — all three of our implementations:
+
+to represent aspects of the program’s static CFG;
+
+indirect forward-edge, control-ﬂow instructions;
+
+slower integrity checks in certain complex cases;
+
+• add new, read-only metadata to compilation modules
+• add machine code for fast integrity checks before
+• optionally divert execution to code that performs
+• call out to error handlers in the case of failures; and
+• may employ runtime library routines to handle im-
+portant exceptional events such as dynamic loading.
+Like all defenses, we aim to prevent certain threats
+and not others, according to an attack model. As in the
+original work on CFI, our model pessimistically assumes
+that an adversary can arbitrarily perturb most writable
+program data at any time [1]. The program code, read-
+only data, and thread register state cannot be modiﬁed.
+While pessimistic, this attack model has stood the test of
+time, and is both conceptually simple and realistic.
+
+Similar to recent independent CFI work done concur-
+rently with ours [19], and motivated by attackers’ increas-
+ing focus on heap-based exploits, our mechanisms protect
+only forward-edge control transfers. Our attack model
+does not contain many types of stack corruption, since,
+as stated previously, effective defenses against such cor-
+ruption are already in common use. Thus, our choice of
+attack model differs from most earlier work on CFI, ex-
+cept for work on mechanisms like XFI [12], which place
+the stack outside of pointer-accessible memory.
+
+In our attack model we also depart from most previous
+CFI work by choosing to trust the compiler toolchain.
+For the integration of general-purpose defenses in pro-
+
+942  23rd USENIX Security Symposium 
+
+USENIX Association
+
+2
+
+duction compilers, we ﬁnd relying only on stand-alone
+veriﬁcation of the ﬁnal, output binaries to be impractical —
+although well-suited to custom compilers for speciﬁc sce-
+narios, such as in Google’s Native Client [17, 21]. While
+eliminating trust in the compiler is a laudable goal [24],
+doing so increases complexity, reduces portability, and
+prevents optimizations, while providing only uncertain
+beneﬁts. In particular, we know of no exploits on pre-
+vious compiler-based defenses that justify the software
+engineering costs of eliminating trust in the compiler.
+
+By adopting the above attack model, our mechanisms
+are practical as well as efﬁcient. While many experimen-
+tal CFI mechanisms have been constructed and described
+in the literature, none have been able to efﬁciently provide
+strong, precise integrity guarantees with the full support
+that programmers demand from a production compiler. In
+particular, incremental compilation and dynamic libraries
+have remained primary challenges for CFI implementa-
+tions, as has achieving low performance overheads; these
+challenges have only recently started to be addressed in
+experimental prototypes that enforce more coarse-grained
+CFI policies [28, 34]. However, CFI enforcement that
+is too coarse grained may provide only limited protec-
+tion [4, 10, 15, 16] against modern attackers.
+
+In summary, by focusing on forward-edge CFI, and
+fully integrating into compilers, our mechanisms can en-
+force ﬁne-grained CFI at a runtime overhead that im-
+proves on that of the best previous work.
+Related Work. Following the original 2005 work on
+CFI, later revised as Abadi et al. [1], there have been
+a number of implementations that have extended or
+built-upon CFI: XFI by Erlingsson et al. [12], BGI by
+Castro et al. [5], HyperSafe by Wang and Jiang [31],
+CFI+Sandboxing by Zeng et al. [32], MoCFI by Davi
+et al. [9], CCFIR by Zhang et al. [34], Strato by Zeng
+et al. [33], bin-CFI by Zhang et al. [35], MIP by Niu
+et al. [28], and SAFEDISPATCH by Jang et al. [19].
+
+These CFI-based mechanisms vary widely in their
+goals, tradeoffs and implementation details. To achieve
+low overhead, many enforce only coarse-grained CFI,
+which may be a weak defense [15].
+
+XFI, Strato, HyperSafe, and BGI use control-ﬂow in-
+tegrity primarily as a building block for higher-level func-
+tionality, such as enforcing software-based fault isolation
+(SFI), or ﬁne-grained memory-access controls. Some,
+like XFI, focus on statically verifying untrusted binary
+modules, to establish that CFI will be correctly enforced
+during their execution, and thus that they can be used
+safely within different address spaces, such as the OS
+kernel.
+
+Many implementations of CFI are based on binary
+rewriting. XFI and the original work on CFI used the
+sound, production-quality Windows binary rewriter, Vul-
+can [11], as well as debug information in PDB ﬁles.
+
+These implementations construct precise control-ﬂow
+graphs (CFGs) to ensure that all indirect control trans-
+fers are constrained in a sound manner. Other imple-
+mentations — including MoCFI, CCFIR, and bin-CFI —
+are based on more ad hoc and fragile mechanisms. For
+example, MoCFI produces an imprecise CFG for ARM
+applications running on an iPhone based on runtime code
+dumping, disassembly, and heuristics. CCFIR relies on
+relocation tables and recursive disassembly with heuris-
+tics to identify code that needs to be protected. The code
+is then rewritten to use a special randomized springboard
+section through which all indirect control transfers hap-
+pen. Bin-CFI also uses heuristic disassembly; however,
+unlike CCFIR, bin-CFI injects a CFI-protected copy of
+the text section into the original binary and uses dynamic
+binary translation to convert pointers between the two
+code copies at runtime.
+
+Other implementations, including HyperSafe, MIP,
+CFI+Sandboxing, and SAFEDISPATCH are implemented
+as modiﬁcations to the compiler toolchain and compile
+source code to binaries with CFI protection. The ﬁrst
+three are implemented as rewriting either assembly or
+the compiler’s Intermediate Representation (IR) of ma-
+chine code — essentially a more precise form of binary
+rewriting.
+
+Our vtable veriﬁcation (see Section 3) is most simi-
+lar to SAFEDISPATCH: work done independently and
+concurrently with ours that adds passes to LLVM for in-
+strumenting code with runtime CFI checks, and relies
+on proﬁle-driven, whole-program optimization to reduce
+enforcement overhead. At a call site, SAFEDISPATCH
+checks that either (1) the vtable pointer is to a valid vtable,
+for the call site, or (2) the address in the vtable points to a
+valid method for the call site. However, SAFEDISPATCH
+disallows separate compilation, dynamic libraries, etc.,
+and relies on proﬁle-driven, whole-program optimization,
+which is not very practical.
+
+The overhead of all these various CFI mechanisms
+ranges from 6% to 200%, with some signiﬁcant variations.
+In particular, the recent papers on MIP, CCFIR, and Strato
+state their low CFI enforcement overhead as a main con-
+tribution; Strato also highlights its support for compiler
+optimizations. However, as mentioned previously, their
+overheads on comparable benchmarks are several times
+larger than those of our CFI mechanisms — and they are
+likely to perform even worse on C++ benchmarks. This is
+due in part to the different properties our work enforces:
+we limit our scope to protecting control data that is not
+already well-protected by other mechanisms.
+3 VTV: Virtual-Table Veriﬁcation
+Vtable Veriﬁcation (VTV) is a CFI transformation imple-
+mented in GCC 4.9 for C++ programs. VTV protects only
+virtual calls and does not attempt to verify other types of
+
+USENIX Association  
+
+23rd USENIX Security Symposium  943
+
+3
+
+indirect control ﬂow. However, most indirect calls in C++
+are virtual calls (e.g., 91.8% in Chrome), making them
+attractive targets for attackers. VTV is our most precise
+CFI approach: it guarantees that the vtable used by each
+protected virtual call is both valid for the program and
+also correct for the call site.
+3.1 Problem Description
+Virtual calls are made through objects, which are instances
+of a particular class, where one class (e.g., rectangle)
+inherits from another class (e.g., shape), and both classes
+can deﬁne the same function (e.g., draw()), and declare
+it to be virtual. Any class that has a virtual function
+is known as a polymorphic class. Such a class has an
+associated virtual function table (vtable), which contains
+pointers to the code for all the virtual functions for the
+class. During execution, a pointer to an object declared
+to have the type of a parent class (its static type, e.g.,
+shape) may actually point to an object of one of the
+child classes (its dynamic type, e.g., rectangle). At
+runtime, the object contains a pointer (the vtable pointer)
+to the appropriate vtable for its dynamic type. When it
+makes a call to a virtual function, the vtable pointer in the
+object is dereferenced to ﬁnd the vtable, then the offset
+appropriate for the function is used to ﬁnd the correct
+function pointer within the vtable, and that pointer is used
+for the actual indirect call. Though somewhat simpliﬁed,
+this explanation is generally accurate.
+
+The vtables themselves are placed in read-only memory,
+so they cannot be easily attacked. However, the objects
+making the calls are allocated on the heap. An attacker
+can make use of existing errors in the program, such as
+use-after-free, to overwrite the vtable pointer in the object
+and make it point to a vtable created by the attacker. The
+next time a virtual call is made through the object, it uses
+the attacker’s vtable and executes the attacker’s code.
+3.2 Overview of VTV
+To prevent attacks that hijack virtual calls through bogus
+vtables, VTV veriﬁes the validity, at each call site, of
+the vtable pointer being used for the virtual call, before
+allowing the call to execute. In particular, it veriﬁes that
+the vtable pointer about to be used is correct for the call
+site, i.e., that it points either to the vtable for the static
+type of the object, or to a vtable for one of its descendant
+classes. VTV does this by rewriting the IR code for
+making the virtual call: a veriﬁcation call is inserted after
+getting the vtable pointer value out of the object (ensuring
+the value cannot be attacked between its veriﬁcation and
+its use) and before dereferencing the vtable pointer. The
+compiler passes to the veriﬁer function the vtable pointer
+from the object and the set of valid vtable pointers for the
+call site. If the pointer from the object is in the valid set,
+then it gets returned and used. Otherwise, the veriﬁcation
+
+function calls a failure function, which normally reports
+an error and aborts execution immediately.
+3.3 More Details
+VTV differs from all previous compiler-based CFI im-
+plementations in that it allows incremental compilation
+rather than requiring that all ﬁles be recompiled if a single
+one is changed. VTV also does not forbid or restrict dy-
+namic library loading. Such requirements and restrictions
+are common in research prototypes but impractical for
+real world systems.
+
+Because VTV allows incremental compilation and dy-
+namic loading, it must assume that its knowledge of the
+class hierarchy is incomplete during any particular compi-
+lation. Therefore, VTV has two pieces: the main compiler
+part, and a runtime library (libvtv), both of which are part
+of GCC. In addition to inserting veriﬁcation calls at each
+call site, the compiler collects class hierarchy and vtable
+information during compilation, and uses it to generate
+function calls into libvtv, which will (at runtime) build
+the complete sets of valid vtable pointers for each poly-
+morphic class in the program.
+
+To keep track of static types of objects and to ﬁnd sets
+of vtable pointers, VTV creates a special set of variables
+called vtable-map variables, one for each polymorphic
+class. At runtime, a vtable-map variable will point to the
+set of valid vtable pointers for its associated class. When
+VTV inserts a veriﬁcation call, it passes in the appropriate
+vtable-map variable for the static type of the object, which
+points to the set to use for veriﬁcation.
+
+Because our vtable-pointer sets need to be built before
+any virtual calls execute, VTV creates special constructor
+init functions and gives them a high priority. The compiler
+inserts into these special functions the calls for building
+vtable-pointer sets. These functions run before standard
+initialization functions, which run before main, ensuring
+the data is in place before any virtual calls are made.
+
+Vtable-map variables and vtable-pointer sets need to
+be read only to avoid introducing new vectors for attack.
+However, they must be writable when they are ﬁrst ini-
+tialized and whenever a dynamic library is loaded, since
+the dynamic library may need to add to the vtable-pointer
+sets. So, we need to be able to ﬁnd all our data quickly.
+To keep track of the vtable-pointer sets, we wrote our own
+memory allocation scheme based on mmap. VTV uses
+this scheme when creating the sets; this lets it ﬁnd all such
+sets in memory.
+
+To ﬁnd vtable-map variables, VTV writes them into a
+special named section in the executable, which is page-
+aligned and padded with a page-sized amount of zeros to
+prevent any other data from residing on the same pages.
+Before updating its data, VTV ﬁnds all memory pages that
+contain vtable-map variables and vtable-pointer sets and
+makes them writable. When it ﬁnishes the update, it ﬁnds
+
+944  23rd USENIX Security Symposium 
+
+USENIX Association
+
+4
+
+all appropriate pages and makes them read-only. Thus,
+the only times these VTV data structures are vulnerable
+to attack are during program initialization, and possibly
+during dlopen calls. The VTV code that updates our data
+structures uses pthread mutexes to prevent races between
+multiple threads.
+3.4 Practical Experience with VTV
+We encountered some challenges while developing VTV.
+Declaring global variables. Originally, VTV declared
+vtable-map variables as COMDAT and as having global
+visibility, because incremental compilation can result in
+multiple compilation units deﬁning the same vtable-map
+variable, and COMDAT sections can be coalesced by the
+linker. However, this did not work reliably because there
+are many ways in which programmers can override the
+visibility of a symbol: linker version scripts can explicitly
+declare which symbols have global visibility; the rest of
+the symbols become hidden by default. Also, if global
+symbols are not added to the dynamic symbol table, then
+vtable-map variables might not be global. Finally, calls to
+dlopen with the RTLD_LOCAL ﬂag have similar effects.
+We found all these techniques at work in Chromium.
+
+When some vtable-map variables do not have global
+visibility, there can be multiple live instances of a vtable-
+map variable for a particular class, each pointing to a
+different vtable-pointer set containing only part of the full
+vtable-pointer set for the class. If the veriﬁcation function
+is passed a variable pointing to the wrong part of the set,
+execution aborts incorrectly. We call this the split-set
+problem.
+
+We ﬁnally concluded that there is no existing mecha-
+nism for the compiler to ensure a symbol will always be
+globally visible. The only way to eliminate the split-set
+problem was to accept that there would be multiple live
+versions of some vtable-map variables. To handle the
+consequences of this new assumption, VTV keeps track
+of the ﬁrst instance of a vtable-map variable for each class.
+When initializing any vtable-map variable, it ﬁrst checks
+if it has already seen a version of that variable. If not, then
+it allocates a vtable-pointer set for the variable, makes
+the variable point to the vtable-pointer set, and registers
+the variable in its variable registry. All subsequent vtable-
+map variables for that class are then initialized to point to
+the same vtable-pointer set as the ﬁrst one.
+Mixing veriﬁed and non-veriﬁed code. VTV causes
+execution to halt for one of three reasons: (1) a vtable
+pointer has been corrupted; (2) the C++ code contains
+an incorrect cast between two class types (programmer
+error); or (3) the set of valid vtable pointers used for
+veriﬁcation is incomplete. The split-set problem is an
+example of the last case. This can also occur if some ﬁles
+that deﬁne or extend classes are instrumented with vtable
+
+#include "lib.h"
+struct Derived_Priv : public Base {
+
+virtual ~Derived_Priv() {}
+
+};
+
+lib.cc
+
+Base *GetPrivate() {
+
+return new Derived_Priv;
+
+}
+void Destroy(Base *pb) {
+
+delete pb; // virtual call #1
+
+}
+
+main.cc
+
+#include "lib.h"
+struct Derived : public Base {
+virtual ~Derived() {}
+
+};
+
+int main() {
+
+Derived *d = new Derived;
+Destroy(d);
+Base *pp = GetPrivate();
+delete pp; // virtual call #2
+
+}
+
+main.cc
+w/ VTV
+
+lib.cc
+w/ VTV
+
+vcall #1
+
+OK
+
+vcall #2 Missing from vtable
+
+OK
+
+pointer set
+
+Yes
+No
+Yes
+No
+
+Yes
+No
+No
+Yes
+
+Yes
+Yes
+Yes
+No
+
+Yes
+Yes
+No
+Yes
+
+Nothing
+Nothing
+Derived_Priv
+Derived
+
+Figure 1: Example of problems resulting from mixing
+veriﬁed and unveriﬁed code. If only main.cc is compiled
+with veriﬁcation, the vtable pointer for Derived_Priv
+does not get added to the valid set for Base, so virtual
+call #2 fails to verify.
+If only lib.cc is compiled with
+veriﬁcation, the vtable pointer for Derived does not get
+added to the valid set for Base, so virtual call #1 fails.
+
+veriﬁcation, and other ﬁles that deﬁne or extend part of
+the class hierarchy are not. A similar effect also can occur
+with libraries or plugins that pass objects in and out, if
+one is instrumented and the other is not.
+
+Figure 1 shows this problem: a header ﬁle, lib.h, de-
+clares a base class Base. The class Base contains one
+virtual function, its destructor. There are two source ﬁles,
+lib.cc and main.cc, that each includes lib.h and contains
+classes that inherit from Base, as shown in the upper part
+of Figure 1. The table in the lower part of Figure 1 shows
+the effects on the two marked virtual calls of compiling
+lib.cc and main.cc with and without VTV. Note that the
+only cases where both virtual calls pass veriﬁcation are
+when everything is built with VTV or nothing is.
+
+We encountered this problem in ChromeOS with the
+Chrome browser. There are two third-party libraries
+which are built without VTV and are distributed to
+ChromeOS as stripped, obfuscated binaries (these bina-
+ries are not part of the open-source Chromium project).
+To make matters worse, when we built the rest of Chrome
+
+USENIX Association  
+
+23rd USENIX Security Symposium  945
+
+5
+
+and ChromeOS with VTV and ran tests that exercised
+those libraries, we encountered veriﬁcation failures.
+
+To deal with the mixed-code problem in general, VTV
+was designed and written with a replaceable failure func-
+tion. This function gets called if the veriﬁcation function
+fails to ﬁnd a vtable pointer in a valid set. To replace
+the default failure function, a programmer writes a re-
+placement function (using the same signature, provided
+in a header ﬁle in libvtv), compiles it, and links it into
+the ﬁnal binary. For Chrome we replaced the default
+failure function with a whitelist failure function. The
+whitelist function maintains an array with one record for
+each whitelisted library. The record contains the mem-
+ory address range where the readonly data section for
+the library (which contains all of the library’s vtables)
+is loaded. If a vtable pointer fails normal veriﬁcation, it
+gets passed to the whitelist failure function. The function
+goes through the array, checking to see if the pointer is
+in any of the address ranges. If so, it assumes the pointer
+is valid and execution continues (veriﬁcation succeeded).
+Otherwise, it reports an error and aborts.
+
+Because the obfuscated libraries are dynamically
+loaded, the whitelist array records do not initially contain
+any addresses. If any records are empty when the whitelist
+failure function is called, then the function checks to see
+if the corresponding library has been loaded, and if so, it
+ﬁlls in the addresses before veriﬁcation. For ChromeOS,
+our whitelist consists of the two third-party libraries men-
+tioned above. This secondary veriﬁcation, while not as
+accurate as normal VTV veriﬁcation, still severely limits
+what an attacker can do, and with it we were able to exe-
+cute all our tests on Chrome with no veriﬁcation failures.
+Our secondary failure function only gets called in those
+cases where the main veriﬁcation function fails. In that
+case it usually performs at most one alignment check and
+four pointer comparisons. Therefore, its overall impact
+on performance is small.
+3.5 Alternatives & Enhancements for VTV
+Since our performance overhead is reasonably good (rang-
+ing from 2.0% to 8.7% in the worst case, as we discuss
+in Section 7.1), we have not spent much time improv-
+ing the performance of VTV. However, there are some
+things that could be done to improve these numbers. For
+various reasons, Chrome/ChromeOS currently cannot be
+compiled with devirtualization1 enabled; we could enable
+devirtualization in Chrome and tune the devirtualizer to
+be more aggressive when combined with VTV. Partial
+inlining of the veriﬁcation call sequences is another av-
+
+1Devirtualization is an optimization that replaces virtual calls with
+a fast-path/slow-path mechanism: the fast path uses a direct call to
+the most common target, with a conditional check to make sure this is
+right; the slow path falls back on the normal virtual call mechanism.
+Devirtualization reduces the number of indirect calls and veriﬁcations
+and improves the overall performance of VTV.
+
+enue we could explore, since call overhead accounts for a
+signiﬁcant portion of our overall performance penalties.
+We could also implement secure methods for caching and
+reusing frequently veriﬁed values.
+
+When we started implementing VTV, we decided that
+we did not want to modify any element of the toolchain
+except the compiler, especially because GCC can be used
+with a variety of different assemblers and linkers, and
+we did not want to modify all of them. An alternative
+approach would have been to have the compiler store the
+vtable-pointer sets as data in the assembly ﬁles. This data
+would be passed through the assembler to the linker. At
+link time the linker would see the whole program and
+could efﬁciently combine the vtable-pointer sets from
+the various object ﬁles into the appropriate ﬁnal vtable-
+pointer sets. The dynamic loader, when loading the pro-
+gram, could load the pointers into our data sets and mark
+them read-only. This approach would eliminate order-
+ing issues between functions that build vtable-pointer
+sets and functions that make virtual calls. The dynamic
+loader would also need to update the data, as appropri-
+ate, whenever it loaded a dynamic library that contained
+additional vtable pointers. A disadvantage of this alter-
+native approach is that instead of requiring modiﬁcations
+only to the compiler, it would modify the entire toolchain:
+the compiler, the assembler, the linker, and the dynamic
+loader.
+4
+Indirect Function-Call Checks (IFCC) is a CFI transforma-
+tion implemented over LLVM 3.4. It operates on LLVM
+IR during link-time optimization (LTO). IFCC does not
+depend on the details of C++ or other high-level lan-
+guages; instead, it protects indirect calls by generating
+jump tables for indirect-call targets and adding code at
+indirect-call sites to transform function pointers, ensuring
+that they point to a jump-table entry. Any function pointer
+that does not point into the appropriate table is considered
+a CFI violation and will be forced into the right table by
+IFCC. IFCC collects function-pointers into jump tables
+based on function-pointer sets, like VTV’s vtable-pointer
+sets, with one table per set.
+
+IFCC: Indirect Function-Call Checks
+
+IFCC forces all indirect-calls to go through its jump ta-
+bles. This signiﬁcantly reduces the set of possible indirect-
+call targets, and severely limits attacker options, prevent-
+ing attacks that do not jump to a function entry point of
+the right type.
+
+Each entry in a jump table consists solely of an aligned
+jump instruction to a function. The table is written to
+the read-only text area of the executable and is padded
+with trap instructions to a power-of-two size so that any
+aligned jump to the padding will cause the program to
+crash. Since the size of the table is a power of two, IFCC
+can compute a mask that can be used at call sites to force
+
+946  23rd USENIX Security Symposium 
+
+USENIX Association
+
+6
+
+a function pointer into the right function-pointer set. For
+example, if each jump-table entry takes up 8 bytes, and
+the table is 512 bytes in size, then there are 64 entries in
+the table, and the mask would be 111111000 in binary,
+which is 504 in decimal.
+
+IFCC rewrites IR for functions that have their address
+taken; we call these address-taken functions. The main
+transformation replaces the address of each such function
+with the address of the corresponding entry in a jump table.
+Additionally, indirect calls are replaced with a sequence
+of instructions that use a mask and a base address to
+check the function pointer against the function-pointer set
+corresponding to the call site. The simplest transformation
+subtracts the base address from the pointer, masks the
+result, and adds the masked value back to the base. If the
+pointer was in the right function-pointer set before this
+transformation, then it remains unchanged. If not, then
+a call through the resulting pointer is still guaranteed to
+transfer control only to addresses in the function-pointer
+set or to trap instructions. Note that every pointer in a
+jump table is a valid function pointer (although some
+of them immediately hit trap instructions when they are
+called), so they can correctly be passed to external code.
+IFCC can support many kinds of function-pointer sets,
+each with different levels of precision. For example, the
+most precise version would have one function-pointer set
+per function type signature. However, real world code
+does not always respect the type of function pointers, so
+this can fail for function-pointer casts. We will focus on
+two simple ways of constructing function-pointer sets:
+(1) Single puts all the functions into a single set; and (2)
+Arity assigns functions to a set according to the number
+of arguments passed to the indirect call at the call site
+(ignoring the return value).
+
+Note that although we implemented only two simple
+types of tables, any disjoint partitioning of the function-
+pointer types in the program will work, as long as each
+call site can be uniquely associated with a single table.
+This is true no matter what analysis is used to generate
+these tables — be it static, dynamic, or manual. So, for
+example, the compiler could perform a detailed analysis
+of escaping pointers and use it to separate these pointers
+into their own tables.
+
+The following example demonstrates the IFCC tech-
+nique for a simple program. Consider a function
+int f(char a) { return (int)a; } and a main
+function that makes an indirect call to f through a
+function-pointer variable g.
+In LLVM IR, the sym-
+bol @f will refer to function deﬁned above; IFCC adds
+a @baseptr symbol that stores a pointer to the ﬁrst
+function pointer in the generated jump table. Before
+IFCC, the LLVM IR contains an indirect call instruc-
+tion %call = call i32 %2(i8 signext 0) to the
+function pointer stored in variable %2.
+
+IFCC generates a new symbol @f_JT and deﬁnes it
+in the IR as an external function. It ﬁnds each instance
+where the program uses the address of @f and makes it
+use the address of @f_JT instead. It also creates a jump
+table of the form:
+
+.align 8
+.globl f_JT
+
+f_JT:
+
+jmp f
+
+This deﬁnes the symbol @f_JT and satisﬁes the linker.
+IFCC instruments the code before the indirect call with
+instructions that transform the pointer. There are several
+ways to perform this transformation. We show two tech-
+niques, one that requires large alignments, and another
+for when large alignments are not supported. The require-
+ment for large alignment in one scheme is because the
+base pointer must be aligned to the size of its table. This
+makes the base a preﬁx of each entry in its table.
+
+When the object format and the kernel support large
+table alignments (e.g., greater than one page), IFCC
+can use a compact set of instructions to transform a
+pointer. The following IR assumes integer representa-
+tions of @baseptr in %1 and @mask in %2, and a pointer
+to @f in %3.
+
+%4 = and i64 %2, %3
+%5 = add i64 %1, %4
+%6 = inttoptr i64 %5 to i32 (i8)*
+%7 = call i32 %6(i8 signext 0)
+
+In x86-64 assembly, this becomes:
+
+and
+add
+callq
+
+$mask, %rax
+$baseptr, %rax
+*%rax
+
+The ELF format supports arbitrary alignments but the
+Linux kernel does not (as of version 3.2.5, under ASLR
+with Position-Independent Executables (PIE)). Under
+ASLR, the kernel treats the beginning of each ELF seg-
+ment as an offset and generates a random base to add to
+the offset. The base is guaranteed to be aligned to a page
+boundary (212) but the resulting address is not guaranteed
+to have larger alignment.
+
+Under these circumstances, IFCC changes the way it
+operates on function pointers; instead of adding a masked
+pointer to a base, it computes the difference between the
+base address and the function pointer, masks this value
+with the same mask as before, and adds the result to the
+base. This ends up generating 3 instructions for pointer
+manipulation in x86-64: a sub, then an and, then an add.
+4.1 Practical Experience with IFCC
+We modiﬁed the Chromium build scripts to build under
+LTO as much of the code as possible. It built 128 ﬁles as
+x86-64 ELF objects, and 11,012 ﬁles as LLVM IR. We
+
+USENIX Association  
+
+23rd USENIX Security Symposium  947
+
+7
+
+then applied, separately, the Single and Arity versions of
+IFCC in this conﬁguration.
+
+Like VTV, IFCC suffers from false positives due to
+external code. In particular, any function that was not de-
+ﬁned or declared during link-time optimization will trig-
+ger a CFI violation. This can happen for several reasons.
+First, JIT code (like JavaScript engines) can generate func-
+tions dynamically. Second, some external functions (like
+dlsym or sigaction) can return external function point-
+ers. Finally, some functions can be passed to external
+libraries and can be called there with external function
+pointers; this is common in graphics libraries like gtk.
+The number of false positives varies greatly depending on
+the external code, ranging from extremely frequent in the
+case of JIT-generated code to extremely infrequent in the
+case of signal handlers.
+
+To handle function pointers returned by external code,
+we added a ﬁxed-size set of special functions to the be-
+ginning of each table. These functions perform indirect
+jumps through function pointers stored in an array. IFCC
+rewrites all calls to external functions (including dlsym)
+that return function pointers and inserts a function call
+that takes the pointer and writes it to the array if it is not
+already present. It returns a pointer to the table entry that
+corresponds to the array entry used to store the pointer. If
+the array has no more space, then it halts the program with
+an error. This converts function pointers from external
+code into table entries at the expense of adding a small
+number of writable function pointers to the code. This
+memory can be protected using the techniques described
+in Section 3.4, though the prototype in this paper does not
+perform this protection.
+
+To handle functions passed to external functions, IFCC
+must ﬁnd all cases in which functions are passed to exter-
+nal code and must rewrite the functions to not test their
+function pointers against the jump tables generated by
+IFCC. We added a ﬂag to the IFCC plugin that takes
+the name of a function to skip in rewriting. To discover
+these function pointers, we added a warning mode to the
+IFCC transformation that prints at run time the names of
+functions that make indirect calls to functions outside the
+function-pointer sets. We found 255 such functions in
+Chromium, mostly associated with graphics libraries.
+4.2 Annotations
+The version of IFCC described in this section provides
+automatic methods for discovering and handling false
+positives. To improve maintainability of software with
+IFCC, however, we have implemented a different version
+that uses annotations instead of compile-time ﬂags and
+uses custom failure functions like VTV. This is the version
+that we are working on upstreaming into LLVM.
+
+Instead of functions being forced into the appropriate
+jump table, they are checked using the same code se-
+
+quences as above, and any pointer that fails the check
+is passed to a custom failure function. IFCC’s default
+failure function prints out the name of the function in
+which the failure occurred, and the value of the pointer
+that failed the check. This version of IFCC adds a compar-
+ison, a jump, and function call to the inserted instruction
+sequence. However, it gives greater ﬂexibility to the re-
+sulting code in handling false positives, as discussed for
+VTV.
+
+This new implementation provides annotations and a
+simple interprocedural dataﬂow analysis to help detect
+and handle these problems automatically. We provide
+two annotations that programmers can add using attribute
+notation: __attribute__((annotate())).
+
+• cfi-maybe-external is applied to local vari-
+ables/parameters as well as to pointers in data struc-
+tures.
+
+• cfi-no-rewrite is applied to functions.
+The dataﬂow analysis in IFCC ﬁnds external func-
+tion pointers and traces their ﬂow into indirect calls
+and into store instructions. It also traces the ﬂow from
+cfi-maybe-external-annotated pointers and other
+variables into indirect calls and store instructions. It pro-
+duces compile-time warnings if it ﬁnds a store instruction
+for an external function pointer and the pointer in the
+store instruction did not come from a location annotated
+by cfi-maybe-external. The annotations then can be
+used as a kind of whitelist in the CFI failure function, or
+these indirect calls can be skipped in rewriting.
+
+The annotation cfi-no-rewrite means that all in-
+direct calls in the annotated function might use external
+function pointers. The information from this annotation
+can be used either to build a whitelist or to skip rewriting.
+Our implementation currently skips rewriting for these
+indirect calls.
+
+These annotations are also useful for cases that IFCC
+cannot detect, like callbacks buried deep inside data struc-
+tures passed to external code. Calls to these functions will
+generate CFI violations at run time; these violations are
+false positives, and the locations of these indirect calls
+can be annotated with, e.g., cfi-maybe-external to
+indicate this to the CFI failure function.
+
+It might seem like all an adversary has to do is to
+ﬁnd one of the locations that has been annotated with
+cfi-maybe-external and overwrite a pointer that
+ﬂows into it, and this will defeat IFCC. However, these
+annotations merely convey information to the CFI failure
+function; this function can perform arbitrarily complex
+checks make sure that function pointers that violate CFI
+are still valid. For the purposes of our evaluation, we im-
+plemented a simple failure function, as described above.
+
+948  23rd USENIX Security Symposium 
+
+USENIX Association
+
+8
+
+5 FSan: Indirect-Call-Check Analysis
+The more precise the control-ﬂow graph used in a CFI
+implementation, the harder it becomes for an attacker
+to exploit a program while staying within CFI-enforced
+bounds: a more precise CFG leads to fewer choices in
+targets for indirect control-transfer instructions. However,
+building a precise CFG is a hard problem, and program-
+ming techniques like function-pointer type punning and
+runtime polymorphism exacerbate this problem. Every
+time a CFI mechanism faces uncertainty, it is forced to
+be conservative to preserve correctness. Although this
+strategy guarantees correctness, it may result in a loss of
+security. Thus, techniques that reduce uncertainty about
+the CFG can increase security. We can achieve the best
+practical results by combining knowledge of program-
+ming language constructs (such as vtables), static analy-
+sis (such as we do for IFCC), and dynamic analysis. To
+that end, we designed FSan—an optional indirect call
+checker—and integrated it into Clang, LLVM’s front end.
+Clang’s undeﬁned behavior sanitizer (UBSan) instru-
+ments C and C++ programs with checks to identify in-
+stances of undeﬁned behavior. FSan was added to UBSan
+in LLVM 3.4. FSan detects CFI violations at runtime for
+indirect function calls.2 FSan operates during the transla-
+tion from the Clang AST to LLVM IR, so it has full access
+to type information, allowing it to make more accurate
+checks than IFCC, which uses IR alone.
+
+FSan is a developer tool designed to perform optional
+type checking.
+In particular, it is not designed to de-
+fend against attacks. Instead, it is designed to be used
+by developers to identify CFI violations that may lead
+to security issues. As a fully accurate checker (it checks
+deﬁnedness exactly according to the deﬁnition in the C++
+standard), it can also be used to help guide the develop-
+ment of control-ﬂow integrity techniques by identifying
+properties of interest to be checked in the ﬁeld.
+
+FSan preﬁxes each function emitted by the compiler
+with 8 (on x86-32) or 12 (on x86-64) bytes of metadata.
+Table 1 shows the layout of these bytes; they are exe-
+cutable and cost little in performance, since the ﬁrst two
+bytes encode a relative branch instruction which skips the
+rest of the metadata. The next two bytes encode the in-
+structions rex.RX push %rsp (on x86-64) or incl
+%esi ; pushl %esp (on x86-32); this sequence of
+instructions is unlikely to appear at the start of a non-
+instrumented function body, and we observed no false
+positives in Chromium due to this choice of preﬁx.
+
+Each indirect call site ﬁrst loads the ﬁrst four bytes
+from the function pointer, and compares it to the expected
+signature — the optionality of FSan arises from selecting
+a signature unlikely but permitted to appear at the start of
+
+2The undeﬁned behavior sanitizer also includes a vtable-pointer
+
+checker which is not described here.
+
+Kind
+
+Signature
+
+Offset
+0
+1
+2
+3
+
+RTTI
+
+4
+
+Interpretation
+
+‘F’
+‘T’
+
+jmp .+0x08/0x0c
+
+Data
+0xeb
+0x06/0x0a
+0x46
+0x54
+Pointer to std::type_info for the
+function’s type (4/8 bytes)
+
+Table 1: Function preﬁx data layout for the optional func-
+tion type checker.
+
+an uninstrumented function. Because GCC at optimiza-
+tion level -O2 and higher and Clang at any optimization
+level will align functions to 16 bytes, this initial read suc-
+ceeds for each function compiled with these compilers,
+regardless of the length of the function. This assumes
+GCC-compiled system libraries are compiled with -O2 or
+higher.
+
+If the signature matches, then the next 4 or 8 bytes
+are loaded and compared against the expected function
+Run-Time Type Information (RTTI) pointer, which is
+simply the RTTI pointer for the function type of the callee
+expression used at the call site. If the pointers are unequal,
+then a runtime function is called to print an appropriate
+error message. A pointer equality test is sufﬁcient because
+the function RTTI pointer for a particular function type is
+normally unique. This is because the linker will normally
+(but not always) coalesce RTTI objects for the same type,
+as they have the same mangled name.
+
+The condition for undeﬁned behavior as speciﬁed by
+the C++ standard is that the function types do not match
+(see C++11 [18, expr.reinterpret.cast], “The effect of call-
+ing a function through a pointer to a function type [...]
+that is not the same as the type used in the deﬁnition of the
+function is undeﬁned”), so FSan is precise (no false posi-
+tives or false negatives) with respect to this paragraph of
+the standard when both the caller and callee are compiled
+with the checker (provided that the linker coalesces RTTI
+symbols). However, FSan has not been implemented for
+C, and indeed would not work in its present form, mainly
+because the C rules relating to the deﬁnedness of calls to
+functions without a prototype are more complex.
+
+Note that the RTTI pointer for a vtable function call
+is less precise than the vtable-pointer set check in VTV.
+FSan checks that each function has the correct type but
+not whether it was in the original program’s CFG.
+5.1 Practical Experience with FSan
+We evaluated FSan by applying it to Chromium: we ran an
+instrumented version of the main browser executable, and
+FSan produced a variety of undeﬁned-behavior reports.
+Two of the main categories of reports we observed were:
+• Template functions whose parameters are of a tem-
+plated pointer type, which are cast to functions
+whose parameters are of void pointer type so that
+they can be used as untyped callbacks;
+
+USENIX Association  
+
+23rd USENIX Security Symposium  949
+
+9
+
+• Functions that take context parameters as typed
+pointers in the function declaration but void pointers
+or pointers to a base class at the call site.
+
+The ﬁx for these types of bugs is simple in principle:
+give the parameters a void pointer type and move the
+casts into the function body. One instance of each type
+of problem was found and ﬁxed in the Skia graphics li-
+brary that Chromium uses. This eliminated much of the
+low-hanging fruit reported by FSan; most of the remain-
+ing problems were more widespread in the codebase and
+thus will take more effort to deal with. For example, V8
+uses callbacks to implement a feature known as “reviv-
+able objects” which Blink (née WebKit) relies on heavily;
+in many cases these callbacks were implemented using
+the derived types expected by the object implementation,
+rather than V8’s base value type.
+6 Security Analysis
+In order to evaluate the efﬁcacy of security techniques it
+is important to apply them to the real-world code they are
+expected to protect and measure the impact. To this end,
+we analyzed Chromium compiled with VTV and GCC,
+and with IFCC and Clang.
+
+One consequence of implementing security mecha-
+nisms in the compiler is that it is important to evaluate the
+ﬁnal output rather than simply the output of the particular
+compiler pass. The reasons for this are twofold: (1) later
+optimization passes may transform the security mecha-
+nism in unpredictable ways; and (2) the ﬁnal linking step
+adds additional binary code to the ﬁnal executable that
+the security pass never sees.
+
+Basic optimizations such as common-subexpression
+elimination and loop-invariant code motion can elim-
+inate redundant checks or hoist checks out of loops.
+Although such optimizations are generally acceptable
+from a correctness point of view, they may be imper-
+missible from a security standpoint. For example, con-
+sider two consecutive calls to C++ member functions
+obj.foo(); obj.bar();. A security mechanism that
+protects virtual function calls, such as VTV, can load a
+vtable pointer into a callee-saved register, perform the
+veriﬁcation, and then perform the two calls:
+
+movq
+movq
+callq
+movq
+callq
+movq
+callq
+
+(%r12), %rbx ; set rbx to the vptr
+%rbx, %rdi
+verify_vtable ; verify_vtable(vptr)
+%r12, %rdi
+*16(%rbx)
+%r12, %rdi
+*24(%rbx)
+
+; obj.foo()
+
+; obj.bar()
+
+This is perfectly correct behavior since the ﬁrst function
+call is guaranteed by the platform ABI to preserve the
+value of the register. However, if rbx is spilled to the
+stack in foo() and is later overwritten, e.g., via a buffer
+overﬂow on the stack, then the call to bar() will be to
+
+an attacker-controlled location. An alternative to using a
+callee-saved register is to explicitly spill/reload the regis-
+ter to/from the stack, which has similar security concerns.
+Since protecting the stack is outside the scope of this
+work, the compiler has signiﬁcantly more freedom to
+eliminate this sort of redundant check.
+
+Although it is difﬁcult to meaningfully quantify the
+security provided by a mitigation measure, recent work
+by Zhang and Sekar [35, Deﬁnition 1] introduced the
+Average Indirect-target Reduction (AIR) metric
+
+AIR =
+
+1
+n
+
+n(cid:31)i=1(cid:30)1−
+
+Ti
+
+S(cid:29)
+
+where n is the number of indirect control-transfer instruc-
+tions (indirect calls, jumps, and returns), Ti is the number
+of instructions the ith indirect control transfer instruction
+could target after applying a CFI technique, and S is the
+size of the binary.
+
+It’s clear that for any reasonable CFI technique and
+a large binary, Ti (cid:29) S for all indirect control-transfer
+instructions transformed by the technique. Similarly, Ti ≈
+S for all other indirect control-transfer instructions. So,
+AIR reduces to the fraction of indirect control transfer
+instructions that are protected by the technique.3
+
+Since we are focused on protecting forward edges, we
+consider the related metric forward-edge AIR, or fAIR,
+which performs the same computation as AIR, but the av-
+erage is taken only over the forward-edge indirect control
+transfer instructions: indirect calls and jumps.
+
+To compute the statistics reported in the rest of this
+section, we modiﬁed LLVM’s object-ﬁle disassembler
+to perform a hybrid recursive and linear scan through
+the Chromium binary, reconstructing functions and ba-
+sic blocks on which we performed our analysis. This
+process was aided by ensuring that Chromium was com-
+piled with debugging information including symbols (cf.
+Bao et al. [2]). This disassembler was used as part of a
+stand-alone tool to ﬁnd all indirect control transfer instruc-
+tions. For each such instruction, the tool walks backward
+through the CFG, looking for the speciﬁc protection mech-
+anism. It also attempts to ﬁnd constants which are inserted
+into registers used for the call or jump. See Table 2 for
+a break down of forward-edge indirect control transfer
+(fICT) instructions in Chromium.
+VTV. Compiling a recent version of Chromium using
+GCC with vtable veriﬁcation leads to a ﬁnal binary con-
+taining 124,325 indirect calls and 18,453 indirect jumps
+for a total of 142,778 fICT instructions. Of these, 6,855
+are neither constant nor protected by vtable veriﬁcation,
+giving fAIRVTV = 95.2%. The majority of the unprotected
+3This demonstrates that AIR — and our related fAIR — is at best a
+weak proxy for measuring security. Unfortunately, an actual metric for
+the security a CFI technique provides has thus far remained elusive.
+
+950  23rd USENIX Security Symposium 
+
+USENIX Association
+
+10
+
+fICT
+Constant
+Constant, spilled†
+Protected
+Protected, spilled†
+Unprotected
+Total
+
+VTV
+7,410
+7,334
+113,617
+7,562
+6,855
+142,778
+
+IFCC
+5,957
+315
+154,244
+33,914
+908
+195,338
+
+Table 2: Forward-edge indirect control transfer (fICT)
+instructions in Chromium. Their arguments may be placed
+in three classes: (a) a type of constant, (b) an indirect
+address protected by CFI, and (c) an unprotected address.
+Constant-argument instructions include indirect jumps in
+the PLT which target a read-only GOT section and indirect
+jump instructions implementing switch statements, as well
+as indirect call instructions with constant targets.
+† The targets for these indirect control transfer instructions
+are either spilled to the stack explicitly or are in callee-
+saved registers which are potentially spilled by intervening
+function calls.
+
+fICTs come from C libraries, function-pointer adapter
+classes, and C-style callbacks.
+
+Although more than 89% of the protected or constant
+fICTs are used almost immediately after being veriﬁed
+or loaded from read-only memory, in 14,896 instances
+(about 10%), the indirect target is potentially spilled to
+the stack. But this is not a ﬂaw in our protection (see
+below).
+IFCC. Compiling the same version of Chromium using
+Clang with IFCC (Single) produces a different binary con-
+taining 175,396 indirect calls and 19,942 indirect jumps
+for a total of 195,338 fICT instructions. Having more
+calls and jumps is what we would expect since the link-
+time optimizer has more inlining opportunities than is the
+case when optimizing one translation unit at a time.4
+
+Since IFCC is designed to protect all fICT instruc-
+tions, not just C++ virtual member function calls, only
+908 fICT instructions are left unprotected. This gives
+fAIRIFCC = 99.5%. In fact, this is an over estimate of
+the number of unprotected fICT instructions. Of the 908
+unprotected instructions, 512 correspond to the special
+functions created for function pointers returned from non-
+instrumented functions. Discounting those gives the more
+accurate value of fAIRIFCC = 99.8%. Most of the remain-
+ing unprotected fICT instructions correspond to functions
+which are explicitly not instrumented. (See Section 4.1
+for a discussion of both of these.) The remaining hand-
+ful come from the C run time statically linked into every
+binary.
+
+With IFCC, about 18% of the constant or protected
+fICTs have targets which are potentially spilled to the
+
+4There is a corresponding decrease in the number of return instruc-
+
+tions for the same reason.
+
+stack. However this is not a fatal ﬂaw, as discussed im-
+mediately below, since we are assuming that the stack is
+protected by some other means.
+Stack spilling implications. For the purpose of our
+techniques, spilling target values to the stack introduces
+no additional security risk, since an attacker who can over-
+write one value on the stack can easily overwrite a saved
+return address. This does have serious implications for
+CFI schemes that attempt to protect backward edges.
+
+Our experience shows the importance of verifying a
+protection mechanism’s intended invariants on the ﬁnal bi-
+nary output after all optimizations, including architecture-
+dependent optimization in the compiler backend, have
+taken place and the language runtime has been linked in.
+Counting ROP gadgets.
+It is common in CFI papers
+to count the number of return-oriented programming gad-
+gets that remain after applying the protection mechanism.
+Since we are explicitly not protecting return instructions,
+it does not make sense to count gadgets.
+7 Performance Measurements and Results
+We measured the performance of our approaches both
+on the C++ tests from the SPEC CPU2006 benchmark
+suite and on the Chromium browser running Dromaeo,
+SunSpider, and Octane. Except where otherwise speciﬁed,
+the VTV tests were run all on an HP Z620 Xeon E52690
+2.9GHz machine, running Ubuntu Linux 12.04.2, and the
+IFCC and FSan tests were run on an HP Z620 Xeon E5550
+2.67GHz machine, running the same OS. We turned off
+turbo mode and ASLR on these machines, as doing so
+signiﬁcantly reduced the variation in our results.
+
+The Chromium web browser is a large, complex, real-
+world application, comprising over 15 million lines of
+C++ code in over 50,000 source ﬁles, and containing hun-
+dreds of thousands of virtual calls. It links in many third-
+party libraries and makes extensive use of dynamic library
+loading. It is also representative of the type of target at-
+tackers are interested in. For all these reasons, Chromium
+makes an excellent test for measuring the effects of our
+CFI approaches on real-world systems. Both VTV and
+IFCC were able to successfully build fully-functional,
+protected versions of Chromium.
+7.1 VTV Performance
+Since veriﬁcation adds instructions to the execution, some
+performance penalty is unavoidable.
+Initially, we ran
+SPEC CPU2006 C++ benchmarks with and without VTV
+to get a baseline. Table 3 shows that omnetpp, astar, and
+xalancbmk suffer a noticeable performance penalty in
+this naive implementation, ranging from 2.4% to 19.2%.
+We improve on this later. The other four benchmarks
+(povray, namd, soplex, and dealII) showed no signiﬁcant
+performance effects. To determine why, we collected
+statistics on those benchmarks, for both compile-time
+
+USENIX Association  
+
+23rd USENIX Security Symposium  951
+
+11
+
+Test
+omnetpp
+astar
+xalanc.
+namd
+dealII
+soplex
+povray
+
+no VTV
+(seconds)
+320.70
+440.61
+248.86
+445.19
+344.89
+235.20
+181.18
+
+VTV
+
+(seconds)
+346.42
+450.95
+296.53
+445.32
+348.39
+236.46
+181.87
+
+%
+slowdown
+8.0
+2.4
+19.2
+*
+*
+*
+*
+
+Table 3: Untuned SPEC run-time numbers, at -O2. The
+asterisks indicate changes that are too small to be of any
+signiﬁcance. These numbers are the minimum out of three
+runs (standard deviation is very close to zero).
+
+virtual
+calls
+(static)
+2
+2,118
+720
+159
+1,312
+2
+15,753
+
+veriﬁed
+calls
+(dynamic)
+0
+201,867,094
+4,846,399
+159,186
+1,029,110,532
+2,780,359,179
+2,629,817,426
+NA 6,705,708,649
+113,037,194
+NA
+NA
+27,068,246
+
+run
+time
+(secs)
+445.32
+348.39
+236.46
+181.87
+346.42
+450.95
+296.53
+2379.34
+66.41
+16.36
+
+veriﬁed
+calls
+per second
+0
+579,428
+20,496
+875
+2,970,702
+6,165,560
+8,868,639
+2,818,303
+1,702,214
+1,654,943
+
+Test
+namd
+dealII
+soplex
+povray
+omnetpp
+astar
+xalanc.
+dromaeo
+octane
+sunspi.
+
+Table 4: Veriﬁcations per second when running SPEC
+CPU2006 C++ benchmarks and Chrome with VTV.
+
+(static) and run-time (dynamic) numbers of veriﬁed virtual
+calls. From this we calculated the number of veriﬁed calls
+per second. As shown at the top of Table 4, those tests do
+not perform enough calls per second to noticeably affect
+performance, so we did not include them in any further
+analyses of VTV.
+
+Next, we looked at reducing VTV’s performance
+penalty. To determine the minimum lower bound penalty,
+we considered two sources of performance overhead: (1)
+the cost of making the veriﬁcation function calls; and (2)
+the (potential) cost due to the overall increase in code size
+(code bloat). We measured these by doing two experi-
+ments on the three SPEC benchmarks of interest. First,
+we replaced the bodies of the functions in libvtv with
+stubs. Second, we inserted an unreachable region of code
+preceded by an unconditional jump over the region just be-
+fore each virtual call instruction (the unreachable region
+represented the code that would be inserted by VTV). Our
+results can be seen in Table 5. Note that making calls with
+stubs must increase the number of instructions, just as
+with the code bloat test. Therefore the stubs penalty auto-
+matically includes the code bloat penalty. This shows that
+
+Code Bloat
+
+VTV Stubs
+% Slowdown % Slowdown
+2.4
+1.0
+4.7
+
+0.0
+0.2
+0.8
+
+omnetpp
+astar
+xalancbmk
+
+Table 5: Results of lower bound experiments for VTV.
+
+even if we could reduce to zero the time spent executing
+inside the veriﬁcation function, the minimum lower bound
+VTV penalty for these tests ranges from 1.0% to 4.7%.
+Note that the lower bound is test-speciﬁc and depends on
+the number of virtual calls a test executes.
+
+We then tried various options to reduce VTV’s perfor-
+mance penalties. The two most effective options were:
+using proﬁle guided optimizations (PGO) to improve de-
+virtualization, via GCC’s -ripa ﬂag, thus reducing the over-
+all number of virtual calls; and statically linking libvtv
+itself, to reduce the level of indirection at each veriﬁca-
+tion call. We re-ran the SPEC benchmarks using these
+various options, and the results are shown at the top of
+Figure 2. The xalancbmk test had the worst performance
+with VTV, so it is instructive to consider its results under
+optimization: devirtualization brought the performance
+penalty from 19.2% down to 10.8%, and static linking
+reduced it further to 8.7%. The lower bound of VTV is
+4.7% for xalancbmk (see Table 5).
+
+Chrome interacts with many system libraries, so to
+avoid the problems of mixing veriﬁed and unveriﬁed
+code with VTV we built and ran a veriﬁed version of
+Chrome in a veriﬁed version of ChromeOS on a Chrome-
+book (thus building all the libraries with veriﬁcation
+as well). We built ChromeOS version 28 with VTV,
+and ran the Dromaeo, SunSpider 1.0.2, and Octane 2.0
+benchmarks with it. For these tests, we loaded our im-
+ages onto a Chromebook with an Intel Celeron 867 chip,
+pinned at 1.3GHz, with ASLR turned off, and we ran
+the tests there, with and without VTV. The bottom of
+Figure 2 shows the performance costs. We were not
+able to build Chrome with PGO and devirtualization, nor
+with the statically linked libvtv, so for these measure-
+ments we only have the naive, untuned VTV numbers.
+For Octane we saw a 2.6% penalty with VTV. SunSpi-
+der had a 1.6% penalty. Dromaeo had a fair amount of
+variation across the full set of micro-benchmarks, but
+the overall performance penalty across all of them was
+8.4%. We expect that adding devirtualization would sig-
+niﬁcantly improve these numbers. As with the SPEC
+benchmarks, the performance penalty varies depending
+on the number of veriﬁed calls made at runtime. We
+measured this for each of these tests (see Table 4). As
+expected, Dromaeo, which had the largest penalty, makes
+signiﬁcantly more veriﬁed calls/second than the other
+two.
+
+952  23rd USENIX Security Symposium 
+
+USENIX Association
+
+12
+
+Stubs
+
+VTV+Devirt+Static
+
+VTV+Devirt.
+Plain VTV
+
+astar
+
+omnetpp
+
+xalanc.
+
+dromaeo
+
+sunsp.
+
+octane
+
+-2% 0%
+
+4%
+
+8%
+
+12% 16% 20%
+
+Figure 2: Relative performance overhead of VTV, with
+various tuning options, for the SPEC 2006 C++ bench-
+marks and for Chrome browser.
+
+IFCC and FSan Performance
+
+7.2
+The performance of code compiled under IFCC depends
+on how often it makes indirect calls. IFCC adds code to
+every indirect call site that is not explicitly skipped by a
+command-line directive. The amount of code it adds de-
+pends on the version of IFCC: if tables are small enough
+to ﬁt in a page in memory, then it can use the transforma-
+tion that adds only two instructions (comprising 14 bytes)
+to each site. Otherwise, it uses the subtraction version,
+which adds 4 instructions (which become 20 bytes). Each
+indirect call has additional extra overhead from the jmp in
+the indirect call table(s); and jumps through a table might
+have effects on instruction-cache usage. Finally, when
+rewritten code receives a pointer from dlsym or from a
+dynamically-linked library, this pointer is wrapped using
+linear search through a ﬁxed-length array; this is a slow
+operation but should not happen often.
+
+The exact instructions added by FSan depend on the
+speciﬁc optimization level used, but we found that it usu-
+ally adds about 12 instructions to each call site.
+
+Figure 3 shows results from running C++ programs
+from the SPEC benchmark suite under IFCC and FSan
+and provides relative performance overhead compared to
+an optimized version compiled using Clang; each running
+time is the minimum of 10 executions. As expected,
+LTO outperforms both IFCC transformations in most
+cases. This is because IFCC adds instructions to the
+base LTO-compiled binary, and these instructions reduce
+performance of the executable. The cases in which IFCC
+outperforms LTO involve only small differences in per-
+formance and are likely due to effects similar to the noise
+discussed by Mytkowicz et al. [24], so we do not analyze
+them further here.
+
+We ran the Dromaeo benchmark on Chromium
+31.0.1650.41 built with Clang LTO, a version built with
+IFCC Single, and a version built with IFCC Arity. Single
+got 96.6% of the LTO score, and Arity got 96.1%; higher
+
+is better in Dromaeo, so this is about a 4% overhead, as
+shown in Figure 3a. We also built a version of Chromium
+and the SPEC CPU2006 benchmarks with the annotation
+version of IFCC, and we saw similar results.
+
+IFCC had nearly the same performance as LTO for
+both Single and Arity versions of the SPEC CPU2006
+benchmarks, except for xalancbmk. FSan had effects sim-
+ilar to IFCC. The xalancbmk benchmark suffers the most
+performance degradation from IFCC; this is expected due
+to it having the most dynamic virtual calls, as shown in
+Table 4. Similarly, Dromaeo has a large number of virtual
+calls and has the second highest overhead. So, as with
+VTV, the performance overhead is directly related to the
+number of indirect calls.
+7.3 Comparison to Prior Work
+The SPEC Perl benchmark is worth highlighting. As Niu
+and Tan [28] point out, Perl is, in some sense, a worst
+case for CFI techniques for C — whereas C++ code can be
+even worse. Perl operates by translating the source code
+into bytecode, then sits in a tight loop, interpreting each
+instruction by making an indirect call. This worst case
+behavior is apparent in the performance of four recent CFI
+implementations: CCFIR by Zhang et al. [34], bin-CFI by
+Zhang and Sekar [35], Strato by Zeng et al. [33], and MIP
+by Niu and Tan [28]. The overheads reported for CCFIR,
+bin-CFI, Strato, and MIP are 8.6%, 12%, 15%–25%, and
+14.9%–31.3%, respectively.
+
+In contrast, our own work has less than 2% overhead
+(see Figure 3a). We are able to achieve this signiﬁcant
+speed up over prior work by focusing only on forward
+edges as well as leveraging the compiler to apply opti-
+mizations. This gives different security guarantees, but
+we believe our attack model comports well with reality.
+8 Conclusions
+This paper advances the techniques of Control-Flow In-
+tegrity, moving them from research prototypes to being
+ﬁrmly in the domain of the practical. We have described
+two different principled, compiler-based CFI solutions
+for enforcing control-ﬂow integrity for indirect jumps:
+vtable veriﬁcation for virtual calls (VTV) guarantees that
+the vtable being used for a virtual call is not only a valid
+vtable for the program but is semantically correct for
+the call site; and indirect function-call checking (IFCC)
+guarantees that the target of an indirect call is one of the
+address-taken functions in the program. We also present
+FSan, an optional indirect call checking tool which ver-
+iﬁes at runtime that the target of an indirect call has the
+correct function signature, based on the call site.
+
+We have demonstrated that each of these approaches is
+feasible by implementing each one in a production com-
+piler (GCC or LLVM). We have shown via security analy-
+sis that VTV and IFCC both maintain a very high level
+
+USENIX Association  
+
+23rd USENIX Security Symposium  953
+
+13
+
+astar
+dealII
+namd
+omnet.
+povray
+soplex
+xalanc.
+perlbench
+dromaeo
+
+Single
+Arity
+
+astar
+dealII
+namd
+omnet.
+povray
+soplex
+xalanc.
+
+FSan
+
+-2% 0% 2% 4% 6%
+
+(a) Relative overhead of IFCC enforcement (baseline LLVM
+LTO) for SPEC CPU2006 benchmarks and the Dromaeo bench-
+mark.
+
+-2% 0% 2% 4% 6% 8%
+
+(b) Relative overhead of the FSan optional indirect-call checking
+(baseline Clang) for the C++ benchmarks in SPEC CPU2006.
+
+Figure 3: Performance measurements for IFCC and FSan.
+
+of security, with VTV protecting 95.2% of all possible in-
+direct jumps in our test, and IFCC protecting 99.8%. We
+have also measured the performance of these approaches
+and shown that while there is some degradation, averag-
+ing in the range of 1%–4%, and in the worst case getting
+up to 8.7% for VTV (the most precise approach), this
+penalty is fairly low and seems well within the range of
+what is acceptable, particularly in exchange for increased
+security.
+
+Due to our relaxed, yet realistic, attack model coupled
+with compiler optimizations, we achieve signiﬁcant per-
+formance gains over other CFI implementations while
+defending against real attacks.
+
+References
+
+[1] M. Abadi, M. Budiu, Ú. Erlingsson, and J. Ligatti.
+Control-ﬂow integrity: Principles, implementations,
+and applications. ACM Trans. Info. & System Secu-
+rity, 13(1):4:1–4:40, Oct. 2009.
+
+[2] T. Bao, J. Burket, and M. Woo. BYTEWEIGHT:
+Learning to recognize functions in binary code. In
+Proceedings of USENIX Security 2014, Aug. 2014.
+[3] J. Caballero, G. Grieco, M. Marron, and A. Nappa.
+Undangle: Early detection of dangling pointers in
+use-after-free and double-free vulnerabilities.
+In
+Proceedings of ISSTA 2012, July 2012.
+
+[4] N. Carlini and D. Wagner. Rop is still danger-
+ous: Breaking modern defenses. In Proceedings
+of USENIX Security 2014, Aug. 2014.
+
+[5] M. Castro, M. Costa, J.-P. Martin, M. Peinado,
+P. Akritidis, A. Donnelly, P. Barham, and R. Black.
+Fast byte-granularity software fault isolation.
+In
+
+Proceedings of SOSP 2009, Oct. 2009.
+
+[6] S. Checkoway, L. Davi, A. Dmitrienko, A.-R.
+Sadeghi, H. Shacham, and M. Winandy. Return-
+oriented programming without returns. In Proceed-
+ings of CCS 2010, pages 559–572. ACM Press,
+Oct. 2010. URL https://cs.jhu.edu/~s/
+papers/noret_ccs2010.html.
+
+[7] C. Cowan, C. Pu, D. Maier, J. Walpole, P. Bakke,
+S. Beattie, A. Grier, P. Wagle, and Q. Zhang. Stack-
+Guard: Automatic adaptive detection and preven-
+tion of buffer-overﬂow attacks. In Proceedings of
+USENIX Security 1998, Jan. 1998.
+
+[8] “d0c_s4vage”. Insecticides don’t kill bugs, Patch
+Tuesdays do. Online: http://d0cs4vage.
+blogspot.com/2011/06/insecticides-
+dont-kill-bugs-patch.html, June 2013.
+[9] L. Davi, A. Dmitrienko, M. Egele, T. Fischer,
+T. Holz, R. Hund, S. Nürnberger, and A.-R. Sadeghi.
+MoCFI: A framework to mitigate control-ﬂow at-
+tacks on smartphones.
+In Proceedings of NDSS
+2012, Feb. 2012.
+
+[10] L. Davi, D. Lehmann, A.-R. Sadeghi, and F. Mon-
+rose. Stitching the gadgets: On the ineffectiveness of
+coarse-grained control-ﬂow integrity protection. In
+Proceedings of USENIX Security 2014, Aug. 2014.
+[11] A. Edwards, A. Srivastava, and H. Vo. Vulcan: Bi-
+nary transformation in a distributed environment.
+Technical Report MSR-TR-2001-50, Microsoft Re-
+search, Apr. 2001.
+
+[12] Ú. Erlingsson, M. Abadi, M. Vrable, M. Budiu, and
+G. Necula. XFI: Software guards for system address
+
+954  23rd USENIX Security Symposium 
+
+USENIX Association
+
+14
+
+spaces. In Proceedings of OSDI 2006, pages 75–88,
+Nov. 2006.
+
+[13] Ú. Erlingsson, Y. Younan, and F. Piessens.
+Low-level software security by example.
+In
+P. Stavroulakis and M. Stamp, editors, Handbook
+of Information and Communication Security, pages
+633–658. Springer Berlin Heidelberg, 2010.
+
+[14] C. Evans. Exploiting 64-bit linux like a boss.
+http://scarybeastsecurity.
+
+Online:
+blogspot.com/search?q=Exploiting+
+64-bit+linux, 2013.
+
+[15] E. Gökta¸s, E. Athanasopoulos, H. Bos, and G. Por-
+tokalidis. Out of control: Overcoming control-ﬂow
+integrity.
+In Proceedings of the 34th IEEE Sym-
+posium on Security and Privacy (Oakland), May
+2014.
+
+[16] E. Gökta¸s, E. Athanasopoulos, M. Polychronakis,
+H. Bos, and G. Portokalidis. Size does matter: Why
+using gadget-chain length to prevent code-reuse at-
+tacks is hard. In Proceedings of USENIX Security
+2014, Aug. 2014.
+
+[17] Google Developers.
+
+On-
+line: https://developers.google.com/
+native-client/, 2013.
+
+Native client.
+
+[18] ISO. ISO/IEC 14882:2011 Information technology
+— Programming languages — C++. International
+Organization for Standardization, Geneva, Switzer-
+land, Feb. 2012.
+
+[19] D. Jang, Z. Tatlock, and S. Lerner. SAFEDISPATCH:
+Securing C++ virtual calls from memory corruption
+attacks.
+In Proceedings of NDSS 2014. Internet
+Society, Feb. 2014. To appear.
+
+[20] K. Kortchinsky.
+
+10 years
+
+later, which
+Online:
+
+still matter?
+
+vulnerabilities
+http://ensiwiki.ensimag.fr/
+images/e/e8/GreHack-2012-talk-
+Kostya_Kortchinsky_Crypt0ad_-
+10_years_later_which_in_memory_
+vulnerabilities_still_matter.pdf,
+2012.
+
+[21] G. Morrisett, G. Tan, J. Tassarotti, J.-B. Tristan, and
+E. Gan. Rocksalt: better, faster, stronger SFI for the
+x86. In Proceedings of PLDI 2012, pages 395–404,
+June 2012.
+
+[22] Mozilla
+
+Foundation.
+
+Mozilla
+
+tion security advisory 2013-29.
+https://www.mozilla.org/security/
+announce/2013/mfsa2013-29.html,
+2013.
+
+Founda-
+Online:
+
+[23] MWR InfoSecurity. Pwn2Own at CanSecWest 2013.
+Online: https://labs.mwrinfosecurity.
+com/blog/2013/03/06/pwn2own-at-
+cansecwest-2013, 2013.
+
+[24] T. Mytkowicz, A. Diwan, M. Hauswirth, and
+P. Sweeney. Producing wrong data without doing
+anything obviously wrong! In Proceedings of ASP-
+LOS 2009, Mar. 2009.
+
+[25] NIST.
+
+CVE-2010-0249.
+
+Online: https:
+
+//web.nvd.nist.gov/view/vuln/
+detail?vulnId=CVE-2010-0249, 2010.
+
+[26] NIST.
+
+CVE-2010-3971.
+
+Online: https:
+
+//web.nvd.nist.gov/view/vuln/
+detail?vulnId=CVE-2010-3971, 2010.
+
+[27] NIST.
+
+CVE-2011-1255.
+
+Online: https:
+
+//web.nvd.nist.gov/view/vuln/
+detail?vulnId=CVE-2011-1255, 2011.
+
+[28] B. Niu and G. Tan. Monitor integrity protection
+with space efﬁciency and separate compilation. In
+Proceedings of CCS 2013, Nov. 2013.
+
+[29] J. Pewny and T. Holz. Control-ﬂow restrictor:
+In Proceedings of
+
+Compiler-based CFI for iOS.
+ACSAC 2013, Dec. 2013.
+
+[30] R. Roemer, E. Buchanan, H. Shacham, and S. Sav-
+age. Return-oriented programming: Systems, lan-
+guages, and applications. ACM Trans. Info. & Sys-
+tem Security, 15(1), Mar. 2012.
+
+[31] Z. Wang and X. Jiang. HyperSafe: A lightweight
+approach to provide lifetime hypervisor control-ﬂow
+integrity. In Proceedings of IEEE Symposium on
+Security and Privacy (“Oakland”) 2011, May 2011.
+[32] B. Zeng, G. Tan, and G. Morrisett. Combining
+control-ﬂow integrity and static analysis for efﬁcient
+and validated data sandboxing. In Proceedings of
+CCS 2011, Oct. 2011.
+
+[33] B. Zeng, G. Tan, and Ú. Erlingsson. Strato: A retar-
+getable framework for low-level inlined-reference
+monitors. In Proceedings of USENIX Security 2013,
+Aug. 2013.
+
+[34] C. Zhang, T. Wei, Z. Chen, L. Duan, S. McCamant,
+L. Szekeres, D. Song, and W. Zou. Practical control
+ﬂow integrity & randomization for binary executa-
+bles. In Proceedings of the 33rd IEEE Symposium
+on Security and Privacy (Oakland), May 2013.
+
+[35] M. Zhang and R. Sekar. Control ﬂow integrity for
+COTS binaries. In Proceedings of USENIX Security
+2013, Aug. 2013.
+
+USENIX Association  
+
+23rd USENIX Security Symposium  955
+
+15
+
+

@@ -1,0 +1,1932 @@
+Practical Detection of Entropy Loss in
+Pseudo-Random Number Generators
+
+Felix Dörre
+
+Karlsruhe Institute of Technology, Germany
+
+felix.doerre@student.kit.edu
+
+Karlsruhe Institute of Technology, Germany
+
+Vladimir Klebanov
+
+klebanov@kit.edu
+
+ABSTRACT
+Pseudo-random number generators (PRNGs) are a critical
+infrastructure for cryptography and security of many com-
+puter applications. At the same time, PRNGs are surpris-
+ingly diﬃcult to design, implement, and debug. This paper
+presents the ﬁrst static analysis technique speciﬁcally for
+quality assurance of cryptographic PRNG implementations.
+The analysis targets a particular kind of implementation
+defect, the entropy loss. Entropy loss occurs when the en-
+tropy contained in the PRNG seed is not utilized to the
+full extent for generating the pseudo-random output stream.
+The Debian OpenSSL disaster, probably the most prominent
+PRNG-related security incident, was one but not the only
+manifestation of such a defect.
+
+Together with the static analysis technique, we present its
+implementation, a tool named Entroposcope. The tool of-
+fers a high degree of automation and practicality. We have
+applied the tool to ﬁve real-world PRNGs of diﬀerent de-
+signs and show that it eﬀectively detects both known and
+previously unknown instances of entropy loss.
+
+Keywords
+Pseudo-Random Number Generator; PRNG; entropy loss;
+information ﬂow; OpenSSL; static analysis; bounded model
+checking
+
+1.
+
+INTRODUCTION
+
+Motivation and goal.
+
+Somewhat simpliﬁed, a pseudo-random number generator
+(PRNG) is a software module that is seeded with a small
+amount of externally-sourced entropy (read randomness)1
+and “stretches” it into a stream that is indistinguishable
+from random to a computationally-bounded adversary. The
+
+1Entropy is, strictly speaking, a measure of uncertainty, but,
+as customary, we overload the term to denote data with high
+entropy, i.e., data that is diﬃcult to guess for an adversary.
+
+Permission to make digital or hard copies of all or part of this work for personal or
+classroom use is granted without fee provided that copies are not made or distributed
+for proﬁt or commercial advantage and that copies bear this notice and the full cita-
+tion on the ﬁrst page. Copyrights for components of this work owned by others than
+ACM must be honored. Abstracting with credit is permitted. To copy otherwise, or re-
+publish, to post on servers or to redistribute to lists, requires prior speciﬁc permission
+and/or a fee. Request permissions from permissions@acm.org.
+CCS’16, October 24-28, 2016, Vienna, Austria
+c(cid:13) 2016 ACM. ISBN 978-1-4503-4139-4/16/10. . . $15.00
+DOI: http://dx.doi.org/10.1145/2976749.2978369
+
+seed is typically obtained from outside the immediate sys-
+tem scope: A user-space PRNG, for instance, may query
+the OS, which derives it, among other things, from physical
+noise in the hardware. The PRNG then produces a stream
+of pseudo-random data by, in cycles, permuting its internal
+state and deriving a ﬁxed-length output chunk from a part of
+it. The latter part of the PRNG code, with which we will be
+concerned in this paper, is deterministic and contains both
+cryptographic and non-cryptographic parts.
+
+On the implementation level, of all things, the non-cryp-
+tographic parts have shown a history of defects causing fa-
+tal security incidents. Many of these defects are entropy
+losses, where entropy supplied in the seed is overwritten
+with constant or predictable values, or otherwise remains
+unused during PRNG operation. This kind of defect makes
+it unnecessarily easy for an attacker to predict the PRNG
+output.
+
+The probably most prominent PRNG security incident,
+the Debian OpenSSL disaster [28], was caused by such an
+entropy loss. While suﬃcient seed entropy was available
+(the code collecting entropy was working), only 15 bits of
+it (the ID of the current process) were used for generating
+output, resulting in merely 215 = 32768 distinct possible
+output streams (ﬁxing endianness and native word size). As
+a consequence, for instance, only 215 key pairs could be gen-
+erated on any aﬀected system, which allowed an attacker to
+easily brute-force the private key to any given public key
+generated on a vulnerable system.
+
+For an attacker, a ﬂawed PRNG is an attractive vector,
+as it constitutes a single point of failure for many services
+relying on cryptography. The Debian OpenSSL disaster
+eﬀectively demonstrated this point by aﬀecting the secu-
+rity of—among other things—DNS (BIND), Email (postﬁx,
+cyrus, uw-imapd), FTP, VPN (StrongSWAN, OpenVPN),
+SSH (OpenSSH clients and servers), Kerberos authentica-
+tion, Tor, and WWW (Apache).2 For almost two years, the
+general public lacked awareness that cryptographic measures
+securing these services on Debian systems were essentially
+turned oﬀ.
+
+Attacks based on PRNG ﬂaws are also particularly insid-
+ious, as they often require only passive access to the vic-
+tim’s communications. Breaking into the victim’s system is
+typically not necessary. Such an attack leaves behind less
+evidence and is thus much more diﬃcult to detect or, in af-
+termath, reconstruct. This point was illustrated by a series
+of unsolved bitcoin thefts probably going back to an entropy
+loss in the Android PRNG [23].
+
+2https://wiki.debian.org/SSLkeys
+
+678Despite the gravity of the situation, there are very few ef-
+fective quality assurance techniques against implementation
+defects in cryptographic PRNGs. The ﬁrst testing technique
+claiming potential to have prevented the Debian OpenSSL
+disaster was proposed only recently [27].
+
+The overarching contribution of this work is the ﬁrst static
+analysis technique for detecting entropy loss in PRNG im-
+plementations. An entropy loss is detected when the anal-
+ysis ﬁnds two distinct seeds that produce the same output
+stream. The technique is implemented in a highly auto-
+matic analysis tool building on program veriﬁcation technol-
+ogy and eﬀectively applies to real-world implementations.
+
+Contributions in detail.
+
+The paper identiﬁes absence of entropy loss, a particular
+important correctness property of PRNGs, and formulates
+it within the popular semantical framework of information
+ﬂow. In contrast to functional speciﬁcation, such a formu-
+lation is both succinct, easy to understand, and uniform
+across PRNGs. In contrast to the majority of established
+security research scenarios, PRNG correctness is concerned
+with maximizing and not minimizing information ﬂow, ren-
+dering most of the existing security analysis tools inapplica-
+ble. The paper proposes a method to ﬁnd deviations from
+ﬂow maximality and thus instances of entropy loss.
+
+A particular challenge in this context is the use of cryp-
+tographic primitives in PRNGs. Since our analysis is purely
+information-theoretic, we propose a way to deal with the
+issue by replacing such primitives with idealizations.
+
+Implementing the method, the paper presents a tool for
+PRNG analysis, built on top of the CBMC bounded model
+checker for C and Java. Due to the carefully deﬁned appli-
+cation scenario, the tool enables a fast feedback cycle, with
+counterexamples, i.e., potential witnesses of entropy loss,
+aiding the developer in understanding the problem.
+
+We have applied the analyzer to ﬁve popular PRNG im-
+plementations, including the OpenSSL PRNG and Apple’s
+version of Yarrow. We report our experiences in detail us-
+ing the example of OpenSSL. One result is that the tool
+detected a previously undiscovered (if small) entropy loss
+in the OpenSSL PRNG. A larger previously undiscovered
+entropy loss was detected in the Libgcrypt PRNG.
+
+The paper also includes a “mini-museum” of entropy loss
+with the goal to increase awareness of this kind of prob-
+lem. This section presents and discusses several disparate
+instances of entropy loss, demonstrating the importance of
+the concept and the diversity of applications where the prob-
+lem occurs.
+
+2.
+
+ILLUSTRATION OF ENTROPY LOSS:
+ANDROID PRNG (2013)
+
+The origin of the Android PRNG lies in the Apache Har-
+mony project, a clean room reimplementation of the Java
+Core Libraries under the Apache License. The Harmony
+PRNG was part of the Android platform up to and includ-
+ing Android 4.1. It was replaced when a problem with the
+PRNG became widely known [23], after a series of mysteri-
+ous bitcoin thefts.
+
+Bitcoin transactions are ECDSA signatures and include a
+nonce that is often generated by a PRNG. If the same nonce
+is used for two transactions signed by the same key, then
+
+anyone can reconstruct the private key of the victim from
+public information and divert their money without having
+to compromise their system. Entropy loss in the PRNG
+increases the probability of nonce reuse.
+
+The entropy loss occurred in the main method of the An-
+droid PRNG, engineNextBytes(byte[] bytes), which ﬁlls the
+caller-supplied array bytes with pseudo-random values. The
+PRNG operates in cycles, each cycle generating 20 pseudo-
+random bytes.
+If the caller requests more bytes, several
+cycles are performed; if the caller requests fewer bytes, the
+surplus generated bytes are stored for later usage.
+
+The main component of the PRNG state is an int[] array
+of length 87, somewhat inappropriately named seed (Fig-
+ure 1). The front part of this array is populated with the
+externally-provided entropy (i.e., the actual seed). The seed-
+ing can happen either manually by calling setSeed() or au-
+tomatically.
+In the latter case, the PRNG is seeded with
+20 bytes of entropy requested from the OS kernel on ﬁrst
+invocation of engineNextBytes(). This so-called self-seeding
+mode is typically considered preferable as less error-prone.
+Figure 1(c) shows the essence of the PRNG’s operation in
+this scenario. In cycle k, the 20 pseudo-random bytes are
+computed by combining the seed (words 0–4 in Figure 1(a)),
+the cycle counter k (as a 64-bit integer in words 5–6), and
+the output of cycle k−1 (resp. SHA-1 initialization vector in
+the initial cycle) with the SHA-1 compression function. The
+computation makes use of the scratch space in words 16–
+79, and its result is stored in words 82–86. The latter are
+subsequently unpacked into bytes that form the output of
+the cycle.
+
+To compute the output, the seed and the cycle counter
+have to be suﬃxed by a standard-deﬁned SHA-1 padding.
+The PRNG keeps track of the length of the seed in word 80.
+The essence of the vulnerability is that a stale value of this
+length (i.e., zero) is used after initializing the seed in the
+self-seeding mode. As a consequence, the cycle counter and
+the SHA-1 padding constant overwrite words 0–2, leaving
+only two words of the original seed (Figure 1(b)). Twelve
+bytes of entropy are lost, and the actual amount of entropy
+in the PRNG amounts thus to 8 instead of 20 bytes.3
+
+The goal of our analysis is to detect that two seeds diﬀer-
+
+ing in words 0–2 will produce the same output stream.
+
+3. FOUNDATIONS
+3.1 The PRNG Model
+
+In this paper, we treat a PRNG as a function
+
+g : {0, 1}m → {0, 1}n ,
+
+which translates a seed of m bits into a stream of n bits
+(m, n > 0). The fact that we only consider ﬁnite streams
+is inconsequential in the scope of this work. Since PRNG
+implementations typically use bytes as an atomic unit of
+information exchange, we establish the following convention.
+Whenever we use the parameters M and N , we are implying
+m = 8M and n = 8N .
+
+The above model of a PRNG as a function from seed to
+output goes hand in hand with the following assumptions
+that we make:
+3The PRNG also contains a native backup component in
+case the kernel does not provide an entropy source. Inciden-
+tally, this component contained two more instances of en-
+tropy loss, though these were much simpler technically [23].
+
+679out 0 = sha1 ( seed (cid:124) 0 (cid:124) sha1 - iv )
+out k = sha1 ( seed (cid:124) k (cid:124) out k−1 )
+
+(c) Equations describing the output of
+the Android PRNG in each cycle
+
+(a) Intended operation
+
+(b) Eﬀect of the bug
+
+Figure 1: Structure of the Android PRNG’s main array (1 word = 1 int = 4 bytes)
+
+1. The PRNG is seeded before it starts producing output.
+
+2. The seed is chosen uniformly at random from the set
+
+{0, 1}m for some m > 0.
+
+3. An attacker neither knows the seed nor has control
+
+over its choice.
+
+4. The PRNG is not re-seeded, i.e., the seed remains con-
+
+stant throughout the PRNG’s lifetime.4
+
+5. An attacker knows the source code of the PRNG but
+
+cannot inspect or corrupt its internal state.
+
+6. We only consider sequential operation (i.e., no multi-
+
+threading).
+
+3.2 PRNG Security Concerns
+
+Security of a PRNG means intuitively that a computation-
+ally-bounded attacker cannot predict its output with any
+practical probability. We will not state a complete formal
+model of PRNG security. Instead, we describe three major
+concerns that are its necessary prerequisites. In this paper,
+we focus on Concern 2, but to delineate the problem prop-
+erly, we brieﬂy discuss the others as well.
+
+Concern 1. The entropy contained in the seed should
+be suﬃciently large. While we leave open what exactly is
+considered suﬃcient, the issue can be further broken down
+as follows. First, the seed range 2m (i.e., number of possible
+seeds) should be suﬃciently large. For instance, the cur-
+rent time of the day in milliseconds provides only slightly
+more than m = 26 bits of entropy. Second, entropy is maxi-
+mal for the uniform distribution. Skewed seed distributions
+will reduce entropy content. Third, in practice, entropy ar-
+guments are only sound relative to attacker knowledge. If
+one seeds the PRNG with current time but the attacker can
+roughly identify the moment when the seeding takes place,
+the eﬀective unpredictability will be signiﬁcantly below the
+theoretical 26 bits mentioned above.5
+
+Since, hardware noise is typically an important source
+of PRNG seeds, ensuring suﬃcient seed entropy requires
+4Reseeding can be modeled by considering several PRNG
+functions. An example featuring the Yarrow PRNG is shown
+in Figure 4(b), Section 6.
+5This circumstance was used in cracking the online poker
+PRNG in [2] or the hardware PRNG in encrypted hard
+drives [1]. In the latter case, the hardwired seed was close
+to the manufacturing time embossed on the drive.
+
+knowledge of said hardware (e.g., rotating hard drive vs.
+SSD) and its characteristics (e.g., seek time distribution).
+In the meantime, it has become widely known that proper
+seeding can be a substantial challenge in virtual machines
+and embedded devices [15].
+
+Concern 2. Seed entropy should not be lost during
+PRNG operation. For an unbounded attacker, predicting
+the PRNG output of length n (cid:62) m should not be easier
+than predicting the m-bit seed itself.
+
+Since the output is a deterministic function of the seed,
+it is clear that it is impossible to keep unpredictable both
+the output and the seed after observing the output. Barring
+permanent inﬂow of entropy, the only practical solution to
+this dilemma is to maximize the ﬂow of information from
+the seed to the output and to prevent seed reconstruction
+by means of a cryptographic one-way function, shifting the
+adversary assumption from an unbounded to a computa-
+tionally bounded one. This is indeed the way most crypto-
+graphic PRNGs operate.
+
+Summarizing, absence of seed entropy loss (Concern 2),
+together with suﬃcient seed entropy (Concern 1), impedes
+an attacker at brute-forcing the seed resp. a part of the seed
+suﬃcient to predict the output.
+
+Concern 3. It should be computationally infeasible to
+analytically invert g. A resource-bounded attacker should
+not be able to compute seed from an observed preﬁx of
+g(seed ).
+
+Examples of PRNGs susceptible to seed reconstruction
+are PRNGs that do not use cryptography, such as the linear
+congruential generators (LCG). A typical representative is
+the drand48 generator in the C standard library.
+
+A diﬀerent example is the Dual EC DRBG, which uti-
+lizes a supposedly one-way elliptic curve primitive incor-
+porating two parameters P and Q. The parameters were
+chosen by the NSA in an opaque manner, even though the
+(non-)invertibility of g and thus the security of the PRNG
+hinges critically on their choice. As [5] notes, “[. . . ] it may
+be the case the adversary knows a d such that dQ = P .
+Then [. . . ] a distinguisher could immediately recover the se-
+cret prestates from the output.”
+
+When considering more elaborate PRNG security models
+such as [7], further concerns can be identiﬁed. One can
+examine whether a PRNG can withstand an attacker that
+has some control over the choice of the seed or the capability
+
+04567815167980818286seed0...00computationspace#0spaceforSHA1result(cid:124)(cid:123)(cid:122)(cid:125)20byte↑counter↑0x80000000045678seedcounter0x80000000...012345678counter0x80000000seed(rest)0...00...(cid:124)(cid:123)(cid:122)(cid:125)8byte680PX
+
+Y
+
+An attacker tries to guess the secret input X after observing
+program output Y . The secret X typically reﬂects some in-
+formation in the real world and has ﬁxed entropy. Reduced
+information ﬂow between X and Y makes X harder to guess,
+increasing security.
+
+(a) Classical information ﬂow analysis scenario
+
+X
+
+PR
+NG
+
+X(cid:48)
+
+P
+
+Y
+
+An attacker tries to guess X(cid:48) after observing Y . The secret X(cid:48)
+is generated by a PRNG, and its entropy depends on proper-
+ties of the generator. Reduced information ﬂow between the
+seed X and X(cid:48) makes X(cid:48) easier to guess, diminishing security.
+
+(b) PRNG security scenario
+
+Figure 2: Information ﬂow scenarios illustrated
+
+to temporarily inspect or corrupt the internal state of the
+PRNG. We consider such further concerns out of scope for
+this paper.
+
+Of the three concerns elaborated above, the ﬁrst concern
+cannot be solved by means of (mere) code analysis, as it
+involves the larger system into which the PRNG is embed-
+ded. The third concern has solution components in the form
+of widely-vetted one-way primitives, such as cryptographic
+hash functions of the SHA family. For the second concern,
+this paper makes a contribution in supplementing the usual
+manual code review with a practical technical solution.
+3.3 Entropy and Information Flow
+
+In general, entropy of a random variable X is a measure of
+an observer’s uncertainty about its value. Information ﬂow
+or leakage refers to the decrease of an (unbounded) attacker’s
+uncertainty about a secret part of a program’s initial state
+after observing a part of its ﬁnal state. Information ﬂow in
+a deterministic terminating program can be identiﬁed with
+the degree of injectivity of the input-output function induced
+by the program [18].
+
+There is a vast body of work in information ﬂow analysis,
+going back several decades. The entropy loss problems with
+PRNGs have entered public awareness in 2008 at the latest,
+but as far as we are aware the two have never been previously
+brought together. A part of the explanation is probably in
+the fact that information ﬂow research concentrated on mini-
+mizing information ﬂow for conﬁdentiality, while maximizing
+information ﬂow is needed for PRNG security (Figure 2).
+
+Various entropy metrics have been deﬁned, such as Shan-
+non entropy, min-entropy, etc. In this paper we will be con-
+centrating on min-entropy [25], which is a measure in bit of
+the probability to guess the value of X in one try. Similar
+arguments can be made for other metrics.
+
+Definition 1
+
+(Min-entropy). The min-entropy of a
+
+random variable X
+
+H∞(X) := − log max
+
+x
+
+Pr[X = x] ,
+
+where log is a logarithm to the base 2.
+
+We choose min-entropy for its clear operational guarantees
+w.r.t. guessability. By construction, the probability of an
+adversary successfully guessing the value of X in one try is
+not larger than 2−H∞(X).
+
+Proposition 1. If X follows a uniform distribution on
+
+a ﬁnite set of values, then
+
+H∞(X) = − log
+
+1
+
+|{x ∈ X}| = log |{x ∈ X}| .
+
+Concretely, if X follows a uniform distribution on {0, 1}m,
+then H∞(X) = m bits.
+
+In the PRNG setting, we are considering a pair of jointly
+
+distributed random variables X and Y , where Y = g(X).
+
+Proposition 2. Let X and Y be random variables with
+
+Y = g(X) and X following a uniform distribution.
+
+H∞(Y ) = − log max
+
+y
+
+Pr[Y = y] =
+
+maxy∈Y |{x ∈ X | g(x) = y}|
+
+− log
+H∞(X) − log max
+y∈Y
+
+|{x ∈ X}|
+
+=
+
+|{x ∈ X | g(x) = y}| .
+
+Corollary 3. Under the assumptions of Proposition 2,
+H∞(Y ) (cid:54) H∞(X) with H∞(Y ) = H∞(X) if and only if g
+is injective.
+
+In terms of information leakage, this result can be inter-
+preted as H∞(Y ) being maximal iﬀ the information that g
+leaks about X is maximal. Due to this constellation, many
+existing information ﬂow analysis tools are not directly ap-
+plicable to the problem, as they inherently provide upper
+bounds on leakage only. We, in contrast, need lower leakage
+bounds.
+
+4. THE ANALYSIS METHOD
+
+Per Corollary 3, assuring that no seed entropy is lost (i.e.,
+the PRNG output is at least as unpredictable as the seed) is
+synonymous to establishing that the function g induced by
+a PRNG is injective. Thus, for a given PRNG implementa-
+tion, the analysis computes the above-described function
+
+g : {0, 1}m → {0, 1}n
+
+for given m and n (m (cid:54) n) and checks whether the entropy
+preservation condition
+
+g(seed 1) = g(seed 2) → seed 1 = seed 2
+
+(1)
+
+holds. In other words, we check whether two distinct seeds
+produce distinct pseudo-random streams.
+
+While the condition (1) is quite concise on this level of
+abstraction, checking it with existing program veriﬁcation
+technology is not without challenges. Two major ones are:
+reasoning about cryptographic primitives and making the
+analysis practical.
+4.1 Modeling Cryptographic Primitives Used
+
+in a PRNG
+
+During its operation, a typical PRNG will invoke crypto-
+graphic primitives, such as, e.g., the SHA-1 hash function.
+The primitives are by design computationally hard to invert
+and are used, among other things, to prevent an attacker
+from calculating the seed from the observed PRNG output
+
+681(Concern 3). As a consequence, it is also computationally
+infeasible to reason about them with veriﬁcation technol-
+ogy.6
+
+For assuring absence of bugs in the implementation of the
+primitives, this infeasibility is not too problematic, as the
+primitives are standardized, with widely-available reference
+implementations and test suites. The non-cryptographic
+PRNG code, on the other hand, is not standardized, error-
+prone, and cannot be easily tested.
+
+Our goal is thus to check absence of entropy loss in the
+latter, non-cryptographic parts, while assuming that cryp-
+tographic primitives do not contribute to it. We do not
+attempt this by considering only the code between the prim-
+itives, as reasoning about unstructured code is challenging
+and poorly supported in existing veriﬁcation systems. In-
+stead, we still consider a whole-program correctness prop-
+erty (i.e., entropy ﬂow through the whole PRNG, from seed
+to output) but replace the cryptographic primitives with
+idealizations.
+
+We assume that the deﬁnition of g contains several occur-
+
+rences of a cryptographic function h:
+
+hi : {0, 1}ki → {0, 1}l .
+
+Instead of the function g, we henceforth consider the func-
+tion ˜g with the same signature, derived by replacing each hi
+in g with a function ˜hi of the same signature. Altogether,
+we consider two types of idealizations ˜hi.
+
+The ﬁrst type of idealization replaces hi in g with a pro-
+
+jection, i.e., a function of the form
+
+˜hi(x1, . . . , xji , . . . , xji+l−1, . . . , xki ) = (xji , . . . , xji+l−1)
+
+for some user-speciﬁed 1 (cid:54) ji (cid:54) ki. Since the output of h
+is l bits long, we expect the input to contain at least l bits
+of entropy. In practice, it suﬃces to assume that the l bits
+are supplied as one contiguous region xji , . . . , xji+l−1; the
+other parts of the input can be discarded.
+
+For each i, we let the user identify the entropic region
+start ji by visually matching bit patterns occurring in the
+seed to the inputs of hi. In general, there is only a small ﬁ-
+nite choice of possible values of ji, and in practice, the choice
+is often even smaller, as most PRNGs supply a concatena-
+tion of a few longer bitvectors to h, each with a distinct
+purpose (see Section 6.4 for an example).
+
+Now, while h and the above ˜h are both injections from
+xji , . . . , xji+l−1, they are otherwise incomparable functions,
+and the properties of ˜g need thus not carry over to g (though
+very often they do). In other words, this type of idealization
+is unsound.
+
+The second type of idealization replaces hi in g with an un-
+interpreted function (i.e., a fresh function symbol) ˜hi, while
+adding the following injectivity axiom for ˜hi, based on a
+user-supplied ji:
+
+(cid:0)˜hi(x1, . . . , xji , . . . , xji+l−1, . . . , xki ) =
+ki )(cid:1) →
+
+(cid:48)
+ji+l−1, . . . , x
+
+(cid:48)
+˜hi(x
+1, . . . , x
+
+(cid:48)
+
+(cid:48)
+ji , . . . , x
+
+(cid:0)xji = x
+
+ji ∧ . . . ∧ xji+l−1 = x
+(cid:48)
+
+(cid:1) .
+
+(cid:48)
+ji+l−1
+
+(2)
+
+We assume that the cryptographic primitive h satisﬁes (2),
+which, e.g., for cryptographic hash functions, is a common
+6More precisely, it is not feasible to establish properties re-
+lated to their injectivity (which we are interested in).
+In
+contrast, it is quite easy to prove, for instance, mere termi-
+nation of the SHA-1 implementation.
+
+information-theoretical approximation of the collision-resis-
+tance property. Since ˜h is otherwise uninterpreted, we are
+making strictly fewer assumptions about the nature of h in ˜g
+than in g. The properties of ˜g thus carry over to g, which
+makes this type of idealization sound.
+
+Theorem 4
+
+(Soundness). Let ˜g be obtained from g by
+substituting each occurrence of h with an uninterpreted func-
+tion ˜h satisfying (2). If ˜g is injective and h satisﬁes (2),
+then g is injective.
+
+Together with the soundness of the employed program ver-
+iﬁcation technology, the theorem implies that the analysis
+is guaranteed to detect all instances of entropy loss in the
+scope given by m and n.
+
+The reason for also having unsound idealization is that
+it produces injectivity counterexamples (pairs of program
+traces) that are easier to interpret for the user, as the output
+of each ˜h is just a copy of a part of its input. The user can
+thus easier track the ﬂow of information in the PRNG by
+identifying occurrences of the same concrete bit pattern on
+the way from the seed to the output. This does not hold for
+the sound idealization. We typically perform the analysis
+with the unsound idealization ﬁrst to ﬁnd defects, and later
+automatically strengthen the idealization to the sound one
+to conﬁrm their absence.
+
+If no idealization can be synthesized to make (1) hold, then
+either the contiguous input region assumption is violated (we
+have not experienced this) or there is an entropy loss in the
+PRNG.
+
+4.2 Scope and Limitations
+
+While it is important to say what our analysis is designed
+to do, it is just as important to say what it is not designed
+to do.
+
+The analysis does not consider entropy collection. The
+analysis will detect entropy loss in the non-cryptographic
+portions of any entropy extraction code, but otherwise makes
+no claims about its function. We are assuming that the pro-
+vided seed contains maximal entropy. We are not discussing
+the size of the seed necessary for a desired level of security.
+The analysis never examines the implementation of the
+cryptographic primitives, and cannot ensure that they are
+implemented correctly. We assume, the risk in this area
+is suﬃciently mitigated by using reference implementations
+and the appropriate test suites.
+
+The analysis only detects loss of entropy in the ﬁrst N
+bytes of output, given a seed of M bytes. This limitation
+is key to achieving a tractable, automatic analysis that is
+sound and reasonably complete in its scope. The parameters
+M and N can be trivially adjusted, but checking with higher
+bounds consumes more resources. Values like M = N = 40,
+corresponding to 2–4 PRNG cycles are easily manageable
+(details in Section 6).
+
+The analysis is complete, except for the overapproxima-
+tion of the cryptographic primitive with its injectivity speci-
+ﬁcation (2). If a PRNG relies for its injectivity on properties
+of a primitive other than (2), the analysis will produce a false
+alarm. This is a constellation that we yet have to encounter
+in practice.
+
+If an entropy loss is detected, its severity and impact has
+
+to be established by a security analyst.
+
+6821. Complete the analysis driver template, ﬁx m and n.
+
+2. If necessary, disable self-seeding.
+
+3. Conﬁgure the source code for analysis (complete the
+
+project-speciﬁc part of the Makeﬁle).
+
+R A N D _ a d d ( in , M , M ) ;
+R A N D _ b y t e s ( out , N ) ;
+
+(a) For the OpenSSL PRNG
+
+4. Provide
+
+cryptographic
+(choose j in each occurrence of (2)).
+
+idealized
+
+implementation
+
+PrngRef ref ;
+p r n g I n i t i a l i z e (& ref ) ;
+
+5. Run a sanity check, checking that CBMC can symbol-
+
+ically execute the code.
+
+6. Run the entropy loss analysis.
+
+p r n g I n p u t ( ref , ( BYTE *) in , M ,
+
+SYSTEM_SOURCE , M * 8) ;
+
+p r n g F o r c e R e s e e d ( ref ,0) ;
+p r n g O u t p u t ( ref , ( BYTE *) out , N ) ;
+
+7. If analysis returns success, perform vacuity testing: in-
+
+troduce a bug in the implementation and repeat.
+
+8. If analysis returns a counterexample, run the coun-
+
+p r n g I n p u t ( ref , ( BYTE *) in2 , M ,
+
+SYSTEM_SOURCE , M * 8) ;
+
+p r n g F o r c e R e s e e d ( ref ,0) ;
+p r n g O u t p u t ( ref , ( BYTE *) out2 , N ) ;
+
+terexample visualizer.
+
+9. If counterexample is spurious, reﬁne the idealized cryp-
+
+tographic implementation and repeat the analysis.
+
+10. If counterexample is genuine, evaluate the defect’s
+
+severity and ﬁx it as appropriate.
+
+Figure 3: General analysis procedure
+
+4.3 Checking Non-Invertibility (Concern 3)
+
+Though this is not our main concern in this paper, we
+can use a simple variation of the method above to check an-
+alytical non-invertibility of g. To this end, we replace the
+top-level injectivity assertion (1) with one of non-injectivity:
+g(seed 1) = g(seed 2), and the assumption of injectivity of
+cryptographic primitives (2) with a corresponding non-in-
+jectivity assumption. This approach implements a standard
+check that there is no information ﬂow from the seed to the
+output, or the ﬂow passes through a one-way primitive. The
+one-way property of the primitive remains to be established
+by cryptanalysis (see the discussion of Dual EC DRBG in
+Section 3.2).
+
+5. Entroposcope: A TOOL FOR DETECT-
+
+ING ENTROPY LOSS
+
+We have implemented our analysis in an automatic detec-
+tion tool named Entroposcope. The tool consists of an
+oﬀ-the-shelf veriﬁcation tool (the bounded model checker
+CBMC [20]), a Java program for generating the injectivity
+veriﬁcation condition and interpreting a potential satisfying
+assignment, an analysis driver template, an idealized hash
+function template, and a Makeﬁle template. The overall
+analysis procedure is outlined in Figure 3. The individual
+components are described in more detail in the following.
+
+Relational reasoner.
+
+Entroposcope relies on CBMC to generate for a given
+PRNG implementation a propositional formula in conjunc-
+tive normal form
+
+φ(seed , out, aux )
+
+(3)
+
+that encodes the function g induced by the implementation.
+The arguments of φ are vectors of propositional variables.
+By construction, the formula ∃aux . φ(seed , out, aux ) is true
+iﬀ the PRNG produces the output encoded by out from
+
+(b) For the Yarrow PRNG (incl. reseeding)
+
+Figure 4: Analysis drivers (excerpts)
+
+the input encoded by seed . The auxiliary variables aux are
+used to represent intermediate states and for the Tseitin
+encoding7.
+
+Entroposcope generates from the formula (3) produced
+
+by CBMC a formula of the form
+ψ ∧ φ(seed , out, aux ) ∧ φ(seed
+
+(cid:48)
+
+(cid:48)
+, out
+seed (cid:54)= seed
+
+, aux
+(cid:48) ∧ out = out
+
+(cid:48)
+
+)∧
+
+(cid:48)
+
+.
+
+(4)
+
+This formula (4) is essentially a negation of the correctness
+condition (1). Its satisﬁability coincides with a loss of in-
+jectivity of g and thus entropy in the PRNG. Satisﬁability
+of (4) is checked with an oﬀ-the-shelf SAT solver (Minisat).
+The subformula ψ is a bit-level encoding of the idealization
+injectivity axiom (2).
+
+In logic-based veriﬁcation, it is often customary to en-
+code a relational property such as (1) as a safety property
+via self-composition, a program transformation syntactically
+duplicating the program [4, 8]. Self-composition is techni-
+cally challenging in presence of heap, pointer arithmetic, and
+complex global state. To sidestep this problem, Entropo-
+scope operates on the logical formula level shown above
+rather than by transforming the program.
+
+Analysis driver.
+
+The starting point of the analysis is the analysis driver
+that deﬁnes the main function exercising the PRNG func-
+tionality. The driver consists of two parts: a generic and a
+PRNG-speciﬁc part. The PRNG-speciﬁc part is deﬁned by
+the analyst in conformance with the PRNG API. It is sup-
+posed to seed the PRNG with an M -byte seed and generate
+an N -byte output. Figure 4 shows the PRNG-speciﬁc parts
+of the drivers for the OpenSSL and the Yarrow PRNG.
+
+The generic part of the driver is the same for all PRNGs
+(not shown).
+It contains the scaﬀolding establishing the
+naming convention for the seed and output buﬀers (needed
+for generating (4)), as well as the code for counterexample
+visualization.
+
+7A well-known method for encoding an arbitrary circuit as
+a formula in conjunctive normal form (CNF) required by a
+SAT solver.
+
+683SAT-based bounded model checker.
+
+To generate the formula (3), Entroposcope uses the
+SAT-based model checker CBMC [20]. CBMC is a very
+mature and popular bit-precise veriﬁcation tool supporting
+almost all of ANSI C, including pointer constructs and dy-
+namic memory allocation. Since recently, CBMC also sup-
+ports programs written in Java.
+
+CBMC executes the program symbolically starting from
+the given function (in our case, the main function of the
+analysis driver). During this process, called functions are
+inlined and loops are unwound to the user-speciﬁed depth.
+CBMC warns the user if the unwinding depth is insuﬃ-
+cient to cover all of the program behaviors (this is known
+as unwinding assertion checking). The unwound program
+is transformed into the static-single-assignment (SSA) form.
+In this form, statements can be interpreted as equations over
+bitvectors. The equations are combined and reduced to a
+formula of propositional logic in a process resembling syn-
+thesis of arithmetic circuits. The formula is ﬂattened into
+j Li,j, where each lit-
+eral Li,j is either a propositional variable or its negation.
+The formula is exported in standard DIMACS format. The
+metadata embedded in the formula allows us to identify the
+variables representing the seed and the output.
+
+conjunctive normal form (CNF) (cid:86)
+
+(cid:87)
+
+i
+
+Veriﬁcation condition generator.
+
+The subformula φ(seed(cid:48), out(cid:48), aux (cid:48)) in (4) is obtained by
+syntactically duplicating φ(seed , out, aux ) with fresh vari-
+ables. The schematic equality of bitvectors in (4) is, in re-
+ality, encoded on the individual bit level; for the inequality,
+Tseitin encoding is used to obtain an equisatisﬁable formula
+in conjunctive normal form.
+
+Counterexample visualizer.
+
+If the SAT solver ﬁnds a satisfying assignment for (4),
+Entroposcope interprets it and outputs a pair of distinct
+seeds and a common PRNG output that form a suspected
+witness for entropy loss. The user needs to analyze the coun-
+terexample to understand if it is spurious (i.e., due to the in-
+suﬃcient choice of the cryptographic primitive idealization)
+or if it is a real problem in the PRNG. To aid the user, the
+analyzer also generates C preambles from the satisfying as-
+signment and runs the PRNG once for each of the seeds. The
+inputs and the idealized output of each cryptographic prim-
+itive invocation together with any other debugging output
+that the user may add are then displayed in a side-by-side
+diﬀ.
+
+6. ANALYZING REAL-WORLD PRNGS:
+
+OPENSSL AND OTHERS
+
+We applied Entroposcope to a number of PRNGs, car-
+rying out the analysis according to the procedure outlined in
+Figure 3. In cases where no defects were found, we injected
+and detected synthetic bugs.
+
+Entroposcope ﬁnds the Android PRNG bug described
+in Section 2 and veriﬁes the eﬀectiveness of the oﬃcial patch.
+We found no entropy loss in the Yarrow PRNG [16] in
+the version used in Apple’s XNU kernel (part of iOS and
+OS X). One of the scenarios we analyzed included reseeding
+(Figure 4(b)): Entroposcope shows that the old and the
+new seed fully inﬂuence the output before and after reseed-
+ing respectively. On the other hand, attempts to analyze
+
+Yarrow with M = 40, N = 40 (without reseeding) immedi-
+ately fail due to the fact that Yarrow’s generator state is only
+20 bytes large (a restriction prominently declared in [16]).
+
+With Entroposcope, we found a previously undiscov-
+ered entropy loss in the Libgcrypt PRNG, which we brieﬂy
+describe in Section 6.9.
+
+In the following we report in detail the results of our analy-
+sis of the OpenSSL PRNG. We also analyzed the PRNG
+in BoringSSL, Google’s drop-in replacement for OpenSSL,
+and found no defects in the latter.
+6.1 Structure of the OpenSSL PRNG
+
+The relevant functions of the OpenSSL PRNG API are
+RAND_add(const void *buf, int num, double add_entropy) to
+add entropy and RAND_bytes(unsigned char *buf, int num)
+to generate output. They are shown as pseudocode in Fig-
+ure 5. The code has been simpliﬁed for presentation, elid-
+ing irrelevant features such as provisions for multi-threading
+(postponed as future work), function pointer indirection,
+etc. The PRNG is also parametric in the choice of a crypto-
+graphic hash function; we present the default instantiation
+with SHA-1. Nonetheless, please note that, unless explic-
+itly mentioned otherwise below, we are analyzing the actual
+unmodiﬁed source code of OpenSSL.
+
+OpenSSL PRNG maintains two entropy pools: a 20-byte
+buﬀer named md and a 1023-byte circular buﬀer named state.
+Entropy added to the PRNG using RAND_add is split into 20-
+byte chunks and hashed chunkwise into state. The chunks
+are chained together using local_md, a thread-local copy of
+the md buﬀer. Output generation proceeds in chunks of 10
+bytes. First, a 20-byte hash is generated from the next 10
+bytes of state and two counters; local_md is used for chain-
+ing. Then, the hash is split, with 10 bytes forming output,
+while the other 10 bytes are XORed back into state. This
+process is repeated until enough output bytes are generated.
+If the requested amount of output bytes is not a multiple
+of 10, superﬂuous bytes are discarded.
+6.2 Entropy Sources and the Analysis Driver
+The analysis driver is straightforward, containing a call to
+RAND_add followed by a call to RAND_bytes. The core part
+of the driver is shown in Figure 4(a). A minor complication
+arises due to the fact that the OpenSSL PRNG self-seeds,
+i.e., automatically incorporates entropy from several sources
+beyond what is supplied by the driver: (i) entropy collected
+by an OS-speciﬁc routine (RAND_poll) added on ﬁrst call
+to RAND_bytes, (ii) PID, time of day, and hardware RNG
+entropy (if available) added at every call to RAND_bytes,
+and (iii) the content of the (potentially uninitialized) output
+buﬀer supplied to RAND_bytes.
+
+We choose to ignore these auxiliary sources, as they oﬀer
+little conceptual added value from the analysis perspective.
+Technically, we set corresponding compilation ﬂags (PURIFY,
+GETPID_IS_MEANINGLESS) and supply empty implementations
+for RAND_poll and time. Alternatively, it is trivial to include
+the output of relevant functions and content of buﬀers as an
+extra part of the conceptual seed in an extended scenario.
+6.3 Pool Stirring
+
+After self-seeding, but before generating ﬁrst output, the
+OpenSSL PRNG “stirs” state. During the stirring process,
+RAND_add is called with a constant 20-byte input (literally
+20 dot characters) for a total of at least 1023 bytes. The
+
+684=
+=
+
+0;
+0;
+
+1 long m d _ c o u n t _ 0
+2 long m d _ c o u n t _ 1
+3 char state [1023] = {0};
+= {0};
+4 char md [20]
+5 int s t a t e _ i n d e x
+=
+6 int s t i r r e d _ p o o l =
+7
+8 void R A N D _ a d d ( const void * buf , int num ) {
+9
+
+char l o c a l _ m d [] = copyOf ( md ) ;
+
+0;
+0;
+
+for ( int i = 0; i < num ; i += 20) {
+
+l o c a l _ m d = sha1 ( l o c a l _ m d
+
+(cid:124) state [ s t a t e _ i n d e x .. s t a t e _ i n d e x +20 >]
+(cid:124) buf [ i .. i +20 <]
+(cid:124) m d _ c o u n t _ 0 (cid:124) m d _ c o u n t _ 1 ) ;
+
+m d _ c o u n t _ 1 ++;
+state [ s t a t e _ i n d e x .. s t a t e _ i n d e x +20 >] ^=
+
+l o c a l _ m d ;
+
+s t a t e _ i n d e x = ( s t a t e _ i n d e x + 20) % 1023;
+
+}
+md ^= l o c a l _ m d ;
+
+20
+21 }
+22
+23 void R A N D _ b y t e s ( const void * buf , int num ) {
+24
+
+if (! s t i r r e d _ p o o l ++) s t i r _ p o o l () ;
+char l o c a l _ m d [] = copyOf ( md ) ;
+m d _ c o u n t _ 0 ++;
+int i = 0;
+while ( num > 0) {
+
+10
+
+11
+
+12
+
+13
+
+14
+
+15
+
+16
+
+17
+
+18
+
+19
+
+25
+
+26
+
+27
+
+28
+
+29
+
+30
+
+31
+
+32
+
+33
+
+34
+
+35
+
+36
+
+37
+
+38
+
+39 }
+
+l o c a l _ m d = sha1 ( l o c a l _ m d
+
+(cid:124) m d _ c o u n t _ 0 (cid:124) m d _ c o u n t _ 1
+(cid:124) state [ s t a t e _ i n d e x .. s t a t e _ i n d e x +10 >] ) ;
+
+state [ s t a t e _ i n d e x .. s t a t e _ i n d e x +10 >] ^=
+
+l o c a l _ m d [ 0 . . 1 0 ] ;
+
+buf [ i .. i +10 <] = l o c a l _ m d [ 1 0 . . 2 0 ] ;
+s t a t e _ i n d e x = ( s t a t e _ i n d e x + 10) % 1023;
+num -= 10;
+i += 10;
+
+}
+
+md = sha1 ( m d _ c o u n t _ 0 (cid:124) m d _ c o u n t _ 1 (cid:124) l o c a l _ m d (cid:124)
+
+md ) ;
+
+Notation:
+
+• We assume that every array has an associated implicit
+
+length.
+
+• buf[a..b] denotes the sub-array of buf starting with a
+
+and ending with b (exclusive).
+
+• Array actions such as assignments and XORs are to
+be understood component-wise. If the right-hand side
+of an assignment denotes more locations than the left-
+hand side (Line 33), the superﬂous locations are ig-
+nored.
+
+• buf[a..b>]
+
+treats
+
+as
+cyclic
+amounts
+b<=len(buf),
+buf[a..len(buf)]∪buf[0..b-len(buf)] otherwise.
+
+buf[a..b],
+
+buf
+
+to
+
+if
+
+and
+and
+
+i.e., it is equivalent to buf[a..min(b,len(buf))].
+
+• buf[a..b<] ignores accesses past the right array bound,
+• sha1(a (cid:124) b (cid:124) c) denotes the hash of the concatenation
+
+of a, b and c.
+
+Figure 5: Simpliﬁed pseudocode of the OpenSSL
+PRNG
+
+purpose is to better distribute the entropy throughout the
+pool via the chunk chaining mechanism. At the same time,
+stirring, obviously, does not increase the entropy content of
+the pool.
+
+We abstract from pool stirring in the analysis scenario.
+It is a small and relatively simple piece of code: a single
+loop repeatedly calling RAND_add. At the same time, stir-
+ring imposes a prohibitively high computational tax on the
+analysis. Instead, we assume that we are already suﬃciently
+exercising the RAND_add functionality through the analysis
+driver. Technically, we disable stirring by instructing the
+model checker to ignore the appropriate loop.
+6.4 Idealized Cryptographic Functionality
+
+Abstract description.
+
+OpenSSL PRNG uses three static occurrences of a cryp-
+tographic primitive (SHA-1 hash per default). Each occur-
+rence can be invoked several times depending on the pa-
+rameters M, N . As described in Section 4.1, we replace the
+primitives by idealizations.
+
+The ﬁrst occurrence transfers the seed entropy into the
+
+pool and is invoked in RAND_add as:
+
+h1 ( l o c a l _ m d (cid:124) state [ s t a t e _ i n d e x .. s t a t e _ i n d e x +20 >]
+
+(cid:124) buf [ i .. i +20 <] (cid:124) m d _ c o u n t _ 0 (cid:124) m d _ c o u n t _ 1 )
+
+We idealize it as an injection from buf[i..i+20<] (third ar-
+gument), based both on its name and it carrying the seed
+material, as shown by the counterexample visualizer.
+
+The second occurrence is for output generation and in-
+
+voked in RAND_bytes:
+
+h2 ( l o c a l _ m d (cid:124) m d _ c o u n t _ 0 (cid:124) m d _ c o u n t _ 1
+
+(cid:124) state [ s t a t e _ i n d e x .. s t a t e _ i n d e x +10 >])
+
+We discuss this occurrence in detail in Section 6.5.
+
+The third occurrence updates the global state upon com-
+
+pletion of RAND_bytes:
+
+h3 ( m d _ c o u n t _ 0 (cid:124) m d _ c o u n t _ 1 (cid:124) l o c a l _ m d (cid:124) md )
+
+We idealize it as an injection from local_md, though it is only
+relevant, if one calls RAND_bytes more than once.
+
+As the example shows, there is only a very limited choice
+of argument for the injection, and roughly half of them—the
+counters—can be eliminated outright. For each invocation
+of a cryptographic primitive, Entroposcope’s counterex-
+ample visualizer shows the exact callsite and the arguments
+supplied to the primitive, its output, which argument po-
+tentially contains or is inﬂuenced by the seed material, and
+whether each invocation and the overall PRNG are currently
+injective. This feedback eﬀectively assists the user in synthe-
+sizing the appropriate idealized functionality, i.e., choosing
+the right j in (2).
+
+Implementation.
+
+On the implementation level, the hash function is imple-
+mented by a stateful object with a stream-based interface.
+The hash object is initialized by calling MD_Init, data to be
+hashed is supplied via MD_Update, and ﬁnally, the hash value
+is obtained by calling MD_Final. Passing a concatenation of
+several buﬀers as an argument to the hash function, which
+we use in the pseudocode, is implemented by repeated calls
+to MD_Update. We instrument each call with a counter that
+makes it possible to distinguish the three logical occurrences
+of the primitive shown above even though they use the same
+interface.
+
+6856.5 OpenSSL PRNG Loses Entropy in Out-
+
+put by Design
+
+Attempts to synthesize an idealization for the hash func-
+tion invocation h2 shown in Section 6.4 show a peculiar
+problem. Abstracting away from details, the entropy ﬂow
+from the 20 byte of state to the 20 byte of PRNG’s output
+in RAND_bytes can be represented as follows (see Figure 5
+for notation):
+
+o1
+o2
+
+= h2 (... (cid:124) state [ 0..10]) ;
+= h2 (... (cid:124) state [ 1 0 . . 2 0 ] ) ;
+out = o1 [ 1 0 . . 2 0 ] (cid:124) o2 [ 1 0 . . 2 0 ] ;
+
+Note that the entropy in state[0..10] and state[10..20]
+is “spread” over o1 and o2 respectively, yet o1[0..10] and
+o2[0..10] are discarded. Thus, some of the entropy con-
+tained in state will not make it to the output in this com-
+putation.
+
+The fact that this particular construction is prominent
+and pervasive throughout the PRNG suggests that it is not
+an accident but a design decision by OpenSSL. While we do
+not agree with it, we choose to mask the issue and concen-
+trate on uncovering other problems.
+
+We achieve the masking by deﬁning h2 as injective from its
+last argument, state[state_index..state_index+10>], to the
+last 10 byte of its output (as opposed to an injection from
+a 20-byte argument to the full 20-byte output as demanded
+by (2)). It is clear that the actual SHA-1 implementation
+does not have this property, but the unsound idealization
+makes the code fragment above injective from state[0..20]
+to out, as the discarded parts of o1 and o2 no longer contain
+entropy. This deviation from (2) silences the alarm.
+6.6 Entroposcope Detects the Debian Incident
+The Debian incident occurred when the Debian OpenSSL
+maintainer, as part of a campaign against memory-related
+errors, patched OpenSSL to be memory-safe. As mentioned
+above, OpenSSL uses uninitialized memory as an additional
+source of entropy for its PRNG, but the patch not only elim-
+inated that but unintentionally disabled all PRNG seeding.
+Or rather almost all, as the current PID was still used as a
+source of entropy in RAND_bytes to prevent stream duplica-
+tion upon forking (this part is elided from Figure 5).
+
+The incident corresponds to the Debian maintainer hav-
+ing deleted Line 14 from the source code in Figure 5. This
+way, the entropy-containing buf[i..i+20<] is no longer read
+from in the rest of the PRNG. Deﬁning an idealized hash
+function that ensures injectivity of the PRNG (like the ﬁrst
+one in Section 6.4) becomes impossible. For any given ide-
+alization, Entroposcope produces a counterexample to in-
+jectivity (any two seeds will produce the same output after
+invoking SHA-1 in RAND_add), which immediately leads to
+the detection of the problem. The counterexample visualizer
+helps pinpoint the exact place where the problem occurs.
+
+Once the idealized functionality is developed, Entropo-
+scope can also be included as a completely automatic check
+into the continuous integration process in order to prevent
+introduction of bugs during maintenance.
+6.7 Entroposcope Detects A Previously Undis-
+covered Anomaly in the OpenSSL PRNG
+When we applied Entroposcope to the OpenSSL PRNG,
+the tool immediately detected a bug in a piece of code that
+manages entropy in the large pool. The defect is close in
+
+spirit to the one in the Android PRNG. Even though it
+turned out not exploitable in the larger context, the inci-
+dent demonstrates that Entroposcope is eﬀective at doing
+what it is designed to.
+
+The problem occurs in the code implementing the circular
+buﬀer state that is the large entropy pool. The following
+code is encountered towards the end of RAND_bytes:
+
+for ( i =0; i < M D _ D I G E S T _ L E N G T H /2; i ++) {
+
+state [ st_idx ++]^= l o c a l _ m d [ i ];
+if ( st_idx >= st_num ) st_idx =0;
+if ( i < j ) *( buf ++) = l o c a l _ m d [ i + M D _ D I G E S T _ L E N G T H /2];
+
+}
+
+In the pseudocode implementation of Figure 5, this code
+corresponds to Lines 32–33. After the analysis driver has
+seeded the PRNG with M bytes, we reach this code for the
+ﬁrst time with st_idx = st_num = M . The former variable is
+the current index into state, while the latter is the number
+of bytes in the pool that are ﬁlled with seed data.
+
+The code above is itself part of an outer loop. It is easy to
+see that the sequence of values of st_idx at inner loop entry
+is M, 9, 19, 29, . . . The correct sequence, in contrast, would
+have been 0, 10, 20, . . . or at least M, 10, 20, . . . (a special case
+in the code reading from the pool treats st_num as zero). The
+signiﬁcance of these values is that they are used to decom-
+pose the pool into chunks supplying entropy in each cycle of
+output generation. The code above forces chunks of the
+form state[0..10], state[9..19], state[19..29], . . . While
+each chunk is 10 bytes long, the ﬁrst two chunks overlap by
+one byte. Accordingly, the last byte of entropy in the pool
+(byte number M − 1) is never used for output generation.
+The code above thus suﬀers from a small but real entropy
+loss, though this defect is masked during normal operation.
+The bug can only manifest itself when the entropy pool is
+not full (st_num < 1023). In practice, though, the pool is full,
+alone by virtue of self-seeding and pool stirring. Under these
+circumstances, another instance of wrapping code comes into
+eﬀect, correctly wrapping the index at the right bound of the
+state buﬀer.
+
+The bug can be ﬁxed—which Entroposcope veriﬁes—by
+
+prepending the loop shown above with
+
+if ( st_idx >= st_num ) st_idx =0;
+
+From a larger perspective, though, an overhaul of the con-
+voluted pool index manipulation in the whole PRNG could
+be beneﬁcial.
+6.8 Statistics
+
+Entroposcope completes a single analysis run of the
+OpenSSL PRNG for M = N = 40 in 33 seconds on a modest
+desktop computer (Intel Core i7 860 2.80GHz CPU). Of this
+time, translation of the PRNG behavior into a formula by
+CBMC took 7 seconds, generating the relational proof obli-
+gation 16 seconds, SAT solving 7 seconds, and generation
+of a counterexample from a satisfying assignment 3 seconds.
+The size of the formula supplied to the SAT solver was 191
+megabytes in DIMACS format. OpenSSL is the largest and
+most complex PRNG we considered.
+6.9 Entroposcope Detects a Previously Undis-
+covered Entropy Loss in Libgcrypt PRNG
+For reasons of space, we can only superﬁcially describe the
+problem here; details can be found in the extended version
+of the paper [11].
+
+686The Libgcrypt PRNG describes itself as modeled after
+the one in [13]. Its critical function mix_pool perturbs the
+state of the generator by repeatedly hashing overlapping re-
+gions of the entropy pool back into the pool. The Libgcrypt
+implementation deviates from [13] in several ways. In par-
+ticular, the region of the pool supplied to the hash function
+in Libgcrypt is not contiguous but contains a 20-byte “hole”.
+The hole has the consequence that mixing a full pool reduces
+its entropy by at least 20 bytes. Other deviations from [13]
+make the ﬂow of entropy diﬃcult to understand. The prob-
+lem was ﬁxed by the Libgcrypt developer after we reported
+it.
+
+7. A MINI-MUSEUM OF ENTROPY LOSS
+Entropy loss is not limited to (cryptographic) PRNGs. All
+entropy-processing applications are susceptible. To demon-
+strate the importance of the concept, we brieﬂy discuss three
+instances taken from diﬀerent application domains. While
+Entroposcope detects injectivity failures in all of these
+cases, we are not claiming that it is the best means to deal
+with the problem.
+In scenarios like the third one (Linux
+kernel), the routine use of the tool, on the other hand, is
+probably advisable.
+7.1 Debit Card PINs
+
+A requirement of the early eurocheque debit card system
+(“EC-Karte” in Germany) was that an ATM can check the
+card PIN oﬄine. To this end, the PIN was derived by en-
+crypting and transforming the public data stored on the
+card. As the source of entropy the banks chose four hex
+digits of the ciphertext. To obtain a decimal PIN, the hex
+digits A − F were replaced by 0 − 5 correspondingly.
+In
+the ﬁnal step, any occurrence of an initial zero was replaced
+by one, as the banks deemed a PIN beginning with a zero
+confusing for the customer. This decimalization produced
+a skewed PIN distribution, with small digits more common
+than large digits. Ampliﬁed by other features of the cards,
+the entropy loss resulted in four-digit PINs that were easier
+to guess than a uniformly distributed three-digit PIN [21].
+The problem was solved when oﬄine PIN checking was re-
+tired and online checking became mandatory.
+7.2 Online Poker Card Deck Shufﬂing
+
+ASF Software Inc. was one of the ﬁrst online poker soft-
+ware providers. Since cheating by the operator is a concern
+in online gambling, the company published its deck shuﬄing
+source code with the intent to increase client conﬁdence in
+its software.
+
+The analysis of the software reported in [2] has shown
+that it fails on all three security concerns. Concern 1 was
+violated due to seeding the PRNG with current time, which
+was not only limited in range to 32 bits (a shuﬄed deck of
+cards contains nearly 226 bits of entropy) but also roughly
+known to the attacker. The software furthermore also failed
+Concern 2. The shuﬄing process produced a skewed dis-
+tribution of decks containing less entropy than a properly
+shuﬄed deck or the PRNG output used to control the shuf-
+ﬂe.
+7.3 Linux ASLR Vulnerability
+
+Address space layout randomization (ASLR) is a popu-
+lar OS mechanism to mitigate buﬀer overﬂow attacks. An
+entropy loss in the Linux kernel prior to version 3.19-rc3
+
+reduces the eﬀectiveness of the stack randomization by a
+factor of four.8
+
+In the following code (assuming x86 64 architecture), the
+entropy source are the lowest 22 bits (STACK_RND_MASK=0x7ff)
+of the value obtained from get_random_int() (Line 7).
+In
+Line 8, the result is shifted left by PAGE_SHIFT = 12 bits,
+causing an unsigned overﬂow of the 32-bit random_variable.
+22 + 12 − 32 = 2 bits of entropy inadvertently never reach
+the return value of the function. The solution is to declare
+random_variable as a 64-bit integer, as was intended.
+
+1
+
+static u n s i g n e d long r a n d o m i z e _ s t a c k _ t o p ( u n s i g n e d
+
+long s t a c k _ t o p )
+
+2 {
+3
+
+4
+
+5
+
+6
+
+7
+
+8
+
+9
+
+u n s i g n e d int r a n d o m _ v a r i a b l e = 0;
+
+if (( current - > flags & P F _ R A N D O M I Z E ) &&
+
+!( current - > p e r s o n a l i t y & A D D R _ N O _ R A N D O M I Z E ) ) {
+r a n d o m _ v a r i a b l e = g e t _ r a n d o m _ i n t () &
+
+S T A C K _ R N D _ M A S K ;
+
+r a n d o m _ v a r i a b l e < <= P A G E _ S H I F T ;
+
+}
+
+return P A G E _ A L I G N ( s t a c k _ t o p ) + r a n d o m _ v a r i a b l e ;
+
+return P A G E _ A L I G N ( s t a c k _ t o p ) - r a n d o m _ v a r i a b l e ;
+
+10 # ifdef C O N F I G _ S T A C K _ G R O W S U P
+11
+12 # else
+13
+14 # endif
+15 }
+
+Another entropy loss in the ASLR implementation on Linux
+has also been reported.9
+
+8. RELATED WORK AND ALTERNATIVES
+
+Previous own work.
+
+This paper builds upon insights collected during the pilot
+study [10], where we proved correctness of the (ﬁxed) An-
+droid PRNG in an interactive theorem prover. The current
+paper signiﬁcantly extends and improves this work, both in
+the information-theoretical development and in practicality.
+The fact that proof construction previously took hours
+and required substantial user interaction motivated us to re-
+design the approach, changing the underlying program ver-
+iﬁcation architecture and the idealization of cryptographic
+primitives. The result is a vastly improved pragmatics, with
+drastically reduced need for user interaction, counterexam-
+ples to PRNG correctness, and turnaround times in the mag-
+nitude of seconds rather than hours.
+
+Functional veriﬁcation and testing.
+
+Of course, it is possible to state and verify a functional
+speciﬁcation of the PRNG implementation with existing ver-
+iﬁcation technology. However, since PRNG output lacks in-
+trinsic meaning, such a speciﬁcation would have to closely
+mimic the implementation and thus be complex and tedious
+to write. It would be diﬃcult to understand it and ascer-
+tain its adequacy; neither would it be possible to reuse it for
+another PRNG. The information ﬂow speciﬁcation (1), on
+the other hand, directly expresses the desired property, is
+compact and easy to understand, and is nearly independent
+of the PRNG implementation in question.
+
+Functional testing is rare for similar reasons. The only
+test suite containing reference seeds and corresponding out-
+8H. Marco, CVE-2015-1593, http://hmarco.org/bugs/linux-
+ASLR-integer-overﬂow.html
+9http://hmarco.org/bugs/linux-ASLR-reducing-mmap-by-
+half.html
+
+687puts we are aware of is part of the NIST SP 800-90 standard
+for PRNGs implementing it. Note that such a suite essen-
+tially constitutes a regression test, i.e., it only assures that
+all implementations of the standard perform in the same
+way. Unit testing of PRNGs is often impeded by the lack of
+modularity in implementations.
+
+Statistical testing.
+
+Several statistical test suites exist for assessing the qual-
+ity of random numbers. Among the most popular are DIE-
+HARD with its open source counterpart DIEHARDER and
+the NIST SP800-22 test suite. The suites scan a stream of
+pseudo-random numbers for certain predeﬁned distribution
+anomalies. At the same time, we are not aware of recommen-
+dations on how the stream is to be produced. In practice, it
+appears customary to derive the stream from a single seed.
+The tests are repeated multiple times (with diﬀerent seeds)
+to increase the degree of conﬁdence but the results between
+individual runs are not cross-correlated.
+
+Given the single-stream nature of the mentioned tests, it
+is reasonably safe to expect that any modern cryptographic
+PRNG will pass them, even in presence of entropy loss.
+In [27], it was empirically demonstrated that the defective
+Debian OpenSSL PRNG passes the NIST SP800-22 test.
+
+The ﬁrst signiﬁcant advance in quality assurance for cryp-
+tographic PRNGs has been made only recently in the form
+of LIL testing [27]. The test estimates the distance in a
+particular statistical metric between a set of bit sequences
+generated by running a PRNG and a similarly-sized set of
+truly random sequences. The authors show that the de-
+fective Debian OpenSSL PRNG is associated with a signiﬁ-
+cantly larger distance to uniform randomness than the intact
+PRNG when considering 1000 sequences of 2GB each.
+
+The LIL test is agnostic of the exact way the sequences
+are generated. The advice given by the authors is to gen-
+erate them in a way reﬂecting the particular application of
+interest. The advantage of such a test (as of testing in gen-
+eral) is that it can be made to reﬂect the actual deployment
+scenario, including the larger system, up to the hardware
+layer. On the other hand, it requires insight into the ex-
+act planned PRNG usage pattern, as diﬀerent patterns can
+produce signiﬁcantly diﬀerent results.
+
+For example, a single-threaded Debian OpenSSL PRNG
+client fails the LIL test as carried out in [27]. The test
+was run in a simulated environment on a Windows sys-
+tem, where PIDs are recycled with a substantial probability.
+Since the PID is the only source of entropy in the broken De-
+bian PRNG (in the single-threaded case), many generated
+sequences were identical. The same test on an actual Debian
+system would have (as far as we understand) succeeded, as
+Linux only recycles PIDs after they wrap around. Finally,
+testing cannot detect less severe (but still cryptography-
+aﬀecting) instances of entropy loss where the probability of
+repeated streams is suﬃciently low.
+
+Information ﬂow analyses.
+
+Many information ﬂow analyses have been developed—
+most of them with the use case of minimizing information
+ﬂow. Maximizing information ﬂow, in contrast, plays a much
+less prominent role. The ﬁrst appearance we are aware of
+is as required information release in [6]. The concept has
+been revisited in [24] for the purpose of optimizing secure
+multi-party computation protocols. The latter work devel-
+
+ops tooling based on symbolic execution and SMT solving
+and is the one closest in spirit to ours.
+
+A research branch measuring the amount of information
+ﬂowing in programs (rather than checking absence or max-
+imality of ﬂows) is Quantitative Information Flow analysis
+(QIF). Several methods and tools for QIF exist, including
+our own for C programs [19]. Yet, the complexity of PRNGs
+coupled with large desired ﬂows puts this application beyond
+the reach of state-of-the-art QIF tools.
+
+Some of the entropy loss instances described in this pa-
+per are “simple” enough to be detectable by some form of
+(to be developed) static or even dynamic dataﬂow anal-
+ysis. This is the case where some part of the entropy-
+carrying state is never read (Sections 6.6, 6.7) or immedi-
+ately overwritten with clearly irrelevant values (Section 2).
+Other instances (Section 6.9) feature complex ﬂows that re-
+quire, at the least, (unsound) cryptographic primitive ideal-
+ization to be detectable without losing practical complete-
+ness. Furthermore, due to their lack of precision and impos-
+sibility to use sound idealizations, aforementioned analyses
+can only detect bugs. Entroposcope, on the other hand,
+can prove their absence within the analyzed scope. Nonethe-
+less, dataﬂow analyses have the advantage of scalability and
+warrant further investigation.
+
+Manual PRNG analysis.
+
+A number of publications report results of manual anal-
+ysis of individual cryptographic PRNGs or PRNG classes,
+among them [12–14, 17, 22, 23, 26] and [3, 7, 9]. The perspec-
+tive taken in the latter works is based on elaborate attack
+models, where the attacker, for instance, can control the
+distribution of the inputs used to seed the PRNG, view, or
+even corrupt the internal PRNG state.
+
+Complementary research.
+
+There exists a wide body of work on randomness in cryp-
+tography and security. Research subjects include secure the-
+oretical PRNG constructions, cryptographic schemes that
+either do not require randomness or degrade gracefully in
+presence of bad randomness, empirical studies of random-
+ness in practice through cryptographic artifacts collected
+from public sources, studies and methods of entropy col-
+lection in embedded devices or virtual machines. Since this
+research is orthogonal to the immediate goals or techniques
+of our work, we do not survey it here.
+
+9. CONCLUSION
+
+We have presented the ﬁrst static analysis and one of the
+ﬁrst technical quality assurance measures for cryptographic
+PRNG implementations. We implemented our analysis in
+a tool named Entroposcope and demonstrated its prac-
+ticality by analyzing ﬁve real-world PRNGs implementing
+diﬀerent designs, including one of the most complex in wide
+deployment today.
+
+In the experiments, Entroposcope uncovered PRNG de-
+fects eﬀectively and with reasonable eﬀort. Five instances of
+entropy loss showcase the tool’s capabilities, including pre-
+viously undiscovered anomalies in OpenSSL and Libgcrypt.
+The detection is systematic (i.e., it is not based on exam-
+ples, patterns, or heuristics) and sound. A negative analysis
+outcome guarantees absence of entropy loss in the analyzed
+scope.
+
+688The analysis we presented is intended to detect a large
+but speciﬁc class of implementation mistakes. It is thus not
+intended to replace expert review, nor, more generally, re-
+search into good PRNG designs and deployment practices.
+Yet, it is the ﬁrst instance where the work of a PRNG se-
+curity analyst in a particular area can be supported by an
+eﬀective tool.
+
+Interesting directions for future research include exten-
+sions to more powerful attacker models, scenarios with multi-
+threading, and automatic counterexample-guided synthesis
+of cryptographic idealizations.
+Acknowledgments
+This work was in part supported by the German National
+Science Foundation (DFG) under the priority program 1496
+“Reliably Secure Software Systems – RS3.”
+
+The authors would like to thank the anonymous CCS 2016
+reviewers for the helpful suggestions for improving this paper
+and for pointing out [6] and [24]. Special thanks to the
+CBMC team and in particular Michael Tautschnig for the
+excellent tool and support.
+
+10. REFERENCES
+[1] G. Alendal, C. Kison, and modg. got HW crypto? On
+
+the (in)security of a self-encrypting drive series.
+Cryptology ePrint Archive, Report 2015/1002, 2015.
+https://eprint.iacr.org/2015/1002.
+
+[2] B. Arkin, F. Hill, S. Marks, M. Schmid, T. J. Walls,
+and G. McGraw. How we learned to cheat at online
+poker: A study in software security. Developer.com.
+Originally published on 1999-09-28. Available at
+http://www.cigital.com/papers/download/developer
+gambling.php.
+
+[3] B. Barak and S. Halevi. A model and architecture for
+
+pseudo-random generation with applications to
+/dev/random. In ACM CCS, 2005.
+
+[4] G. Barthe, P. R. D’Argenio, and T. Rezk. Secure
+
+information ﬂow by self-composition. In IEEE
+Computer Security Foundations Workshop, 2004.
+
+[5] D. R. L. Brown and K. Gjøsteen. A security analysis
+of the NIST SP 800-90 elliptic curve random number
+generator. In CRYPTO. Springer, 2007.
+
+[6] S. Chong. Required information release. In IEEE
+
+Computer Security Foundations Symposium (CSF),
+2010.
+
+[7] M. Cornejo and S. Ruhault. Characterization of
+
+real-life PRNGs under partial state corruption. In
+ACM CCS, 2014.
+
+[8] ´A. Darvas, R. H¨ahnle, and D. Sands. A theorem
+
+proving approach to analysis of secure information
+ﬂow. In Security in Pervasive Computing, 2005.
+
+[9] Y. Dodis, D. Pointcheval, S. Ruhault, D. Vergniaud,
+
+and D. Wichs. Security analysis of pseudo-random
+number generators with input: /dev/random is not
+robust. In ACM CCS, 2013.
+
+[10] F. D¨orre and V. Klebanov. Pseudo-random number
+
+generator veriﬁcation: A case study. In Veriﬁed
+Software: Theories, Tools, and Experiments (VSTTE).
+Springer, 2015.
+
+[11] F. D¨orre and V. Klebanov. Practical detection of
+entropy loss in pseudo-random number generators
+(extended version). Technical Report 2016-12,
+
+Karlsruhe Institute of Technology, 2016.
+http://dx.doi.org/10.5445/IR/1000058113.
+
+[12] L. Dorrendorf, Z. Gutterman, and B. Pinkas.
+
+Cryptanalysis of the Windows random number
+generator. In ACM CCS, 2007.
+
+[13] P. Gutmann. Software generation of practically strong
+
+random numbers. In USENIX Security, 1998.
+
+[14] Z. Gutterman, B. Pinkas, and T. Reinman. Analysis
+
+of the Linux random number generator. In IEEE
+Security and Privacy, 2006.
+
+[15] N. Heninger, Z. Durumeric, E. Wustrow, and J. A.
+
+Halderman. Mining your Ps and Qs: Detection of
+widespread weak keys in network devices. In USENIX
+Security, 2012.
+
+[16] J. Kelsey, B. Schneier, and N. Ferguson. Yarrow-160:
+
+Notes on the design and analysis of the Yarrow
+cryptographic pseudorandom number generator. In
+Workshop on Selected Areas in Cryptography, 1999.
+
+[17] J. Kelsey, B. Schneier, D. Wagner, and C. Hall.
+Cryptanalytic attacks on pseudorandom number
+generators. In Workshop on Fast Software Encryption
+(FSE), 1998.
+
+[18] V. Klebanov. Precise quantitative information ﬂow
+
+analysis – a symbolic approach. Theoretical Computer
+Science, 538(0):124–139, 2014.
+
+[19] V. Klebanov, N. Manthey, and C. Muise. SAT-based
+
+analysis and quantiﬁcation of information ﬂow in
+programs. In Quantitative Evaluation of Systems
+(QEST). Springer, 2013.
+
+[20] D. Kroening and M. Tautschnig. CBMC – C bounded
+
+model checker. In Tools and Algorithms for the
+Construction and Analysis of Systems (TACAS), 2014.
+
+[21] M. G. Kuhn. Probability theory for
+
+pickpockets—ec-PIN guessing. In Workshop on
+Cryptography and Network Security. DIMACS
+Research and Education Institute, 1997. Available at
+http://www.cl.cam.ac.uk/˜mgk25/ec-pin-prob.pdf.
+[22] P. Lacharme, A. R¨ock, V. Strubel, and M. Videau.
+
+The Linux pseudorandom number generator revisited.
+Cryptology ePrint Archive, Report 2012/251, 2012.
+http://eprint.iacr.org/2012/251.
+
+[23] K. Michaelis, C. Meyer, and J. Schwenk. Randomly
+
+failed! The state of randomness in current Java
+implementations. In Conference on Topics in
+Cryptology (CT-RSA). Springer, 2013.
+
+[24] A. Rastogi, P. Mardziel, M. Hicks, and M. A.
+
+Hammer. Knowledge inference for optimizing secure
+multi-party computation. In PLAS. ACM, 2013.
+
+[25] G. Smith. Quantifying information ﬂow using
+
+min-entropy. In Quantitative Evaluation of Systems
+(QEST). IEEE Computer Society, 2011.
+
+[26] F. Strenzke. An analysis of OpenSSL’s random
+
+number generator. In EUROCRYPT, 2016.
+
+[27] Y. Wang and T. Nicol. On statistical distance based
+testing of pseudo random sequences and experiments
+with PHP and Debian OpenSSL. Comput. Secur.,
+53(C):44–64, 2015.
+
+[28] S. Yilek, E. Rescorla, H. Shacham, B. Enright, and
+
+S. Savage. When private keys are public: Results from
+the 2008 Debian OpenSSL vulnerability. In Conference
+on Internet Measurement (IMC). ACM, 2009.
+
+689

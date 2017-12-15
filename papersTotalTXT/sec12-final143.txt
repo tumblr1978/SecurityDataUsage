@@ -1,0 +1,2696 @@
+kGuard: Lightweight Kernel Protection against Return-to-user Attacks
+
+Vasileios P. Kemerlis
+
+Georgios Portokalidis
+Network Security Lab
+
+Angelos D. Keromytis
+
+Department of Computer Science
+
+Columbia University, New York, NY, USA
+{vpk, porto, angelos}@cs.columbia.edu
+
+Abstract
+
+Return-to-user (ret2usr) attacks exploit the operating sys-
+tem kernel, enabling local users to hijack privileged ex-
+ecution paths and execute arbitrary code with elevated
+privileges. Current defenses have proven to be inade-
+quate, as they have been repeatedly circumvented, in-
+cur considerable overhead, or rely on extended hypervi-
+sors and special hardware features. We present kGuard,
+a compiler plugin that augments the kernel with com-
+pact inline guards, which prevent ret2usr with low per-
+formance and space overhead. kGuard can be used with
+any operating system that features a weak separation be-
+tween kernel and user space, requires no modiﬁcations
+to the OS, and is applicable to both 32- and 64-bit ar-
+chitectures. Our evaluation demonstrates that Linux ker-
+nels compiled with kGuard become impervious to a va-
+riety of control-ﬂow hijacking exploits. kGuard exhibits
+lower overhead than previous work, imposing on average
+an overhead of 11.4% on system call and I/O latency on
+x86 OSs, and 10.3% on x86-64. The size of a kGuard-
+protected kernel grows between 3.5% and 5.6%, due to
+the inserted checks, while the impact on real-life appli-
+cations is minimal (≤1%).
+
+1 Introduction
+
+The operating system (OS) kernel is becoming an in-
+creasingly attractive target for attackers [30, 60, 61, 64].
+Due to the weak separation between user and kernel
+space, direct transitions from more to less privileged pro-
+tection domains (e.g., kernel to user space) are permissi-
+ble, even though the reverse is not. As a result, bugs
+like NULL pointer dereferences that would otherwise
+cause only system instability, become serious vulnera-
+bilities that facilitate privilege escalation attacks [64].
+When successful, these attacks enable local users to ex-
+ecute arbitrary code with kernel privileges, by redirect-
+ing the control ﬂow of the kernel to a user process.
+
+Such return-to-user (ret2usr) attacks have affected all
+major OSs, including Windows [60], Linux [16, 18],
+and FreeBSD [19, 59, 61], while they are not limited to
+x86 systems [23], but have also targeted the ARM [30],
+DEC [31], and PowerPC [25] architectures.
+
+There are numerous reasons to why attacks against the
+kernel are becoming more common. First and foremost,
+processes running with administrative privileges have be-
+come harder to exploit due to the various defense mech-
+anisms adopted by modern OSs [34, 52]. Second, NULL
+pointer dereference errors had not received signiﬁcant at-
+tention, until recently, exactly because they were thought
+impractical and too difﬁcult to exploit. In fact, 2009 has
+been proclaimed, by some security researchers, as “the
+year of the kernel NULL pointer dereference ﬂaw” [15].
+Third, exploiting kernel bugs, besides earning attack-
+ers administrative privileges, enables them to mask their
+presence on compromised systems [6].
+
+Previous approaches to the problem are either im-
+practical for deployment in certain environments or can
+be easily circumvented. The most popular approach
+has been to disallow user processes to memory-map the
+lower part of their address space (i.e., the one including
+page zero). Unfortunately, this scheme has been circum-
+vented by various means [21, 66] and is not backwards
+compatible [35]. The PaX [52] patch for x86 and x86-64
+Linux kernels does not exhibit the same shortcomings,
+but greatly increases system call and I/O latency, espe-
+cially on 64-bit systems.
+
+Recent advances in virtualization have fostered a
+wave of research on extending virtual machine moni-
+tors (VMMs) to enforce the integrity of the virtualized
+guest kernels. SecVisor [62] and NICKLE [56] are two
+hypervisor-based systems that can prevent ret2usr attacks
+by leveraging memory virtualization and VMM intro-
+spection. However, virtualization is not always practi-
+cal. Consider smartphone devices that use stripped-down
+versions of Linux and Windows, which are also vulnera-
+ble to such attacks [30]. Running a complex VMM, like
+
+SecVisor, on current smartphones is not realistic due to
+their limited resources (i.e., CPU and battery life). On
+PCs, running the whole OS over a VM incurs perfor-
+mance penalties and management costs, while increas-
+ing the complexity and size of a VMM can introduce
+new bugs and vulnerabilities [44, 58, 71]. To address the
+latter, we have seen proposals for smaller and less error-
+prone hypervisors [65], as well as hypervisor protection
+solutions [4, 67]. The ﬁrst exclude mechanisms such as
+SecVisor, while the second add further complexity and
+overhead, and lead to a “turtles all the way down” prob-
+lem,1 by introducing yet another software layer to protect
+the layers above it. Addressing the problem in hardware
+would be the most efﬁcient solution, but even though In-
+tel has recently announced a new CPU feature, named
+SMEP [37], to thwart such attacks, hardware extensions
+are oftentimes adopted slowly by OSs. Note that other
+vendors have not publicly announced similar extensions.
+We present a lightweight solution to the problem.
+kGuard is a compiler plugin that augments kernel code
+with control-ﬂow assertions (CFAs), which ensure that
+privileged execution remains within its valid boundaries
+and does not cross to user space. This is achieved by
+identifying all indirect control transfers during compi-
+lation, and injecting compact dynamic checks to attest
+that the kernel remains conﬁned. When a violation is de-
+tected, the system is halted by default, while a custom
+fault handler can also be speciﬁed. kGuard is able to
+protect against attacks that overwrite a branch target to
+directly transfer control to user space [23], while it also
+handles more elaborate, two-step attacks that overwrite
+data pointers to point to user-controlled memory, and
+hence hijack execution via tampered data structures [20].
+Finally, we introduce two novel code diversiﬁcation
+techniques to protect against attacks that employ by-
+pass trampolines to avoid detection by kGuard. A tram-
+poline is essentially an indirect branch instruction con-
+tained within the kernel. If an attacker manages to ob-
+tain the address of such an instruction and can also con-
+trol its operand, he can use it to bypass our checks. Our
+techniques randomize the locations of the CFA-indirect
+branch pairs, both during compilation and at runtime,
+signiﬁcantly reducing the attackers’ chances of guessing
+their location. The main contributions of this paper can
+be summarized in the following:
+
+• We present
+
+the design and implementation of
+kGuard, a compiler plugin that protects the kernel
+from ret2usr attacks by injecting ﬁne-grained in-
+line guards during compilation. Our approach does
+not require modiﬁcations to the kernel or additional
+software, such as a VMM. It is also architecture in-
+
+1http://en.wikipedia.org/wiki/
+
+Turtles_all_the_way_down
+
+dependent by design, allowing us to compile OSs
+for different target architectures and requires little
+modiﬁcations for supporting new OSs.
+
+• We introduce two code diversiﬁcation techniques
+to randomize the location of indirect branches, and
+their associated checks, for thwarting elaborate ex-
+ploits that employ bypass trampolines.
+
+• We implement kGuard as a GCC extension, which
+is freely available.
+Its maintenance cost is low
+and can successfully compile functional x86/x86-
+64 Linux and FreeBSD kernels. More importantly,
+it can be easily combined with other compiler-based
+protection mechanisms and tools.
+
+• We assess the effectiveness of kGuard using real
+privilege escalation attacks against 32- and 64-bit
+Linux kernels. In all cases, kGuard was able to suc-
+cessfully detect and prevent the respective exploit.
+
+• We evaluate the performance of kGuard using a set
+of macro- and micro-benchmarks. Our technique
+incurs minimal runtime overhead on both x86 and
+x86-64 architectures. Particularly, we show negligi-
+ble impact on real-life applications, and an average
+overhead of 11.4% on system call and I/O latency
+on x86 Linux, and 10.3% on x86-64. The space
+overhead of kGuard due to the instrumentation is
+between 3.5% – 5.6%, while build time increases
+by 0.05% to 0.3%.
+
+kGuard is to some extent related to previous research
+on control-ﬂow integrity (CFI) [2]. Similar to CFI,
+we rely on inline checks injected before every unsafe
+control-ﬂow transfer. Nevertheless, CFI depends on a
+precomputed control-ﬂow graph for determining the per-
+missible targets of every indirect branch, and uses binary
+rewriting to inject labels and checks in binaries.
+CFI is not effective against ret2usr attacks.
+
+Its in-
+tegrity is only guaranteed if the attacker cannot overwrite
+the code of the protected binary or execute data. Dur-
+ing a ret2usr attack, the adversary completely controls
+user space memory, both in terms of contents and rights,
+and hence, can subvert CFI by prepending his shellcode
+with the respective label. Additionally, CFI induces con-
+siderable performance overhead, thereby making it difﬁ-
+cult to adopt. Ongoing work tries to overcome the lim-
+itations of the technique [72]. kGuard can be viewed
+as a lightweight variant of CFI and Program Shepherd-
+ing [43] that is more suitable and efﬁcient in protecting
+kernel code from ret2usr threats.
+
+The rest of this paper is organized as follows. In Sec-
+tion 2, we look at how ret2usr attacks work and why
+the current protection schemes are insufﬁcient. Section 3
+presents kGuard. We discuss the implementation of the
+
+kGuard GCC plugin in Section 4, and evaluate its effec-
+tiveness and performance in Section 5. Section 6 dis-
+cusses possible extensions. Related work is in Section 7
+and conclusions in Section 8.
+
+2 Overview of ret2usr Attacks
+
+2.1 Why Do They Work?
+
+Commodity OSs offer process isolation through private,
+hardware-enforced virtual address spaces. However, as
+they strive to squeeze more performance out of the hard-
+ware, they adopt a “shared” process/kernel model for
+minimizing the overhead of operations that cross protec-
+tion domains, like system calls. Speciﬁcally, Unix-like
+OSs divide virtual memory into user and kernel space.
+The former hosts user processes, while the latter holds
+the kernel, device drivers, and kernel extensions (inter-
+ested readers are referred to Figure 5, in the appendix,
+for more information regarding the virtual memory lay-
+out of kernel and user space in Linux).
+
+Since code running in user
+
+In most CPU architectures, the segregation of the two
+spaces is assisted and enforced by two hardware features.
+The ﬁrst is known as protection rings or CPU modes,
+and the second is the memory management unit (MMU).
+The x86/x86-64 CPU architecture supports four protec-
+tion rings, with the kernel running in the most privileged
+one (ring 0) and user applications in the least privileged
+(ring 3).2 Similarly, the PowerPC platform supports two
+CPU modes, SPARC and MIPS three, and ARM seven.
+All these architectures also feature a MMU, which im-
+plements virtual memory and ensures that memory as-
+signed to a ring is not accessible by less privileged ones.
+space cannot di-
+rectly access or jump into the kernel, speciﬁc hard-
+ware facilities (i.e., interrupts) or special instructions
+(e.g., SYS{ENTER,CALL} and SYS{EXIT,RET} in
+x86/x86-64) are provided for crossing the user/kernel
+boundary. Nevertheless, while executing kernel code,
+complete and unrestricted access to all memory and sys-
+tem objects is available. For example, when servicing a
+system call for a process, the kernel has to directly access
+user memory for storing the results of the call. Hence,
+when kernel code is abused, it can jump into user space
+and execute arbitrary code with kernel privileges. Note
+that although some OSs have completely separated ker-
+nel and user spaces, such as the 32-bit XNU and Linux
+running on UltraSPARC, most popular platforms use a
+shared layout. In fact, on MIPS the shared address space
+is mandated by the hardware.
+
+As a consequence, software bugs that are only a source
+of instability in user space, like NULL pointer derefer-
+ences, can have more dire effects when located in the
+kernel. Spengler [64] demonstrated such an attack by
+exploiting a NULL pointer dereference bug, triggered by
+the invocation a system call with specially crafted param-
+eters. Earlier, it was generally thought that such ﬂaws
+could only be used to perform denial-of-service (DoS)
+attacks [29], but Spengler’s exploit showed that mapping
+code segments with different privileges inside the same
+scope can be exploited to execute arbitrary user code
+with kernel privileges. Note that SELinux [47], the hard-
+ened version of the Linux kernel, is also vulnerable to
+this attack.
+
+2.2 How Do They Work?
+
+ret2usr attacks are manifested by overwriting kernel-
+level control data (e.g., return addresses, jump tables,
+function pointers) with user space addresses.
+In early
+versions of such exploits, this was accomplished by in-
+voking a system call with carefully crafted arguments to
+nullify a function pointer. When the null function pointer
+is eventually dereferenced, control is transferred to ad-
+dress zero that resides in user space. Commonly, that ad-
+dress is not used by processes and is unmapped.3 How-
+ever, if the attacker has local access to the system, he
+can build a program with arbitrary data or code mapped
+at address zero (or any other address in his program for
+that matter). Notice that since the attacker controls the
+program, its memory pages can be mapped both writable
+and executable (i.e., W∧X anti-measures do not apply).
+736 s o c k
+737 f l a g s = ! ( f i l e −> f _ f l a g s & O_NONBLOCK) ? \
+738
+739 i f
+740
+741 / ∗ [ ! ] NULL p o i n t e r d e r e f e r e n c e
+742 r e t u r n sock −>ops−>s e n d p a g e ( sock , page , o f f s e t ,
+743
+
+= f i l e −> p r i v a t e _ d a t a ;
+
+0 : MSG_DONTWAIT ;
+
+f l a g s
+
+| = MSG_MORE;
+
+( s e n d p a g e )
+
+[ ! ] ∗ /
+
+( more )
+
+s i z e ,
+
+f l a g s ) ;
+
+Snippet 1: NULL function pointer in Linux (net/socket.c)
+
+Snippet 1 presents a straightforward NULL function
+pointer vulnerability [17] that affected all Linux kernel
+versions released between May 2001 and August 2009
+(2.4.4/2.6.0 – 2.4.37/2.6.30.4).
+In this exploit, if the
+sendfile system call is invoked with a socket descrip-
+tor belonging to a vulnerable protocol family, the value
+of the sendpage pointer in line 742 is set to NULL.
+This results in an indirect function call to address zero,
+which can be exploited by attackers to execute arbitrary
+code with kernel privileges. A more detailed analysis of
+this attack is presented in Appendix A.
+
+2Some x86/x86-64 CPUs have more than four rings. Hardware-
+assisted virtualization is colloquially known as ring -1, while System
+Management Mode (SMM) is supposedly at ring -2.
+
+3In Linux accessing an unmapped page, when running in kernel
+mode, results into a kernel oops and subsequently causes the OS to kill
+the offending process. Other OSs fail-stop with a kernel panic.
+
+1333 / ∗ [ ! ] NULL p o i n t e r d e r e f e r e n c e
+1334 i b u f −>ops−> g e t ( i p i p e ,
+1335 o b u f
+1336 ∗ o b u f = ∗ i b u f ;
+
+i b u f ) ;
+= o p i p e −> b u f s + n b u f ;
+
+( o p s )
+
+[ ! ] ∗ /
+
+Snippet 2: NULL data pointer in Linux (fs/splice.c)
+
+Snippet 2 shows the Linux kernel bug exploited by
+Spengler [64], which is more elaborate. The ops ﬁeld
+in line 1334, which is a data pointer of type struct
+pipe_buf_operations, becomes NULL after the
+invocation of the tee system call. Upon dereferencing
+ops, the effective address of a function is read via get,
+which is mapped to the seventh double word (assuming
+an x86 32-bit architecture) after the address pointed by
+ops (i.e., due to the deﬁnition of the structure). Hence,
+the kernel reads the branch target from 0x0000001C,
+which is controlled by the user. This enables an attacker
+to redirect the kernel to an arbitrary address.
+
+NULL pointer dereferences are not the only attack
+vector for ret2usr exploits. Attackers can partially cor-
+rupt, or completely overwrite with user space addresses,
+kernel-level control data, after exploiting memory safety
+bugs. Examples of common targets include, return ad-
+dresses, global dispatch tables, and function pointers
+stored in kernel stack and heap. In addition, other vulner-
+abilities allow attackers to corrupt arbitrary kernel mem-
+ory, and consequently any function or data pointer, due
+to the improper sanitization of user arguments [22, 23].
+Use-after-free vulnerabilities due to race conditions in
+FreeBSD 6.x/7.x and Linux kernels before 2.6.32-rc6
+have also been used for the same purpose [19, 20]. These
+ﬂaws are more complex and require multiple simulta-
+neous kernel entrances to trigger the bug. Once they
+succeed, the attacker can corrupt a pointer to a critical
+kernel data structure that grants him complete control
+over its contents by mapping a tampered data structure at
+user space memory. If the structure contains a function
+pointer, the attacker can achieve user code execution.
+
+The end effect of all these attacks is that the ker-
+nel is hijacked and control is redirected to user space
+code. Throughout the rest of this paper, we will refer
+to this type of exploitation as return-to-user (ret2usr),
+since it resembles the older return-to-libc [27] technique
+that redirected control to existing code in the C library.
+Interestingly, ret2usr attacks are yet another incarna-
+tion of the confused deputy problem [39], where a user
+“cheats” the kernel (deputy) to misuse its authority and
+execute arbitrary, non-kernel code with elevated privi-
+leges. Finally, while most of the attacks discussed here
+target Linux, similar ﬂaws have been reported against
+FreeBSD, OpenBSD, and Windows [19, 26, 59–61].
+
+2.3 Limitations of Current Defenses
+
+Restricting mmap The mitigation strategy adopted by
+most Linux and BSD systems is to restrict the ability to
+map the ﬁrst pages of the address space to users with
+administrative privileges only. In Linux and FreeBSD,
+this is achieved by modifying the mmap system call to
+apply the respective restrictions, as well as preventing
+binaries from requesting page zero mappings. OpenBSD
+completely removed the ability to map page zero, while
+NetBSD has not adopted any protective measures yet.
+
+Unfortunately, this approach has several limitations.
+First and foremost, it does not solve the actual problem,
+which is the weak separation of spaces. Disallowing ac-
+cess to lower logical addresses is merely a protection
+scheme against exploits that rely on NULL pointer bugs.
+If an attacker bypasses the restriction imposed by mmap,
+he can still orchestrate a ret2usr attack. Second, it does
+not protect against exploits where control is redirected to
+memory pages above the forbidden mmap region (e.g.,
+by nullifying one or two bytes of a pointer, or overwrit-
+ing a branch target with an arbitrary value). Third, it
+breaks compatibility with applications that rely on hav-
+ing access to low logical addresses, such as QEMU [5],
+Wine [70], and DOSEMU [28]. Similar problems have
+been reported for the FreeBSD distribution [35].
+
+In fact, shortly after these protection mechanisms were
+set in place, many techniques were developed for circum-
+venting them. The ﬁrst technique for bypassing mmap
+restrictions used the brk system call for changing the
+location of the program break (marked as brk offset
+in Figure 5), which indicates where the heap segment
+starts. By setting the break to a low logical address, it
+was possible to dynamically allocate memory chunks in-
+side page zero. Another technique used the mmap sys-
+tem call to map pages starting from an address above the
+forbidden region and extend the allocated region down-
+wards, by supplying the MAP_GROWSDOWN parameter to
+the call. A more elaborate mechanism utilized the differ-
+ent execution domains supported by Linux, which can be
+set with the personality system call, for executing
+binaries compiled for different OSs. Speciﬁcally, an at-
+tacker could set the personality of a binary to SRV4, thus
+mapping page zero, since SRV4 utilizes the lower pages
+of the address space [66]. Finally, the combination of
+a NULL pointer with an integer overﬂow has also been
+demonstrated, enabling attackers to completely bypass
+the memory mapping restrictions [20, 21]. Despite the
+fact that all the previous techniques were ﬁxed shortly
+after they were discovered, it is possible that other ap-
+proaches can (and probably will be) developed by persis-
+tent attackers, since the root cause of this new manifes-
+tation of control hijacking attacks is the weak separation
+of spaces.
+
+PaX UDEREF
+
+[53]
+
+In particular,
+
+Hardening with
+
+and
+KERNEXEC are two patches included in PaX [52]
+for hardening the Linux kernel.
+they
+provide protection against dereferencing, or branching
+to, user space memory. In x86, PaX relies on memory
+segmentation. It maps kernel space into an expand-down
+segment that returns a memory fault whenever privileged
+code tries to dereference pointers to other segments.4
+In x86-64, where segmentation is not available, PaX
+resorts in temporarily remapping user space memory
+into a different area, using non-executable rights, when
+execution enters the kernel, and restoring it when it exits.
+PaX has limitations. First, it requires kernel patching
+and is platform and architecture speciﬁc (i.e., x86/x86-64
+Linux only). On the other hand, ret2usr attacks not only
+have been demonstrated on many architectures, such as
+ARM [30], DEC Alpha [31], and PowerPC [25], but also
+on different OSs, like the BSDs [19, 26, 59, 61]. Sec-
+ond, as we experimentally conﬁrmed, PaX incurs non-
+negligible performance overhead (see Section 5). In x86,
+it achieves strong isolation using the segmentation unit,
+but the kernel still needs to interact with user-level pro-
+cesses. Hence, PaX modiﬁes the stub that executes dur-
+ing kernel entry for setting the respective segments, and
+also patches code that copies data to/from user space, so
+as to temporarily ﬂatten the privileged segment for the
+duration of the copy. Evidently, this approach increases
+system call latency. In x86-64, remapping user space re-
+quires page table manipulation, which results in a TLB
+ﬂush and exacerbates the problem [41].
+
+3 Protection with kGuard
+
+3.1 Overview
+
+We propose a defensive mechanism that builds upon
+inline monitoring and code diversiﬁcation. kGuard is
+a cross-platform compiler plugin that enforces address
+space segregation, without relying on special hardware
+features [37, 53] or custom hypervisors [56, 62]. It pro-
+tects the kernel from ret2usr attacks with low-overhead,
+by augmenting exploitable control transfers with dy-
+namic control-ﬂow assertions (CFAs) that, at runtime,
+prevent the unconstrained transition of privileged execu-
+tion paths to user space. The injected CFAs perform a
+small runtime check before indirect branches to verify
+that the target address is always in kernel space. If the
+assertion is true, execution continues normally, while if
+it fails because of a violation, execution is transferred to
+a handler that was inserted during compilation. The de-
+fault handler appends a warning message to the kernel
+log and halts the system. We choose to coerce assertion
+
+4In x86, UDEREF restricts only the SS, DS, and ES segments. CS
+
+is taken care by the accompanying KERNEXEC patch.
+
+failures into a kernel fail-stop to prevent unsafe condi-
+tions, such as leaving the OS into an inconsistent state
+(e.g., by aborting an in-ﬂight kernel thread that might
+hold locks or other resources). In Section 6, we discuss
+how we can implement custom handlers for facilitating
+forensic analysis, error virtualization [63], selective con-
+ﬁnement, and protection against persistent attacks.
+
+After compiling a kernel with kGuard, its execution is
+limited to the privileged address space segment (e.g., ad-
+dresses higher than 0xC0000000 in x86 Linux and BSD).
+kGuard does not rely on any mapping restriction, so the
+previously restricted addresses can be dispensed to the
+process, lifting the compatibility issues with various ap-
+plications [5, 28, 35, 70]. Furthermore, the checks cannot
+be bypassed using mmap hacks, like the ones described
+in the previous section, nor can they be circumvented by
+elaborate exploits that manage to jump to user space by
+avoiding the forbidden low memory addresses. More im-
+portantly, the kernel can still read and write user memory,
+so its functionality remains unaffected.
+
+3.2 Threat Model
+
+In this work, we ascertain that an adversary is able to
+completely overwrite, partially corrupt (e.g., zero out
+only certain bytes), or nullify control data that are stored
+inside the address space of the kernel. Notice that over-
+writing certain data with arbitrary values, differs signif-
+icantly from overwriting arbitrary kernel memory with
+arbitrary values. kGuard does not deal with such an ad-
+versary. In addition, we assume that the attacker can tam-
+per with whole data structures (e.g., by mangling data
+pointers), which in turn may contain control data.
+
+Our technique is straightforward and guarantees that
+kernel/user space boundary violations are prevented.
+However, it is not a panacea that protects the kernel
+from all types control-ﬂow hijacking attacks. For in-
+stance, kGuard does not address direct code-injection
+inside kernel space, nor it thwarts code-reuse attacks
+that utilize return-oriented/jump-oriented programming
+(ROP/JOP) [7, 40]. Nevertheless, note the following.
+First and foremost, our approach is orthogonal to many
+solutions that do protect against such threats [4, 14, 42,
+45, 53, 62]. For instance, canaries injected by the com-
+piler [34] can be used against ret2usr attacks performed
+via kernel stack-smashing. Second, the unique nature of
+address space sharing casts many protection schemes, for
+the aforementioned problems, ineffective. As an exam-
+ple, consider again the case of ROP/JOP in the kernel
+setting. No matter what anti-ROP techniques have been
+utilized [45, 51], the attacker can still execute arbitrary
+code, as long as there is no strict process/kernel separa-
+tion, by mapping his code to user space and transferring
+control to it (after hijacking a privileged execution path).
+
+Finally, in order to protect kGuard from being sub-
+verted, we utilize a lightweight diversiﬁcation technique
+for the kernel’s text, which can also mitigate kernel-level
+attacks that use code “gadgets” in a ROP/JOP fashion
+(see Section 3.5). Overall, the aim of kGuard is not to
+provide strict control-ﬂow integrity for the kernel, but
+rather to render a realistic threat ineffective.
+
+3.3 Preventing ret2usr Attacks with CFAs
+
+In the remainder of this section, we discuss the funda-
+mental aspects of kGuard using examples based on x86-
+based Linux systems. However, kGuard is by no means
+restricted to 32-bit systems and Linux. It can be used
+to compile any kernel that suffers from ret2usr attacks
+for both 32- and 64-bit CPUs. kGuard “guards” indirect
+control transfers from exploitation. In the x86 instruc-
+tion set architecture (ISA), such control transfers are per-
+formed using the call and jmp instructions with a reg-
+ister or memory operand, and the ret instruction, which
+takes an implicit memory operand from the stack (i.e.,
+the saved return address). kGuard injects CFAs in both
+cases to check that the branch target, speciﬁed by the re-
+spective operand, is inside kernel space.
+
+81 f b 00 00 00 c0 ; cmp
+;
+73 05
+j a e
+bb 00 00 00 00
+; mov
+f f d3
+
+c a l l _ l b l :
+
+;
+
+c a l l ∗%ebx
+
+$0xc0000000 ,% ebx
+c a l l _ l b l
+$ 0 x c 0 5 a f 8 f 1 ,% ebx
+
+Snippet 3: CFAR guard applied on an indirect call in x86
+Linux (drivers/cpufreq/cpufreq.c)
+
+r e g i s t e r v o i d ∗ t a r g e t _ a d d r e s s ;
+. . .
+i f
+
+( t a r g e t _ a d d r e s s < 0 xC0000000 )
+
+t a r g e t _ a d d r e s s = &< v i o l a t i o n h a n d l e r > ;
+
+c a l l ∗ t a r g e t _ a d d r e s s ;
+
+Snippet 4: CFAR guard in C-like code (x86)
+
+We use two different CFA guards, namely CFAR and
+CFAM, depending on whether the control transfer that
+we want to conﬁne uses a register or memory operand.
+Snippet 3 shows an example of a CFAR guard. The code
+is from the show() routine of the cpufreq driver.
+kGuard instruments the indirect call (call *%ebx)
+with 3 additional instructions. First, the cmp instruction
+compares the ebx register with the lower kernel address
+0xC0000000.5 If the assertion is true, the control transfer
+is authorized by jumping to the call instruction. Oth-
+erwise, the mov instruction loads the address of the vi-
+olation handler (0xc05af8f1; panic()) into the branch
+register and proceeds to execute call, which will result
+into invoking the violation handler. In C-like code, this is
+equivalent to injecting the statements shown in Snippet 4.
+
+5The same is true for x86 FreeBSD/NetBSD, whereas for x86-64
+the check should be with address 0xFFFFFFFF80000000. OpenBSD
+maps the kernel to the upper 512MB of the virtual address space, and
+hence, its base address in x86 CPUs is 0xD0000000.
+
+0 x50 (% ebx ) ,% e d i
+$0xc0000000 ,% e d i
+kmem_lbl
+
+; p u s h %e d i
+;
+l e a
+; cmp
+;
+j a e
+; pop %e d i
+;
+
+57
+8 d 7b 50
+81 f f 00 00 00 c0
+73 06
+5 f
+e8 43 d6 2 d b8
+5 f
+81 7b 50 00 00 00 c0 ; cmpl $0xc0000000 , 0 x50 (% ebx )
+73 05
+c7 43 50 f 1 f 8 5 a c0 ; movl $ 0 x c 0 5 a f 8 f 1 , 0 x50 (% ebx )
+f f 53 50
+
+; kmem_lbl : pop %e d i
+
+c a l l ∗0 x50(% ebx )
+
+c a l l 0 x c 0 5 a f 8 f 1
+
+c a l l _ l b l :
+
+c a l l _ l b l
+
+j a e
+
+;
+
+;
+
+Snippet 5: CFAM guard applied on an indirect call in x86
+Linux (net/socket.c)
+
+r e g i s t e r v o i d ∗ t a r g e t _ a d d r e s s _ p t r ;
+. . .
+t a r g e t _ a d d r e s s _ p t r = &t a r g e t _ a d d r ;
+i f
+
+( t a r g e t _ a d d r e s s _ p t r < 0 xC0000000 )
+
+c a l l < v i o l a t i o n h a n d l e r > ;
+
+i f
+
+( t a r g e t _ a d d r e s s < 0 xC0000000 )
+
+t a r g e t _ a d d r e s s = &< v i o l a t i o n h a n d l e r > ;
+
+c a l l ∗ t a r g e t _ a d d r e s s ;
+
+Snippet 6: CFAM guard in C-like code (x86)
+
+Similarly, CFAM guards conﬁne indirect branches
+that use memory operands.
+Snippet 5 illustrates
+how kGuard instruments the faulty control transfer of
+sock_sendpage() (the original code is shown in
+Snippet 1). The indirect call (call 0x50(%ebx);
+Figure 5) is prepended by a sequence of 10 instructions
+that perform two distinct assertions. CFAM not only
+asserts that the branch target is within the kernel ad-
+dress space, but also ensures that the memory address
+where the branch target is loaded from is also in ker-
+nel space. The latter is necessary for protecting against
+cases where the attacker has managed to hijack a data
+pointer to a structure that contains function pointers (see
+Snippet 2 in Section 2.2). Snippet 6 illustrates how this
+can be represented in C-like code. In order to perform
+this dual check, we ﬁrst need to spill one of the reg-
+isters in use, unless the basic block where the CFA is
+injected has spare registers, so that we can use it as a
+temporary variable (i.e., edi in our example). The ad-
+dress of the memory location that stores the branch target
+(ebx + 0x50 = 0xfa7c8538; Figure 5), is dynamically
+resolved via an arithmetic expression entailing registers
+and constant offsets. We load its effective address into
+edi (lea 0x50(%ebx),%edi), and proceed to ver-
+ify that it points in kernel space. If a violation is detected,
+the spilled register is restored and control is transferred
+to the runtime violation handler (call 0xc05af8f1).
+Otherwise, we proceed with restoring the spilled register
+and conﬁne the branch target similarly to the CFAR case.
+
+81 7b 50 00 00 00 c0 ; cmpl $0xc0000000 , 0 x50 (% ebx )
+73 05
+c7 43 50 f 1 f 8 5 a c0 ; movl $ 0 x c 0 5 a f 8 f 1 , 0 x50 (% ebx
+f f 53 50
+
+c a l l ∗0 x50(% ebx )
+
+c a l l _ l b l :
+
+c a l l _ l b l
+
+j a e
+
+;
+
+;
+
+Snippet 7: Optimized CFAM guard
+
+3.4 Optimizations
+
+In certain cases, we can statically determine that the ad-
+dress of the memory location that holds the branch target
+is always mapped in kernel space. Examples include a
+branch operand read from the stack (assuming that the
+attacker has not seized control of the stack pointer), or
+taken from a global data structure mapped at a ﬁxed ad-
+dress inside the data segment of the kernel. In this case,
+the ﬁrst assertion of a CFAM guard will always be true,
+since the memory operand points within kernel space.
+We optimize such scenarios by removing the redundant
+assertion, effectively reducing the size of the inline guard
+to 3 instructions. For instance, Snippet 7 depicts how we
+can optimize the code shown in Snippet 5, assuming that
+ebx is loaded with the address of a global symbol from
+kernel’s data segment. ret instructions are always con-
+ﬁned using the optimized CFAM variant.
+
+3.5 Mechanism Protection
+
+CFAR and CFAM guards, as presented thus far, provide
+reliable protection against ret2usr attacks, only if the at-
+tacker exploits a vulnerability that allows him to par-
+tially control a computed branch target. Currently, all
+the well known and published ret2usr exploits, which we
+analyzed in Section 2 and further discuss in Section 5.1,
+fall in this category. However, vulnerabilities where the
+attacker can overwrite kernel memory with arbitrary val-
+ues also exist [22]. When such ﬂaws are present, exploits
+could attempt to bypass kGuard. This section discusses
+how we protect against such attacks.
+
+3.5.1 Bypass Trampolines
+
+To subvert kGuard, an attacker has to be able to deter-
+mine the address of a (indirect) control transfer instruc-
+tion inside the text segment of the kernel. Moreover,
+he should also be able to reliably control the value of
+its operand (i.e., its branch target). We shall refer to
+that branch as a bypass trampoline. Note that in ISAs
+with overlapping variable-length instructions, it is possi-
+ble to ﬁnd an embedded opcode sequence that translates
+directly to a control branch in user space [40]. By over-
+writing the value of a protected branch target with the
+address of a bypass trampoline, the attacker can success-
+fully execute a jump to user space. The ﬁrst CFA corre-
+sponding to the initially exploited branch will succeed,
+since the address of the trampoline remains inside the
+privileged memory segment, while the second CFA that
+guards the bypass trampoline is completely bypassed by
+jumping directly to the branch instruction.
+
+Similarly, jumping in the middle of an instruction that
+contains an indirect branch within, could also be used to
+subvert kGuard. At this point, we would like to stress that
+
+if an attacker is armed with a powerful exploit for a vul-
+nerability that allows him to overwrite arbitrary kernel
+memory with arbitrary values, he can easily elevate his
+privileges by overwriting the credentials associated with
+a process under his control. In other words, the attacker
+can achieve his goal without violating the control-ﬂow
+by jumping into user-level shellcode.
+
+3.5.2 Code Diversiﬁcation Against Bypasses
+
+kGuard implements two diversiﬁcation techniques that
+aid in thwarting attacks exploiting bypass trampolines.
+
+Code inﬂation This technique reshapes the kernel’s
+text area. We begin with randomizing the starting ad-
+dress of the text segment. This is achieved by insert-
+ing a random NOP sled at its beginning, which effec-
+tively shifts all executable instructions by an arbitrary
+offset. Next, we continue by inserting NOP sleds of ran-
+dom length at the beginning of each CFA. The end result
+is that the location of every indirect control transfer in-
+struction is randomized, making it harder for an attacker
+to guess the exact address of a conﬁned branch to use as
+a bypass trampoline. The effects of the sleds are cumu-
+lative because each one pushes all instructions and NOP
+sleds following, further to higher memory addresses. The
+size of the initial sled is chosen by kGuard based on the
+target architecture. For example, in Linux and BSD the
+kernel space is at least 1GB. Hence, we can achieve more
+than 20 bits of entropy (i.e., the NOP sled can be ≥ 1MB)
+without notably consuming address space.
+The per-CFA NOP sled is randomly selected from a
+user-conﬁgured range. By specifying the range, users
+can trade higher overhead (both in terms of space and
+speed), for a smaller probability that an attacker can re-
+liably obtain the address of a bypass trampoline. An im-
+portant assumption of the aforementioned technique is
+the secrecy of the kernel’s text and symbols. If the at-
+tacker has access to the binary image of the conﬁned ker-
+nel or is armed with a kernel-level memory leak [32], the
+probability of successfully guessing the address of a by-
+pass trampoline increases. We posit that assigning safe
+ﬁle permissions to the kernel’s text, modules, and debug-
+ging symbols is not a limiting factor.6
+In fact, this is
+considered standard practice in OS hardening, and is au-
+tomatically enabled in PaX and similar patches, as well
+as the latest Ubuntu Linux releases. Also note that the
+kernel should harden access to the system message ring
+buffer (dmesg), in order to prevent the leakage of kernel
+addresses.7
+
+6This can be trivially achieved by changing the permissions in the
+ﬁle system to disallow reads, from non-administrative users, in /boot
+and /lib/modules in Linux/FreeBSD, /bsd in OpenBSD, etc.
+
+7In Linux, this can be done by asserting the kptr_restrict [24]
+
+sysctl option that hides exposed kernel pointers in /proc interfaces.
+
+Initial build
+
+1st relocation
+
+2nd relocation
+
+Front−ends
+
+kernel
+.text
+
+kernel
+.text
+
+kernel
+.text
+
+ 
+
+w
+o
+d
+n
+i
+w
+n
+o
+i
+t
+a
+c
+o
+l
+e
+r
+
+NOP
+sled
+
+CFA
+
+branch
+
+kernel
+.text
+
+NOP
+sled
+
+CFA
+
+branch
+
+NOP
+sled
+
+NOP
+sled
+
+CFA
+
+branch
+
+NOP
+sled
+
+kernel
+.text
+
+kernel
+.text
+
+Figure 1: CFA motion synopsis. kGuard relocates each in-
+line guard and protected branch, within a certain window, by
+routinely rewriting the text segment of the kernel.
+
+CFA motion The basic idea behind this technique is
+the “continuous” relocation of the protected branches
+and injected guards, by rewriting the text segment of the
+kernel. Figure 1 illustrates the concept. During com-
+pilation, kGuard emits information regarding each in-
+jected CFA, which can be used later for relocating the
+respective code snippets. Speciﬁcally, kGuard logs the
+exact location of the CFA inside kernel’s text, the type
+and size of the guard, the length of the prepended NOP
+sled, as well as the size of the protected branch. Armed
+with that information, we can then migrate every CFA
+and indirect branch instruction separately, by moving it
+inside the following window: sizeof(nop_sled)
++ sizeof(cfa) + sizeof(branch). Currently,
+we only support CFA motion during kernel bootstrap. In
+Linux, this is performed after the boot loader (e.g., LILO,
+GNU GRUB) extracts the kernel image and right before
+jumping to the setup() routine [8]. In BSDs, we per-
+form the relocation after the boot program has executed
+and right before transferring control to the machine-
+dependent initialization routines (i.e., mi_startup()
+in FreeBSD and main() in {Net, Open}BSD) [49]. Fi-
+nally, note that CFA motion can also be performed at
+runtime, on a live system, by trading runtime overhead
+for safety. In Section 6, we discuss how we can expand
+our current implementation, with moderate engineering
+effort, to support real-time CFA migration.
+
+To further protect against evasion, kGuard can be
+combined with other techniques that secure kernel code
+against code-injection [46] and code-reuse attacks [45,
+51]. That said, mind that ret2usr violations are detected
+at runtime, and hence one false guess is enough for iden-
+tifying the attacker and restricting his capabilities (e.g.,
+by revoking his access to prevent brute-force attacks). In
+Section 6, we further discuss how kGuard can deal with
+persistent threats.
+
+*.c, *.i
+
+C
+
+*.cc, *.c++
+*.cxx, *.cpp
+
+C++
+
+*.m, *.mi
+
+Objective−C
+
+*.java
+
+...
+
+Java
+
+...
+
+*.F, *.FOR
+
+Fortran
+
+GENERIC
+
+Middle−end
+
+GIMPLE
+
+High
+
+GIMPLE
+
+Low
+
+GIMPLE
+
+SSA
+
+GIMPLE
+
+Back−end
+
+RTL
+
+kGuard
+
+(RTL + CFAs)
+
+*.s
+
+Figure 2: Architectural overview of GCC. The compilation
+process involves 3 distinct translators (frond-end, middle-end,
+back-end), and more than 250 optimization passes. kGuard is
+implemented as a back-end optimization pass.
+
+4 Implementation
+
+We implemented kGuard as a set of modiﬁcations to the
+pipeline of a C compiler. Speciﬁcally, we instrument the
+intermediate language (IL) used during the translation
+process, in order to perform the CFA-based conﬁnement
+discussed in Section 3. Our implementation consists of
+a plugin for the GNU Compiler Collection (GCC) that
+contains the “de-facto” C compiler for building Linux
+and BSD kernels. Note that although other compilers,
+such as Clang and PCC, are capable of building much
+of Linux/FreeBSD and NetBSD/OpenBSD respectively,
+they are not ofﬁcially supported by the corresponding de-
+velopment groups, due to the excessive use of the GNU
+C dialect in the kernel.
+
+Starting with v4.5.1, GCC has been re-designed for
+facilitating better isolation between its components, and
+allowing the use of plugins for dynamically adding fea-
+tures to the translators without modifying them. Fig-
+ure 2 illustrates the internal architecture of GCC. The
+compilation pipeline is comprised by 3 distinct com-
+ponents, namely the front-end, middle-end, and back-
+end, which transform the input into various ILs (i.e.,
+GENERIC, GIMPLE, and RTL). The kGuard plugin
+consists of ∼1000 lines of code in C and builds into a
+position-independent (PIC) dynamic shared object that
+is loaded by GCC. Upon loading kGuard, the plugin
+manager of GCC invokes plugin_init() (i.e., the
+initialization callback assumed to be exported by ev-
+ery plugin), which parses the plugin arguments (if any)
+and registers pass_branchprot as a new “optimiza-
+tion” pass.8 Speciﬁcally, we chain our instrumentation
+callback, namely branchprot_instrument(), af-
+ter the vartrack RTL optimization pass, by call-
+ing GCC’s register_callback() function and re-
+questing to hook with the pass manager (see Figure 2).
+
+8Currently, kGuard accepts 3 parameters: stub, nop, and log.
+stub provides the runtime violation handler, nop stores the maximum
+size of the random NOP sled inserted before each CFA, and log is used
+to deﬁne an instrumentation logﬁle for CFA motion.
+
+The reasons for choosing to implement the instrumen-
+tation logic at the RTL level, and not as annotations to
+the GENERIC or GIMPLE IL, are mainly the following.
+First, by applying our assertions after most of the impor-
+tant optimizations have been performed, which may re-
+sult into moving or transforming instructions, we guaran-
+tee that we instrument only relevant code. For instance,
+we do not inject CFAs for dead code or control trans-
+fers that, due to optimization transformations like inline
+expansion, do not need to be conﬁned. Second, we se-
+cure implicit control transfers that are exposed later in
+the translation (e.g., after the High-GIMPLE IL has been
+“lowered”). Third, we tightly couple the CFAs with the
+corresponding unsafe control transfers. This way, we
+protect the guards from being removed or shifted from
+the respective points of check, due to subsequent opti-
+mization passes (e.g., code motion). For more informa-
+tion regarding the internals of RTL instrumentation, in-
+terested readers are referred to Appendix B.
+
+5 Evaluation
+
+In this section, we present the results from the evaluation
+of kGuard both in terms of performance and effective-
+ness. Our testbed consisted of a single host, equipped
+with two 2.66GHz quad-core Intel Xeon X5500 CPUs
+and 24GB of RAM, running Debian Linux v6 (“squeeze”
+with kernel v2.6.32). Note that while conducting our
+performance measurements, the host was idle with no
+other user processes running apart from the evaluation
+suite. Moreover, the results presented here are mean val-
+ues, calculated after running 10 iterations of each experi-
+ment; the error bars correspond to 95% conﬁdence inter-
+vals. kGuard and the corresponding Linux kernels were
+compiled with GCC v4.5.1, and unless otherwise noted,
+we used Debian’s default conﬁguration that results into a
+complete build of the kernel, including all modules and
+device drivers. Finally, we conﬁgured kGuard to use a
+random NOP sled of 20 instructions on average. Mind
+you that we also measured the effect of various NOP sled
+sizes, which was insigniﬁcant for the range 0 – 20.
+
+5.1 Preventing Real Attacks
+
+The main goal of the effectiveness evaluation is to ap-
+ply kGuard on commodity OSs, and determine whether
+it can detect and prevent real-life ret2usr attacks. Table 1
+summarizes our test suite, which consisted of a collec-
+tion of 8 exploits that cover a broad spectrum of different
+ﬂaws, including direct NULL pointer dereferences, con-
+trol hijacking via tampered data structures (data pointer
+corruption), function and data pointer overwrite, arbi-
+trary kernel-memory nulliﬁcation, and ret2usr via kernel
+stack-smashing.
+
+x86 kernel
+
+x86-64 kernel
+
+call
+20767
+2253
+6325
+29345
+
+jmp
+1803
+
+12
+0
+
+ret
+—
+
+113053
+
+—
+
+1815
+
+113053
+
+call
+17740
+1789
+8780
+28309
+
+jmp
+1732
+
+0
+0
+
+ret
+—
+
+105895
+
+—
+
+1732
+
+105895
+
+CFAM
+CFAMopt
+CFAR
+Total
+
+Table 2: Number of indirect branches instrumented by
+kGuard in the vanilla Linux kernel v2.6.32.39.
+
+We instrumented 10 different vanilla Linux kernels,
+ranging from v2.6.18 up to v2.6.34, both in x86 and x86-
+64 architectures. Additionally, in this experiment, we
+used a home-grown violation handler for demonstrating
+the customization features of kGuard. Upon the detec-
+tion of a ret2usr attack, the handler takes a snapshot of
+the memory that contains the user-provided code for an-
+alyzing the behavior of the offending process. Such a
+feature could be useful in a honeypot setup for perform-
+ing malware analysis and studying new ret2usr exploita-
+tion vectors. All kernels were compiled with and with-
+out kGuard, and tested against the respective set of ex-
+ploits. In every case, we were able to successfully detect
+and prevent the corresponding exploitation attempt. Also
+note that the tested exploits circumvented the page map-
+ping restrictions of Linux, by using one or more of the
+techniques discussed in Section 2.3.
+
+5.2 Translation Overhead
+
+We ﬁrst quantify the additional time needed to inspect the
+RTL IL and emit the CFAs (see Section 4). Speciﬁcally,
+we measured the total build time with Unix’s time util-
+ity, when compiling the v2.6.32.39 Linux kernel natively
+and with kGuard. On average, we observed a 0.3% in-
+crease on total build time on the x86 architecture, and
+0.05% on the x86-64. Moreover, the size of the ker-
+nel image/modules was increased by 3.5%/0.43% on the
+x86, and 5.6%/0.56% on the x86-64.
+
+In Table 2, we show the number of exploitable
+branches instrumented by kGuard, categorized by ar-
+chitecture, and conﬁnement and instruction type. As
+expected, ret instructions dominate the computed
+branches. Note that both in x86 and x86-64 scenar-
+ios, we were able to optimize approximately 10% of
+the total indirect calls via memory locations, using the
+optimization scheme presented in Section 3.4. Over-
+all, the drivers/ subsystem was the one with the
+most instrumentations, followed by fs/, net/, and
+kernel/. Additionally, a signiﬁcant amount of instru-
+mented branches was due to architecture-dependent code
+(arch/) and “inlined” C functions (include/).
+
+Vulnerability
+
+Description
+
+CVE-2009-1897
+CVE-2009-2692
+CVE-2009-2908
+
+CVE-2009-3547
+
+CVE-2010-2959
+CVE-2010-4258
+
+EDB-15916
+
+CVE-2009-3234
+
+NULL function pointer dereference in drivers/net/tun.c due to compiler optimization
+NULL function pointer dereference in net/socket.c due to improper initialization
+NULL data pointer dereference in fs/ecryptfs/inode.c due to a negative reference
+counter (function pointer affected via tampered data ﬂow)
+data pointer corruption in fs/pipe.c due to a use-after-free bug (function pointer under
+user control via tampered data structure)
+function pointer overwrite via integer overﬂow in net/can/bcm.c
+function pointer overwrite via arbitrary kernel memory nulliﬁcation in kernel/exit.c
+NULL function pointer overwrite via a signedness error in Phonet protocol (function
+pointer affected via tampered data structure)
+ret2usr via kernel stack buffer overﬂow in kernel/perf_counter.c (return address is
+overwritten with user space memory)
+
+Impact
+
+2.6.30–2.6.30.1
+2.6.0–2.6.30.4
+
+2.6.31
+
+≤ 2.6.32-rc6
+
+2.6.{27.x, 32.x, 35.x}
+
+≤ 2.6.36.2
+
+2.6.34
+
+2.6.31-rc1
+
+x86
+√
+√
+√
+√
+√
+√
+√
+√
+
+Exploit
+
+x86-64
+
+—
+√
+√
+√
+
+—
+√
+√
+√
+
+√: detected and prevented successfully —: exploit unavailable
+
+Table 1: Effectiveness evaluation suite. We instrumented 10 x86/x86-64 vanilla Linux kernels, ranging from v2.6.18 to v2.6.34,
+for assessing kGuard. We successfully detected and prevented all the listed exploits.
+
+5.3 Performance Overhead
+
+The injected CFAs also introduce runtime latency. We
+evaluated kGuard to quantify this overhead and estab-
+lish a set of performance bounds for different types of
+system services. Moreover, we used the overhead im-
+posed by PaX (i.e., UDEREF [53] and KERNEXEC) as
+a reference. Mind you that on x86, PaX offers protection
+against ret2usr attacks by utilizing the segmentation unit
+for isolating the kernel from user space. In x86-64 CPUs,
+where segmentation is not supported by the hardware, it
+temporarily remaps user space into a different location
+with non-execute permissions.
+
+Macro benchmarks We begin with the evaluation of
+kGuard using a set of real-life applications that repre-
+sent different workloads. In particular, we used a kernel
+build and two popular server applications. The Apache
+web server, which performs mainly I/O, and the MySQL
+RDBMS that is both I/O driven and CPU intensive. We
+run all the respective tests over a vanilla Linux kernel
+v2.6.32.39, the same kernel patched with PaX, and in-
+strumented with kGuard.
+
+First, we measured the time taken to build a vanilla
+Linux kernel (v2.6.32.39), using the Unix time utility.
+On the x86, the PaX-protected kernel incurs a 1.26%
+run-time overhead, while on the x86-64 the overhead is
+2.89%. In contrast, kGuard ranges between 0.93% on
+x86-64, and 1.03% on x86. Next, we evaluated MySQL
+v5.1.49 using its own benchmark suite (sql-bench).
+The suite consists of four different tests, which assess
+the completion time of various DB operations, like table
+creation and modiﬁcation, data selection and insertion,
+and so forth. On average, kGuard’s slowdown ranges
+from 0.85% (x86-64) to 0.93% (x86), while PaX lies
+between 1.16% (x86) and 2.67% (x86-64). Finally, we
+measured Apache’s performance using its own utility ab
+and static HTML ﬁles of different size. We used Apache
+v2.2.16 and conﬁgured it to pre-fork all the worker pro-
+cesses (pre-forking is a standard multiprocessing mod-
+ule), in order to avoid high ﬂuctuations in performance,
+
+due to Apache spawning extra processes for handling the
+incoming requests at the beginning of our experiments.
+We chose ﬁles with sizes of 1KB, 10KB, 100KB, and
+1MB, and measured the average throughput in requests
+per second (req/sec). All other options were left to their
+default setting. The kernel patched with PaX incurs an
+average slowdown that ranges between 0.01% and 0.09%
+on the x86, and 0.01% and 1.07% on x86-64. In antithe-
+sis, kGuard’s slowdown lies between 0.001% and 0.01%.
+Overall, our results indicate that in both x86 and x86-64
+Linux the impact of kGuard in real-life applications is
+negligible (≤1%).
+
+Micro benchmarks Since the injected CFAs are dis-
+tributed throughout many kernel subsystems, such as the
+essential net/ and fs/, we used the LMbench [50] mi-
+crobenchmark suite to measure the impact of kGuard
+on the performance of core kernel system calls and
+facilities. We focus on both latency and bandwidth.
+For the ﬁrst, we measured the latency of entering the
+OS, by investigating the null system call (syscall)
+and the most frequently used I/O-related calls: read,
+write, fstat, select, open/close. Addition-
+ally, we measured the time needed to install a signal
+with sigaction, inter-process communication (IPC)
+latency with socket and pipe, and process creation
+latency with fork+{exit, execve, /bin/sh}.
+
+Figure 3 summarizes the latency overhead of kGuard
+in contrast to the vanilla Linux kernel and a kernel with
+the PaX patch applied and enabled. Note that the time
+is measured in microseconds (µsec). kGuard ranges
+from 2.7% to 23.5% in x86 (average 11.4%), and 2.9%
+to 19.1% in x86-64 (average 10.3%).
+In contrast, the
+PaX-protected kernel exhibits a latency ranging between
+5.6% and 257% (average 84.5%) on the x86, whereas on
+x86-64, the latency overhead ranges between 19% and
+531% (average 172.2%). Additionally, kGuard’s over-
+head for process creation (in both architectures) lies be-
+tween 7.1% and 9.7%, whereas PaX ranges from 8.1%
+to 56.3%.
+
+vanilla
+PaX
+kGuard
+
+)
+c
+e
+s
+µ
+(
+ 
+y
+c
+n
+e
+
+t
+
+a
+L
+
+ 14
+
+ 13
+
+ 12
+
+ 11
+
+ 10
+
+ 9
+
+ 8
+
+ 7
+
+ 6
+
+ 5
+
+ 4
+
+ 3
+
+ 2
+
+ 1
+
+ 0
+
+syscall()
+
+read()
+
+write()
+
+fstat()
+
+sigaction()
+
+(a) x86
+
+vanilla
+PaX
+kGuard
+
+select ()-10 fds
+
+select()-100 fds
+
+open/close()
+
+socket()
+
+pipe()
+
+)
+c
+e
+s
+µ
+(
+ 
+y
+c
+n
+e
+
+t
+
+a
+L
+
+ 0.8
+
+ 0.7
+
+ 0.6
+
+ 0.5
+
+ 0.4
+
+ 0.3
+
+ 0.2
+
+ 0.1
+
+ 0
+
+vanilla
+PaX
+kGuard
+
+)
+c
+e
+s
+µ
+(
+ 
+y
+c
+n
+e
+
+t
+
+a
+L
+
+ 14
+
+ 13
+
+ 12
+
+ 11
+
+ 10
+
+ 9
+
+ 8
+
+ 7
+
+ 6
+
+ 5
+
+ 4
+
+ 3
+
+ 2
+
+ 1
+
+ 0
+
+syscall()
+
+read()
+
+write()
+
+fstat()
+
+sigaction()
+
+(b) x86-64
+
+vanilla
+PaX
+kGuard
+
+select ()-10 fds
+
+select()-100 fds
+
+open/close()
+
+socket()
+
+pipe()
+
+Figure 3: Latency overhead incurred by kGuard and PaX on essential system calls (x86/x86-64 Linux).
+
+x86-64
+
+vanilla
+PaX
+kGuard
+
+6 Discussion and Future Work
+
+)
+c
+e
+s
+µ
+(
+ 
+y
+c
+n
+e
+
+t
+
+a
+L
+
+ 0.8
+
+ 0.7
+
+ 0.6
+
+ 0.5
+
+ 0.4
+
+ 0.3
+
+ 0.2
+
+ 0.1
+
+ 0
+
+ 8000
+
+ 7000
+
+ 6000
+
+ 5000
+
+ 4000
+
+ 3000
+
+ 2000
+
+ 1000
+
+ 0
+
+)
+s
+/
+B
+M
+
+i
+
+(
+ 
+h
+t
+d
+w
+d
+n
+a
+B
+
+x86
+
+vanilla
+PaX
+kGuard
+
+Socket (PF_INET)
+
+Socket (PF_UNIX)
+
+Pipe
+
+)
+s
+/
+B
+M
+
+i
+
+(
+ 
+h
+t
+d
+w
+d
+n
+a
+B
+
+ 8000
+
+ 7000
+
+ 6000
+
+ 5000
+
+ 4000
+
+ 3000
+
+ 2000
+
+ 1000
+
+ 0
+
+Socket (PF_INET)
+
+Socket (PF_UNIX)
+
+Pipe
+
+Figure 4: IPC bandwidth achieved by kGuard and PaX, using
+TCP (PF_INET), Unix sockets (PF_UNIX), and pipes.
+
+As far as bandwidth is concerned, we measured the
+degradation imposed by kGuard and PaX in the maxi-
+mum achieved bandwidth of popular IPC facilities, such
+as sockets and pipes. Figure 4 shows our results (band-
+width is measured in MB/s). kGuard’s slowdown ranges
+between 3.2% – 10% on x86 (average 6%), and 5.25%
+– 9.27% on x86-64 (average 6.6%). PaX’s overhead
+lies between 19.9% – 58.8% on x86 (average 37%),
+and 21.7% – 78% on x86-64 (average 42.8%). Overall,
+kGuard exhibits lower overhead on x86-64, due to the
+fewer CFAM guards (see Table 2). Recall that CFAR con-
+ﬁnement can be performed with just 3 additional instruc-
+tions, and hence incurs less run-time overhead, whereas
+CFAM might need up to 10 (e.g., when we cannot opti-
+mize). However, the same is not true for PaX, since the
+lack of segmentation in x86-64 results in higher perfor-
+mance penalty.
+
+Custom violation handlers kGuard’s default violation
+handler appends a message in system log and halts the
+OS. We coerce assertion violations into a kernel fail-stop
+to prevent brute-force attempts and to avoid leaving the
+OS in inconsistent states (e.g., by aborting an in-ﬂight
+kernel thread that holds a lock). However, kGuard can be
+conﬁgured to use a custom handler. Upon enabling this
+option, our instrumentation becomes slightly different.
+Instead of overwriting offending branch targets with the
+address of our handler, we push the value of the branch
+target into the stack and invoke the handler directly. In
+the case of a CFAR guard this means that the mov in-
+struction (see Snippet 3) will be replaced with a push
+and call. CFAM guards are modiﬁed accordingly.
+
+This instrumentation increases slightly the size of our
+inline guards, but does not incur additional overhead,
+since the extra instructions are on the error path. Ad-
+ditionally, the custom violation handler has access to the
+location where the violation occurred, by reading the re-
+turn address of the callee (pushed into the stack from
+call), as well as to the offending branch target (passed
+as argument to the handler). Using that information,
+one can implement adaptive defense mechanisms, in-
+cluding selective conﬁnement (e.g., deal with VMware’s
+I/O backdoor that needs to “violate” protection domains),
+error virtualization [63], as well as forensic analysis (e.g.,
+dump the shellcode). The latter can be useful in honeypot
+setups for studying new ret2usr exploitation vectors.
+
+Persistent threats By building upon the previous fea-
+ture, we implemented a handler that actively responds to
+persistent threats (i.e., users that repeatedly try to per-
+form a ret2usr attack). Once invoked, due to a violation,
+it performs the following. First, it checks the execution
+context of the kernel to identify if it runs inside a user-
+
+level process or an interrupt handler. If the violation oc-
+curred while executing an interrupt service routine, or
+the current execution path is holding a lock9, then we
+fail-stop the kernel. Else, if the kernel is preemptible, we
+terminate all processes with the same uid of the offend-
+ing process and prevent the user from logging in. Other
+possible approaches include inserting an exponentially
+increased delay for user logins (i.e., make the bruteforce
+attack slow and impractical), activate CFA motion, etc.
+
+Future considerations Currently, we investigate how
+to apply the CFA motion technique (see Section 3.5),
+while a kernel is running and the OS is live. Our early
+Linux prototype utilizes a dedicated kernel thread, which
+upon a certain condition, freezes the kernel and per-
+forms rewriting. Thus far, we achieve CFA relocation
+in a coarse-grained manner, by exploiting the suspend
+subsystem of the Linux kernel. Speciﬁcally, we bring
+the system to pre-suspend state for preventing any ker-
+nel code from being invoked during the relocation (note
+that the BSD OSs have similar facilities). Possible events
+to initiate live CFA motion are the number of executed
+system calls or interrupts (i.e., diversify the kernel ev-
+ery n invocation events), CFA violations, or in the case
+of smartphone devices, dock station attach and charging.
+However, our end goal is to perform CFA motion in a
+more ﬁne-grained, non-interruptible and efﬁcient man-
+ner, without “locking” the whole OS.
+
+7 Related Work
+
+kGuard is inspired by the numerous compiler-based tech-
+niques that explicitly or implicitly constrain control ﬂow
+and impose a speciﬁc execution policy. StackGuard [14]
+and ProPolice [34] are GCC patches that extend the be-
+havior of the translator for inserting a canary word prior
+to the saved return address on the stack. The canary is
+checked again before a function return is performed, and
+execution is halted if it has been overwritten (e.g., due to
+a stack-smashing attack). Stack Shield [1] is a similar ex-
+tension that saves the return address, upon function entry,
+into a write-protected memory area that is not affected by
+buffer overﬂows and restores it before returning.
+
+Generally, these approaches have limitations [9, 69].
+However, they signiﬁcantly mitigate real-life exploits by
+assuring that functions will always return to caller sites,
+incur low performance overhead, and do not require any
+change to the runtime environment or platform of the
+protected applications. For these reasons, they have been
+adopted by mainstream compilers, such as GCC, and en-
+abled by default in many BSD and Linux distributions.
+
+9In Linux, we can check if the kernel
+
+is holding locks by
+looking at the preempt_count variable in the current process’s
+thread_info structure [48].
+
+kGuard operates analogously, by hooking to the compi-
+lation process and dynamically instrumenting code with
+inline guards. However, note that we leverage the plugin
+API of GCC, and do not require patching the compiler
+itself, thus aiding the adoption of kGuard considerably.
+More importantly, since stack protection is now enabled
+by default, kGuard can be conﬁgured to ofﬂoad the bur-
+den of dealing with the integrity of return control data
+to GCC. If random XOR canaries [14] are utilized, then
+any attempt to tamper with saved return addresses on the
+stack, for redirecting the privileged control ﬂow to user
+space, will be detected and prevented. Hence, the protec-
+tion of kernel-level ret instructions with CFAs can be
+turned off. Note that during our preliminary evaluation
+we also measured such a scenario. The average overhead
+of kGuard, with no ret protection, on system call and
+I/O latency was 6.5% on x86 and 5.4% on x86-64, while
+its impact on real-life applications was ≤ 0.5%. This
+“ofﬂoading” cannot be performed in the case of simple
+random canaries or terminator canaries. Nevertheless, it
+demonstrates that our approach is indeed orthogonal to
+complementary mitigation schemes, and operates nicely
+with conﬁnement checks injected during compile time.
+
+PointGuard [13] is another GCC extension that works
+by encrypting all pointers while they reside in mem-
+ory and decrypting them before they are loaded into a
+CPU register. PointGuard could provide some protection
+against ret2usr attacks, especially if a function pointer is
+read directly from user-controlled memory [20]. How-
+ever, it cannot deal with cases where an attacker can nul-
+lify kernel-level function pointers by exploiting a race
+condition [19] or supplying carefully crafted arguments
+to buggy system calls [23].
+In such scenarios, the re-
+spective memory addresses are altered by legitimate code
+(i.e., kernel execution paths), and not directly by the at-
+tacker. kGuard provides solid protection against ret2usr
+attacks by policing every computed control transfer for
+kernel/user space boundary violations.
+
+Other compiler-based approaches include DFI [11]
+that enforces data ﬂow integrity based on a statically cal-
+culated reaching deﬁnition analysis. However, the main
+focus of DFI, and similar techniques [3, 12, 33], is the
+enforcement of spatial safety for mitigating bounds vio-
+lations and preventing bounds-related vulnerabilities.
+
+Control-Flow Integrity (CFI) [2], Program Shepherd-
+ing [43], and Strata [57], employ binary rewriting and
+dynamic binary instrumentation (DBI) for retroﬁtting se-
+curity enforcement capabilities into unmodiﬁed binaries.
+The major issue with such approaches has been mainly
+the large performance overhead they incur, as well as
+the reliance on interpretation engines, which complicates
+their adoption. Program Shepherding exhibits ∼100%
+overhead on SPEC benchmarks, while CFI has an aver-
+age overhead of 15%, and a maximum of 45%, on the
+
+same test suite. CFI-based techniques rewrite programs
+so that every branch target is given a label, and each indi-
+rect branch instruction is prepended with a check, which
+ensures that the target’s label is in accordance with a pre-
+computed control-ﬂow graph (CFG). Unfortunately, CFI
+is not effective against ret2usr attacks. The integrity of
+the CFI mechanism is guaranteed as long as the attacker
+cannot overwrite the code of the protected binary, or ex-
+ecute user-provided data. However, during a ret2usr at-
+tack, the attacker completely controls user space mem-
+ory, both in terms of contents and rights. Therefore, CFI
+can be subverted by prepending user-provided shellcode
+with the respective label.
+
+As an example, consider again Snippet 1 and assume
+that the attacker has managed to overwrite the func-
+tion pointer sendpage with an address pointing in user
+space. CFI will prepend the instruction that invokes
+sendpage with an inline check that fetches a label
+ID (placed right before the ﬁrst instruction in functions
+that sendpage can point to), and compares it with the
+allowed label IDs.
+If the two labels match, the con-
+trol transfer will be authorized. Unluckily, since the at-
+tacker controls the contents and rights of the memory
+that sendpage is now pointing, he can easily prepend
+his code with the label ID that will authorize the control
+transfer. Furthermore, Petroni and Hicks [55] noted that
+computing in advance a precise CFG for a modern kernel
+is a nontrivial task, due to the rich control structure and
+the several levels of interrupt handling and concurrency.
+CFI-based proposals can be combined with kGuard to
+overcome the individual limitations of each technique.
+kGuard can guarantee that privileged execution will al-
+ways be conﬁned in kernel space, thus leaving no other
+options to attackers than targeting kernel-level control
+ﬂow violations, which can be solidly protected by CFI.
+
+Garﬁnkel and Rosenblum proposed Livewire [36],
+which was the ﬁrst system that used a virtual machine
+monitor (VMM) for implementing invariant-based ker-
+nel protection. Similarly, Grizzard uses a VMM for mon-
+itoring kernel execution and validating control ﬂow [38].
+For LMBench, he reports an average of 30% overhead,
+and a maximum of 74%, on top of VMM’s performance
+penalty. SecVisor [62] is a tiny hypervisor that ensures
+the integrity of commodity OS kernels. It relies on phys-
+ical memory virtualization for protecting against code
+injection attacks and kernel rootkits, by allowing only
+approved code to execute in kernel mode and ensuring
+that such code cannot be modiﬁed. However, it requires
+modern CPUs that support virtualization in hardware,
+as well as kernel patching to add the respective hyper-
+calls that authorize module loading. Along the same
+lines, NICKLE [56] offers similar guarantees, without
+requiring any OS modiﬁcation, by relying on an inno-
+vative memory shadowing scheme and real-time kernel
+
+code authentication via VMM introspection. Petroni and
+Hicks proposed state-based CFI (SBCFI) [55], which re-
+ports violations of the kernel’s control ﬂow due to the
+presence of rootkits. Similarly, Lares [54] and Hook-
+Safe [68] protect kernel hooks (including function point-
+ers) from being manipulated by kernel malware. The fo-
+cus of those techniques, however, has been kernel attes-
+tation and kernel code integrity [10], which is different
+from the control-ﬂow integrity of kernel code. On the
+other hand, kGuard focuses on solving a different prob-
+lem: privilege escalation via hijacked kernel-level exe-
+cution paths. Although VMMs provide stronger security
+guarantees than kGuard, and SecVisor and NICKLE can
+prevent ret2usr attacks by refusing execution from user
+space while running in kernel mode, they incur larger
+performance penalties and require running the whole OS
+over custom hypervisors and specialized hardware. It is
+also worth noting that SecVisor and NICKLE cannot pro-
+tect against execution hijacking via tampered data struc-
+tures containing control data [18,20]. kGuard offers solid
+protection against that type of ret2usr due to the way it
+handles control data stored in memory.
+
+Supervisor Mode Execution Prevention (SMEP) [37]
+is an upcoming Intel CPU feature, which prevents code
+executing in kernel mode from branching to code located
+in pages without the supervisor bit set in their page table
+entry. Although it allows for a conﬁnement mechanism
+similar to PaX with zero performance penalty, it is plat-
+form speciﬁc (i.e., x86, x86-64), requires kernel patch-
+ing, and does not protect legacy systems.
+
+8 Conclusions
+
+We presented kGuard, a lightweight compiler-based
+mechanism that protects the kernel from ret2usr attacks.
+Unlike previous work, kGuard is fast, ﬂexible, and of-
+fers cross-platform support. It works by injecting ﬁne-
+grained inline guards during the translation phase that
+are resistant to bypass, and it does not require any mod-
+iﬁcation to the kernel or additional software such as a
+VMM. kGuard can safeguard 32- or 64-bit OSs that map
+a mixture of code segments with different privileges in-
+side the same scope and are susceptible to ret2usr attacks.
+We believe that kGuard strikes a balance between safety
+and functionality, and provides comprehensive protec-
+tion from ret2usr attacks, as demonstrated by our exten-
+sive evaluation with real exploits against Linux.
+
+Availability
+
+The prototype implementation of kGuard is freely avail-
+able at: http://www.cs.columbia.edu/~vpk/
+research/kguard/
+
+Acknowledgments
+
+We thank Michalis Polychronakis and Willem de Bruijn
+for their valuable feedback on earlier drafts of this pa-
+per. This work was supported by DARPA and the
+US Air Force through Contracts DARPA-FA8750-10-2-
+0253 and AFRL-FA8650-10-C-7024, respectively. Any
+opinions, ﬁndings, conclusions, or recommendations ex-
+pressed herein are those of the authors, and do not nec-
+essarily reﬂect those of the US Government, DARPA, or
+the Air Force.
+
+References
+
+[1] Stack Shield.
+
+http://www.angelfire.com/sk/
+
+stackshield/, January 2000.
+
+[2] ABADI, M., BUDIU, M., ERLINGSSON, U., AND LIGATTI, J.
+Control-Flow Integrity. In Proceedings of the 12th ACM Confer-
+ence on Computer and Communications Security (CCS) (2005),
+pp. 340–353.
+
+[3] AKRITIDIS, P., CADAR, C., RAICIU, C., COSTA, M., AND
+CASTRO, M. Preventing memory error exploits with WIT. In
+Proceedings of the 29th IEEE Symposium on Security and Pri-
+vacy (S&P) (2008), pp. 263–277.
+
+[4] AZAB, A. M., NING, P., WANG, Z., JIANG, X., ZHANG, X.,
+AND SKALSKY, N. C. HyperSentry: Enabling Stealthy In-
+context Measurement of Hypervisor Integrity.
+In Proceedings
+of the 17th ACM Conference on Computer and Communications
+Security (CCS) (2010), pp. 38–49.
+
+[5] BELLARD, F. QEMU, a Fast and Portable Dynamic Translator.
+In Proceedings of the 7th USENIX Annual Technical Conference
+(FREENIX track) (2005), pp. 41–46.
+
+[6] BICKFORD, J., O’HARE, R., BALIGA, A., GANAPATHY, V.,
+AND IFTODE, L. Rootkits on Smart Phones: Attacks, Implica-
+tions and Opportunities. In Proceedings of the 11th International
+Workshop on Mobile Computing Systems and Applications (Hot-
+Mobile) (2010), pp. 49–54.
+
+[7] BLETSCH, T., JIANG, X., FREEH, V. W., AND LIANG, Z.
+Jump-Oriented Programming: A New Class of Code-Reuse At-
+In Proceedings of the 6th ACM Symposium on Infor-
+tack.
+mation, Computer and Communications Security (ASIACCS)
+(2011), pp. 30–40.
+
+[8] BOVET, D. P., AND CESATI, M. Understanding the Linux
+Kernel, 3nd ed. O’Reilly Media, Sebastopol, CA, USA, 2005,
+ch. System Startup, pp. 835–841.
+
+[9] BULBA AND KIL3R. Bypassing StackGuard and StackShield.
+
+Phrack 5, 56 (May 2000).
+
+[10] CARBONE, M., CUI, W., LU, L., LEE, W., PEINADO, M., AND
+JIANG, X. Mapping Kernel Objects to Enable Systematic In-
+tegrity Checking. In Proceedings of the 16th ACM Conference on
+Computer and Communications Security (CCS) (2009), pp. 555–
+565.
+
+[11] CASTRO, M., COSTA, M., AND HARRIS, T. Securing Soft-
+ware by Enforcing Data-Flow Integrity.
+In Proceedings of the
+7th Symposium on Operating Systems Design and Implementa-
+tion (OSDI) (2006), pp. 147–160.
+
+[12] CASTRO, M., COSTA, M., MARTIN, J.-P., PEINADO, M.,
+AKRITIDIS, P., DONNELLY, A., BARHAM, P., AND BLACK, R.
+Fast Byte-granularity Software Fault Isolation.
+In Proceedings
+of the 22nd ACM Symposium on Operating Systems Principles
+(SOSP) (2009), pp. 45–58.
+
+[13] COWAN, C., BEATTIE, S., JOHANSEN, J., AND WAGLE, P.
+PointGuardT M : Protecting Pointers From Buffer Overﬂow Vul-
+nerabilities. In Proceedings of the 12th USENIX Security Sympo-
+sium (USENIX Sec) (2003), pp. 91–104.
+
+[14] COWAN, C., PU, C., MAIER, D., HINTON, H., WALPOLE, J.,
+BAKKE, P., BEATTIE, S., GRIER, A., WAGLE, P., AND ZHANG,
+Q. StackGuard: Automatic Adaptive Detection and Prevention
+of Buffer-Overﬂow Attacks. In Proceedings of the 7th USENIX
+Security Symposium (USENIX Sec) (1998), pp. 63–78.
+
+[15] COX, M. J. Red Hat’s Top 11 Most Serious Flaw Types for
+2009. http://www.awe.com/mark/blog/20100216.
+html, February 2010.
+
+[16] CVE. CVE-2009-1897. http://cve.mitre.org/cgi-
+
+bin/cvename.cgi?name=CVE-2009-1897, June 2009.
+
+[17] CVE. CVE-2009-2692. http://cve.mitre.org/cgi-
+August
+
+bin/cvename.cgi?name=CVE-2009-2692,
+2009.
+
+[18] CVE. CVE-2009-2908. http://cve.mitre.org/cgi-
+August
+
+bin/cvename.cgi?name=CVE-2009-2908,
+2009.
+
+[19] CVE.
+
+CVE-2009-3527.
+
+http://cve.mitre.org/
+cgi-bin/cvename.cgi?name=CVE-2009-3527, Octo-
+ber 2009.
+
+[20] CVE.
+
+CVE-2009-3547.
+
+http://cve.mitre.org/
+cgi-bin/cvename.cgi?name=CVE-2009-3547, Octo-
+ber 2009.
+
+[21] CVE. CVE-2010-2959. http://cve.mitre.org/cgi-
+August
+
+bin/cvename.cgi?name=CVE-2010-2959,
+2010.
+
+[22] CVE.
+
+CVE-2010-3904.
+
+http://cve.mitre.org/
+cgi-bin/cvename.cgi?name=CVE-2010-3904, Octo-
+ber 2010.
+
+[23] CVE. CVE-2010-4258. http://cve.mitre.org/cgi-
+bin/cvename.cgi?name=CVE-2010-4258, November
+2010.
+
+[24] DAN ROSENBERG. kptr_restrict for hiding kernel point-
+ers. http://lwn.net/Articles/420403/, December
+2010.
+
+[25] DE C VALLE, R.
+Pointer Dereference
+packetstormsecurity.org/files/81212/Linux-
+sock_sendpage-NULL-Pointer-Dereference.
+html, September 2009.
+
+Linux sock_sendpage() NULL
+http://
+
+(PPC/PPC64 exploit).
+
+[26] DE RAADT, T. CVS-200910282103. http://marc.info/?
+l=openbsd-cvs&m=125676466108709&w=2, October
+2009.
+
+[27] DESIGNER, S.
+
+Getting around non-executable stack (and
+ﬁx). http://seclists.org/bugtraq/1997/Aug/63,
+August 1997.
+
+[28] DOSEMU. DOS Emulation. http://www.dosemu.org,
+
+June 2012.
+
+[29] DOWD, M. Application-Speciﬁc Attacks: Leveraging The Ac-
+tionScript Virtual Machine. Tech. rep., IBM Corporation, April
+2008.
+
+[30] EDB.
+
+EDB-9477.
+
+http://www.exploit-db.com/
+
+exploits/9477/, August 2009.
+
+[31] EDB.
+
+EDB-17391.
+
+http://www.exploit-db.com/
+
+exploits/17391/, June 2011.
+
+[32] EDB.
+
+EDB-18080.
+
+http://www.exploit-db.com/
+
+exploits/18080/, November 2011.
+
+[33] ERLINGSSON, U., ABADI, M., VRABLE, M., BUDIU, M., AND
+NECULA, G. C. XFI: Software Guards for System Address
+Spaces. In Proceedings of the 7th Symposium on Operating Sys-
+tems Design and Implementation (OSDI) (2006), pp. 75–88.
+
+[34] ETOH, H.
+
+GCC extension for protecting applications
+from stack-smashing attacks. http://www.trl.ibm.com/
+projects/security/ssp/, August 2005.
+
+[35] FREEBSD.
+
+sysutils/vbetool doesn’t work with FreeBSD 8.0-
+http://forums.freebsd.
+
+RELEASE and STABLE.
+org/showthread.php?t=12889, April 2010.
+
+[36] GARFINKEL, T., AND ROSENBLUM, M. A Virtual Machine In-
+trospection Based Architecture for Intrusion Detection. In Pro-
+ceedings of the Annual Network & Distributed System Security
+Symposium (NDSS) (February 2003).
+
+[37] GEORGE, V., PIAZZA, T., AND JIANG, H.
+
+Technology
+Intel c(cid:13)Next Generation Microarchitecture Codename
+www.intel.com/idf/library/pdf/sf_
+
+Insight:
+Ivy Bridge.
+2011/SF11_SPCS005_101F.pdf, September 2011.
+
+[38] GRIZZARD,
+
+J. B.
+
+Re-
+establishing Trust in Compromised Systems. PhD thesis, Georgia
+Institute of Technology, 2006.
+
+Towards Self-Healing Systems:
+
+[39] HARDY, N. The Confused Deputy (or why capabilities might
+have been invented). SIGOPS Operating Systems Review 22, 4
+(October 1988), 36–38.
+
+[40] HUND, R., HOLZ, T., AND FREILING, F. C. Return-Oriented
+Rootkits: Bypassing Kernel Code Integrity Protection Mecha-
+nisms. In Proceedings of the 18th USENIX Security Symposium
+(USENIX Sec) (2009), pp. 383–398.
+
+[41] INGO MOLNAR.
+
+more) support.
+July 2003.
+
+4G/4G split on x86, 64 GB RAM (and
+http://lwn.net/Articles/39283/,
+
+[42] KC, G. S., KEROMYTIS, A. D., AND PREVELAKIS, V. Counter-
+ing Code-Injection Attacks With Instruction-Set Randomization.
+In Proceedings of the 10th ACM Conference on Computer and
+Communications Security (CCS) (2003), pp. 272–280.
+
+[43] KIRIANSKY, V., BRUENING, D., AND AMARASINGHE, S. Se-
+cure Execution via Program Shepherding.
+In Proceedings of
+the 11th USENIX Security Symposium (USENIX Sec) (2002),
+pp. 191–206.
+
+[44] KORTCHINSKY, K. CLOUDBURST: A VMware Guest to Host
+Escape Story. In Proceedings of the 12th Black Hat USA (2009).
+
+[45] LI, J., WANG, Z., JIANG, X., GRACE, M., AND BAHRAM, S.
+Defeating Return-Oriented Rootkits With “Return-less” Kernels.
+In Proceedings of the 5th European Conference on Computer Sys-
+tems (EuroSys) (2010), pp. 195–208.
+
+[46] LIAKH, S., GRACE, M., AND JIANG, X. Analyzing and Im-
+proving Linux Kernel Memory Protection: A Model Checking
+Approach. In Proceedings of the 26th Annual Computer Security
+Applications Conference (ACSAC) (2010), pp. 271–280.
+
+[47] LOSCOCCO, P., AND SMALLEY, S.
+
+Integrating Flexible Sup-
+port for Security Policies into the Linux Operating System.
+In
+Proceedings of the 3rd USENIX Annual Technical Conference
+(FREENIX track) (2001), pp. 29–42.
+
+[48] LOVE, R. Linux Kernel Development, 2nd ed. Novel Press, Indi-
+
+anapolis, IN, USA, 2005.
+
+[49] MCKUSICK, M. K., BOSTIC, K., KARELS, M. J., AND QUAR-
+TERMAN, J. S. The Design and Implementation of the 4.4BSD
+Operating System. Addison Wesley Longman Publishing Co.,
+Inc., Boston, MA, USA, 1996, ch. Kernel Services, pp. 49–73.
+
+[50] MCVOY, L., AND STAELIN, C.
+
+lmbench: Portable Tools for
+Performance Analysis. In Proceedings of the 1st USENIX Annual
+Technical Conference (USENIX ATC) (1996), pp. 279–294.
+
+[51] ONARLIOGLU, K., BILGE, L., LANZI, A., BALZAROTTI, D.,
+AND KIRDA, E. G-Free: Defeating Return-Oriented Program-
+In Proceedings of the 26th
+ming through Gadget-less Binaries.
+Annual Computer Security Applications Conference (ACSAC)
+(2010), pp. 49–58.
+
+[52] PAX.
+
+Homepage of The PaX Team.
+
+http://pax.
+
+grsecurity.net, June 2012.
+
+[53] PAX TEAM.
+
+UDEREF.
+
+http://grsecurity.net/
+
+~spender/uderef.txt, April 2007.
+
+[54] PAYNE, B. D., CARBONE, M., SHARIF, M., AND LEE, W.
+Lares: An Architecture for Secure Active Monitoring Using Vir-
+tualization. In Proceedings of the 29th IEEE Symposium on Se-
+curity and Privacy (S&P) (2008), pp. 233–247.
+
+[55] PETRONI, JR., N. L., AND HICKS, M. Automated Detection of
+Persistent Kernel Control-Flow Attacks.
+In Proceedings of the
+14th ACM Conference on Computer and Communications Secu-
+rity (CCS) (October 2007), pp. 103–115.
+
+[56] RILEY, R., JIANG, X., AND XU, D. Guest-Transparent Preven-
+tion of Kernel Rootkits with VMM-based Memory Shadowing.
+In Proceedings of the 11th International Symposium on Recent
+Advances in Intrusion Detection (RAID) (2008), pp. 1–20.
+
+[57] SCOTT, K., AND DAVIDSON, J. Safe Virtual Execution Using
+In Proceedings of the 18th An-
+Software Dynamic Translation.
+nual Computer Security Applications Conference (ACSAC) (De-
+cember 2002), pp. 209–218.
+
+[58] SECURITYFOCUS. Xbox 360 Hypervisor Privilege Escala-
+tion Vulnerability. http://www.securityfocus.com/
+archive/1/461489, February 2007.
+
+[59] SECURITYFOCUS.
+
+BID 36587.
+
+http://www.
+
+securityfocus.com/bid/36587, October 2009.
+
+[60] SECURITYFOCUS.
+
+BID 36939.
+
+http://www.
+
+securityfocus.com/bid/36939, November 2009.
+
+[61] SECURITYFOCUS.
+
+BID 43060.
+
+http://www.
+
+securityfocus.com/bid/43060, September 2010.
+
+[62] SESHADRI, A., LUK, M., QU, N., AND PERRIG, A. SecVisor:
+A Tiny Hypervisor to Provide Lifetime Kernel Code Integrity for
+Commodity OSes. In Proceedings of the 21st ACM Symposium
+on Operating Systems Principles (SOSP) (2007), pp. 335–350.
+
+[63] SIDIROGLOU, S., LAADAN, O., PEREZ, C. R., VIENNOT, N.,
+NIEH, J., AND KEROMYTIS, A. D. ASSURE: Automatic Soft-
+ware Self-healing Using REscue points.
+In Proceedings of the
+14th International Conference on Architectural Support for Pro-
+gramming Languages and Operating Systems (ASPLOS) (2009),
+pp. 37–48.
+
+[64] SPENGLER, B. On exploiting null ptr derefs, disabling SELinux,
+and silently ﬁxed linux vulns. http://seclists.org/
+dailydave/2007/q1/224, March 2007.
+
+[65] STEINBERG, U., AND KAUER, B. NOVA: A Microhypervisor-
+Based Secure Virtualization Architecture.
+In Proceedings of
+the 5th European Conference on Computer Systems (EuroSys)
+(2010), pp. 209–222.
+
+[66] TINNES, J. Bypassing Linux NULL pointer dereference exploit
+http://blog.cr0.org/
+
+prevention (mmap_min_addr).
+2009/06/bypassing-linux-null-pointer.html,
+June 2009.
+
+[67] WANG, Z., AND JIANG, X. HyperSafe: A Lightweight Ap-
+proach to Provide Lifetime Hypervisor Control-Flow Integrity. In
+Proceedings of the 31st IEEE Symposium on Security and Privacy
+(S&P) (2010), pp. 380–395.
+
+[68] WANG, Z., JIANG, X., CUI, W., AND NING, P. Countering Ker-
+nel Rootkits with Lightweight Hook Protection. In Proceedings
+of the 16th ACM Conference on Computer and Communications
+Security (CCS) (2009), pp. 545–554.
+
+0x00000000
+
+[vmalloc area]
+
+                       
+
+                       
+
+                       
+
+0xfa7c8538:
+                       
+
+                       
+
+                       
+
+                       
+
+0xc032fda5:
+                       
+
+                       
+
+                       
+
+                       
+
+                       
+
+0xc01039db:
+                       
+
+                       
+
+}
+
+call *0xc03fd3a8(,%eax,4)
+
+call *0x50(%ebx)
+
+(0xfa7c8538)
+
+[kernel text]
+
+0xFFFFFFFF
+
+(0xc01d0ccf)
+
+0xC0000000
+stack offset
+
+[user stack]
+
+}
+
+stack break
+mmap offset
+
+0xb7fe2419:
+
+sysenter
+
+[sendfile@libc]
+
+0xb7d7d62c:
+
+jmp *0x10(%ebx)
+
+[sendfile@plt]
+
+(0xb7f50d20)
+
+[user heap]
+
+[data + bss segment]
+
+}
+
+brk offset
+
+0x08049d1d:
+
+call 0xb7d7d62c
+
+[user text]
+
+0x08048000
+
+SHELLCODE
+
+L
+E
+N
+R
+E
+K
+
+E
+C
+A
+P
+S
+R
+E
+S
+U
+
+ 
+
+Figure 5: Control transfers that occur during the exploitation
+of a ret2usr attack. The sendfile system call, on x86 Linux,
+causes a function pointer in kernel to become NULL, illegally
+transferring control to user space code.
+
+and are assumed to be control-ﬂow neutral. For that rea-
+son we perform the following. We begin by iterating
+over all the BBs and rtx expressions of the respective
+translation unit, selecting only the computed calls and
+jumps. This includes rtx objects of type CALL_INSN
+or JUMP_INSN that branch via a register or memory
+location. Note that ret instructions are also encoded
+as rtx objects of type JUMP_INSN. Next, we modify
+the rtx expression stream for inserting the CFAR and
+CFAM guards. The CFAR guards are inserted by split-
+ting the original BB into 3 new ones. The ﬁrst hosts
+all the rtx expressions before {CALL, JUMP}_INSN,
+along with the random NOP sled and two more rtx ex-
+pressions that match the compare (cmp) and jump (jae)
+instructions shown in Snippet 3. The second BB contains
+the code for loading the address of the violation handler
+into the branch register (i.e., mov in x86), while the last
+BB contains the actual branch expression along with the
+remaining rtx expressions of the original BB. Note that
+the process also involves altering the control-ﬂow graph,
+by chaining the new BBs accordingly and inserting the
+proper branch labels to ensure that the injected code re-
+mains inlined. CFAM instrumentation is performed in a
+similar fashion.
+
+[69] WILANDER, J., AND KAMKAR, M. A Comparison of Publicly
+Available Tools for Dynamic Buffer Overﬂow Prevention. In Pro-
+ceedings of the Annual Network & Distributed System Security
+Symposium (NDSS) (2003).
+
+[70] WINEHQ. Run Windows applications on Linux, BSD, Solaris
+
+and Mac OS X. http://www.winehq.org, June 2012.
+
+[71] WOJTCZUK, R. Subverting the Xen hypervisor. In Proceedings
+
+of the 11th Black Hat USA (2008).
+
+[72] ZENG, B., TAN, G., AND MORRISETT, G. Combining Control-
+ﬂow Integrity and Static Analysis for Efﬁcient and Validated Data
+In Proceedings of the 18th ACM Conference on
+Sandboxing.
+Computer and Communications Security (CCS) (2011), pp. 29–
+40.
+
+6
+
+5
+
+4
+
+3
+
+2
+
+1
+
+A Step-by-step Analysis of the sendpage
+
+ret2usr Exploit
+
+Figure 5 illustrates the steps taken by a malicious process
+to exploit the vulnerability shown in Snippet 1 (in x86).
+It starts by invoking the sendfile system call with the
+offending arguments (i.e., a datagram socket of a vulner-
+able protocol family, such as PF_IPX). The correspond-
+ing libc wrapper (0xb7f50d20) traps to the OS via the
+sysenter instruction (0xb7fe2419) and the generated
+software interrupt leads to executing the system call han-
+dler of Linux (sysenter_do_call()). The handler
+dynamically resolves the address of sys_sendfile
+(0xc01d0ccf) using the array sys_call_table,
+which includes the kernel-level address of every sup-
+ported system call
+indexed by system call number
+(0xc01039db).10 Privileged execution then continues
+until the offending sock_sendpage() routine is in-
+voked. Due to the arguments passed in sendfile, the
+value of the sendpage pointer (0xfa7c8538) is NULL
+and results in an indirect function call to address zero.
+This transfers control to the attacker, who can execute
+arbitrary code with kernel privileges.
+
+B GCC RTL Instrumentation Internals
+
+branchprot_instrument(), our instrumentation
+callback, is invoked by GCC’s pass manager for every
+translation unit after all the RTL optimizations have been
+applied, and exactly before target code is emitted. At that
+point, the corresponding translation unit is maintained
+as graph of basic blocks (BBs) that contain chained se-
+quences of RTL instructions, also known as rtx expres-
+sions (i.e., LISP-like assembler code for an abstract ma-
+chine with inﬁnite registers). GCC maintains a speciﬁc
+graph-based data structure (call-graph) that holds
+information for every internal/external call site. How-
+ever, indirect control transfers are not represented in it
+
+10The address 0xc03fd3a8 corresponds to the kernel-level memory
+
+address of sys_call_table.
+
+

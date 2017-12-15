@@ -1,0 +1,2562 @@
+A Software Approach to Defeating Side Channels in
+
+Last-Level Caches
+
+Ziqiao Zhou
+
+Michael K. Reiter
+
+Yinqian Zhang
+
+University of North Carolina
+
+University of North Carolina
+
+The Ohio State University
+
+Chapel Hill, NC, USA
+ziqiao@cs.unc.edu
+
+Chapel Hill, NC, USA
+reiter@cs.unc.edu
+
+Columbus, OH, USA
+yinqian@cse.ohio-
+
+state.edu
+
+ABSTRACT
+We present a software approach to mitigate access-driven
+side-channel attacks that leverage last-level caches (LLCs)
+shared across cores to leak information between security do-
+mains (e.g., tenants in a cloud). Our approach dynami-
+cally manages physical memory pages shared between secu-
+rity domains to disable sharing of LLC lines, thus prevent-
+ing “Flush-Reload” side channels via LLCs. It also man-
+ages cacheability of memory pages to thwart cross-tenant
+“Prime-Probe” attacks in LLCs. We have implemented
+our approach as a memory management subsystem called
+CacheBar within the Linux kernel to intervene on such
+side channels across container boundaries, as containers are
+a common method for enforcing tenant isolation in Platform-
+as-a-Service (PaaS) clouds. Through formal veriﬁcation,
+principled analysis, and empirical evaluation, we show that
+CacheBar achieves strong security with small performance
+overheads for PaaS workloads.
+
+Keywords
+Cache-based side channel; prime-probe; ﬂush-reload
+
+1.
+
+INTRODUCTION
+
+An access-driven side channel is an attack by which an at-
+tacker computation learns secret information about a victim
+computation running on the same computer, not by violat-
+ing the logical access control implemented by the isolation
+software (typically an operating system (OS) or virtual ma-
+chine monitor (VMM)) but rather by observing the eﬀects of
+the victim’s execution on microarchitectural components it
+shares with the attacker. Overwhelmingly, the components
+most often used in these attacks are CPU caches. Early
+cache-based side channels capable of leaking ﬁne-grained in-
+formation (e.g., cryptographic keys) across security bound-
+aries used per-core caches (e.g., [28, 10, 34]), though the
+need for the attacker to frequently preempt the victim to
+observe its eﬀects on per-core caches renders these attacks
+
+Permission to make digital or hard copies of part or all of this work for personal or
+classroom use is granted without fee provided that copies are not made or distributed
+for proﬁt or commercial advantage and that copies bear this notice and the full citation
+on the ﬁrst page. Copyrights for third-party components of this work must be honored.
+CCS’16 October 24-28, 2016, Vienna, Austria
+
+c(cid:13) 2016 Copyright held by the owner/author(s).
+
+ACM ISBN 978-1-4503-4139-4/16/10.
+DOI: http://dx.doi.org/10.1145/2976749.2978324
+
+relatively easy to mitigate in software (e.g., [37, 29]). Of
+more concern are side channels via last-level caches (LLCs)
+that are shared across cores and, in particular, do not require
+preemption of the victim to extract ﬁne-grained information
+from it (e.g., [33, 35, 12, 20]).
+
+Two varieties of LLC-based side channels capable of ex-
+tracting ﬁne-grained information from a victim have been
+demonstrated. The ﬁrst such attacks were of the Flush-
+Reload variety [33, 35], which requires the attacker to share
+a physical memory page with the victim—a common situa-
+tion in a modern OS, due to shared libraries, copy-on-write
+memory management, and memory deduplication mecha-
+nisms that aim for smaller memory footprints. The attacker
+ﬁrst Flushes a cache-line sized chunk of the shared page
+out of the cache using processor-speciﬁc instructions (e.g.,
+clflush in x86 processors) and later measures the time
+to Reload (or re-Flush [9]) it to infer whether this chunk
+was touched (and thus loaded to the shared cache already)
+by the victim. More recently, so-called Prime-Probe at-
+tacks have been demonstrated via LLCs [12, 20]; these do
+not require page sharing between the attacker and victim.
+Rather, Prime-Probe attacks can be conducted when the
+two programs share the same CPU cache sets. The attacker
+Primes the cache by loading its own memory into certain
+cache sets. Later it Probes the cache by measuring the time
+to load the same memory into the cache sets and inferring
+how many cache lines in each cache set are absent due to
+conﬂicts with the victim’s execution.
+
+In this paper we propose a software-only defense against
+these LLC-based side-channel attacks, based on two seem-
+ingly straightforward principles. First, to defeat Flush-
+Reload attacks, we propose a copy-on-access mechanism
+to manage physical pages shared across mutually distrust-
+ing security domains (i.e., processes, containers1, or VMs).
+Speciﬁcally, temporally proximate accesses to the same phys-
+ical page by multiple security domains results in the page
+being copied so that each domain has its own copy.
+In
+this way, a victim’s access to its copy will be invisible to
+an attacker’s Reload in a Flush-Reload attack. When
+accesses are suﬃciently spaced in time, the copies can be
+deduplicated to return the overall memory footprint to its
+original size. Second, to defeat Prime-Probe attacks, we
+design a mechanism to manage the cacheability of memory
+pages so as to limit the number of lines per cache set that
+an attacker may Probe. In doing so, we limit the visibil-
+ity of the attacker into the victim’s demand for memory
+that maps to that cache set. Of course, the challenge in
+
+1https://linuxcontainers.org/
+
+871these defenses is in engineering them to be eﬀective in both
+mitigating LLC-based side-channels and supporting eﬃcient
+execution of computations.
+
+To demonstrate these defenses and the tradeoﬀs between
+security and eﬃciency that they oﬀer, we detail their design
+and implementation in a memory management subsystem
+called CacheBar (short for “Cache Barrier”) for the Linux
+kernel. CacheBar supports these defenses for security do-
+mains represented as Linux containers. That is, copy-on-
+access to defend against Flush-Reload attacks makes page
+copies as needed to isolate temporally proximate accesses to
+the same page from diﬀerent containers. Moreover, mem-
+ory cacheability is managed so that the processes in each
+container are collectively limited in the number of lines per
+cache set they can Probe. CacheBar would thus be well-
+suited for use in Platform-as-a-Service (PaaS) clouds that
+isolate cloud customers in distinct containers; indeed, cross-
+container LLC-based side channels have been demonstrated
+in such clouds in the wild [35]. Our security evaluations show
+that CacheBar mitigates cache-based side-channel attacks,
+and our performance evaluation indicates that CacheBar
+imposes very modest overheads on PaaS workloads.
+
+To summarize, we contribute:
+• A novel copy-on-access mechanism to manage physical
+memory pages shared by distrusting tenants to prevent
+Flush-Reload side-channel attacks, and its formal
+veriﬁcation using model checking.
+
+• A novel mechanism to dynamically maintain queues
+of cacheable memory pages so as to limit the cache
+lines a malicious tenant may access in Prime-Probe
+attacks, and a principled derivation of its parameters
+to balance security and performance.
+
+• Implementation of both mechanisms in a mainstream
+Linux operating system kernel and an extensive secu-
+rity and performance evaluation for PaaS workloads.
+
+2. RELATED WORK
+
+Numerous proposals have sought to mitigate cache-based
+side channels with low overhead through redesign of the
+cache hardware, e.g., [31, 13, 19]. Unfortunately, there is
+little evidence that mainstream CPU manufacturers will de-
+ploy such defenses in the foreseeable future, and even if they
+did, it would be years before these defenses permeated the
+installed computing base. Other proposals modify appli-
+cations to better protect secrets from side-channel attacks.
+These solutions range from tools to limit branching on sen-
+sitive data (e.g., [4, 5]) to application-speciﬁc side-channel-
+free implementations (e.g., [15]). However, the overheads of
+these techniques tend to grow with the scope of programs to
+which they apply and can be very substantial (e.g., [25]).
+
+It is for this reason that we believe that systems-level (i.e.,
+OS- or VMM-level) defenses are the most plausible for de-
+ployment in the foreseeable future, and many have been pro-
+posed. With attention to cache-based side-channels speciﬁ-
+cally, several works provide to each security domain a limited
+number of designated pages that are never evicted from the
+LLC (e.g., [14, 18]), thereby rendering their contents im-
+mune to Prime-Probe and Flush-Reload attacks. These
+approaches, however, require the application developer to
+determine what data/instructions to protect and then to
+modify the application to organize the sensitive content into
+the protected pages; in contrast, CacheBar seeks to protect
+applications holistically and requires no application modiﬁ-
+
+cations. CacheBar also diﬀers in several design choices
+that free it from limitations of prior approaches (e.g., the
+limitation of only one protected page per core [14] or de-
+pendence on relatively recent, Intel-speciﬁc cache optimiza-
+tions [18]). Other systems-level solutions manage memory
+so as to partition the use of the LLC by diﬀerent security
+domains (e.g., [24, 26]), though these approaches preclude
+memory-page and CPU-cache sharing entirely and hence can
+underutilize these resources considerably. Others have sug-
+gested disabling or selectively enabling memory sharing [22,
+35, 3] for countering various side-channel attacks exploiting
+shared memory, while stopping short of exploring a complete
+design for doing so. Our copy-on-access design provides
+an eﬃcient realization of this idea for addressing Flush-
+Reload attacks, and extends this idea with cacheability
+management for Prime-Probe defense, as well.
+
+LLC-based side channels are a particular instance of tim-
+ing side channels, and so defenses that seek to eliminate
+timing side channels are also relevant to our problem. Ex-
+amples include fuzzing real-time sources (e.g., [30]), though
+this impinges on legitimate uses of real time. Since real-time
+counters are not the only way to time memory fetches [32],
+other eﬀorts have sought to eliminate side-channel risks more
+holistically via altering the CPU scheduler (e.g., [27, 17])
+and managing how tenants co-locate (e.g., [16, 36, 2, 17]).
+In contrast, here we focus speciﬁcally on LLC-based side
+channels (vs. a larger subset of timing side-channels), which
+again are arguably the most potent known side-channel vec-
+tors [33, 35, 12, 20], and restrict our modiﬁcations to the
+memory management subsystem.
+
+3. COPY-ON-ACCESS
+
+The Flush-Reload attack is a highly eﬀective LLC-based
+side channel that was used, e.g., by Zhang et al. [35] to
+mount ﬁne-grained side-channel attacks in commercial PaaS
+clouds. It leverages physical memory pages shared between
+an attacker and victim security domains, as well as the abil-
+ity to evict those pages from LLCs, using a capability such
+as provided by the clflush instruction on the x86 architec-
+ture. clflush is designed to maintain consistency between
+caches and memory for write-combined memory [11]. The
+attacker uses clflush, providing a virtual address as an ar-
+gument, to invalidate the cache lines occupied by the backing
+physical memory. After a short time interval (the “Flush-
+Reload interval”) during which the victim executes, the at-
+tacker measures the time to access the same virtual address.
+Based on this duration, the attacker can infer whether the
+victim accessed that memory during the interval.
+
+3.1 Design
+
+Modern operating systems, in particular Linux OS, often
+adopt on-demand paging and copy-on-write mechanisms [7]
+to reduce the memory footprints of userspace applications.
+In particular, copy-on-write enables multiple processes to
+share the same set of physical memory pages as long as none
+of them modify the content. If a process writes to a shared
+memory page, the write will trigger a page fault and a sub-
+sequent new page allocation so that a private copy of page
+will be provided to this process. In addition, memory merg-
+ing techniques like Kernel Same-Page Merging (KSM) [1]
+are also used in Linux OS to deduplicate identical memory
+pages. Memory sharing, however, is one of the key factors
+that enable Flush-Reload side channel attacks. Disabling
+
+872An accessed page will be reset to the shared state if it is
+not accessed for ∆accessed seconds. This timeout mechanism
+ensures that only recently used pages will remain in the ac-
+cessed state, limiting chances for unnecessary duplication.
+Page merging may also be triggered by deduplication ser-
+vices in a modern OS (e.g., KSM in Linux). This eﬀect is
+reﬂected by a dashed line in Fig. 1 from state exclusive to
+shared. A page at any of the mapped states (i.e., exclu-
+sive, shared, accessed) can transition to unmapped state
+for the same reason when it is a copy of another page (not
+shown in the ﬁgure).
+
+Merging duplicated pages requires some extra bookkeep-
+ing. When a page transitions from unmapped to exclu-
+sive due to copy-on-access, the original page is tracked by
+the new copy so that CacheBar knows with which page
+to merge it when deduplicating. If the original page is un-
+mapped ﬁrst, then one of its copies will be designated as
+the new “original” page, with which other copies will be
+merged in the future. The interaction between copy-on-
+access and existing copy-on-write mechanisms is also implic-
+itly depicted in Fig. 1: Upon copy-on-write, the triggering
+process will ﬁrst unmap the physical page, possibly inducing
+a state transition (from shared to exclusive). The state
+of the newly mapped physical page is maintained separately.
+
+3.2 Implementation
+
+At the core of copy-on-access implementation is the state
+
+machine depicted in Fig. 1.
+
+unmapped ⇔ exclusive ⇔ shared. Conventional Linux
+kernels maintain the relationship between processes and the
+physical pages they use. However, CacheBar also needs to
+keep track of the relationship between containers and the
+physical pages that each container’s processes use. There-
+fore, CacheBar incorporates a new data structure, counter,
+which is conceptually a table used for recording, for each
+physical page, the number of processes in each container
+that have Page Table Entries (PTEs) mapped to this page.
+The counter data structure is updated and referenced
+in multiple places in the kernel. Speciﬁcally, in CacheBar
+we instrumented every update of _mapcount, a data ﬁeld
+in the page structure for counting PTE mappings, so that
+every time the kernel tracks the PTE mappings of a physical
+page, counter is updated accordingly. The use of counter
+greatly simpliﬁes maintaining and determining the state of
+a physical page: (1) Given a container, access to a single cell
+suﬃces to check whether a physical page is already mapped
+in the container. This operation is very commonly used to
+decide if a state transition is required when a page is mapped
+by a process. Without counter, such an operation requires
+performing reverse mappings to check the domain of each
+mapping. (2) Given a physical page, it takes N accesses to
+counter, where N is the total number of containers, to tell
+which containers have mapped to this page. This operation
+is commonly used to determine the state of a physical page.
+
+shared ⇒ accessed. To diﬀerentiate shared and ac-
+cessed states, one additional data ﬁeld, owner, is added
+(see Fig. 2) to indicate the owner of the page (a pointer
+to a PID_namespace structure). When the page is in the
+shared state, its owner is NULL; otherwise it points to the
+container that last accessed it.
+
+All PTEs pointing to a shared physical page will have
+a reserved Copy-On-Access (COA) bit set. Therefore, any
+
+Figure 1: State transition of a physical page
+
+memory page sharing entirely will eliminate Flush-Reload
+side channels but at the cost of much larger memory foot-
+prints and thus ineﬃcient use of physical memory.
+
+CacheBar adopts a design that we call copy-on-access,
+which dynamically controls the sharing of physical memory
+pages between security domains. We designate each phys-
+ical page as being in exactly one of the following states:
+unmapped, exclusive, shared, and accessed. An un-
+mapped page is a physical page that is not currently in
+use. An exclusive page is a physical page that is currently
+used by exactly one security domain, but may be shared
+by multiple processes in that domain. A shared page is a
+physical page that is shared by multiple security domains,
+i.e., mapped by at least one process of each of the sharing
+domains, but no process in any domain has accessed this
+physical page recently.
+In contrast, an accessed page is
+a previously shared page that was recently accessed by a
+security domain. The state transitions are shown in Fig. 1.
+An unmapped page can transition to the exclusive state
+either due to normal page mapping, or due to copy-on-access
+when a page is copied into it. Unmapping a physical page for
+any reason (e.g., process termination, page swapping) will
+move an exclusive page back to the unmapped state. How-
+ever, mapping the current exclusive page by another secu-
+rity domain will transit it into the shared state. If all but
+one domain unmaps this page, it will transition back from
+the shared state to the exclusive state, or accessed state
+to the exclusive state. A page in the shared state may be
+shared by more domains and remain in the same state; when
+any one of the domains accesses the page, it will transition
+to the accessed state. An accessed page can stay that
+way as long only the same security domain accesses it. If
+this page is accessed by another domain, a new physical page
+will be allocated to make a copy of this one, and the current
+page will transition to either exclusive or shared state,
+depending on the remaining number of domains mapping
+this page. The new page will be assigned state exclusive.
+
+873on each of the memory blocks of any virtual page that maps
+to this physical page.
+
+State transition upon clflush. The clflush instruc-
+tion is subject to the same permission checks as a memory
+load, will trigger the same page faults, and will similarly
+set the ACCESSED bit in the PTE of its argument [11].
+As such, each Flush via clflush triggers the same transi-
+tions (e.g., from shared to accessed, and from accessed
+to an exclusive copy) as a Reload in our implementation,
+meaning that this defense is equally eﬀective against both
+Flush-Reload and Flush-Flush [9] attacks.
+
+Page deduplication. To mitigate the impact of copy-on-
+access on the size of memory, CacheBar implements a less
+frequent timer (every ∆copy = 10 × ∆accessed seconds) to pe-
+riodically merge the page copies with their original pages.
+Within the timer interrupt handler, original_list and
+each copy_list are traversed similarly to the “accessed
+⇒ shared” transition description above, though the AC-
+CESSED bit in the PTEs of only pages that are in the ex-
+clusive state are checked.
+If a copy page has not been
+accessed since the last such check (i.e., the ACCESSED bit
+is unset in all PTEs pointing to it), it will be merged with
+its original page (the head of the copy_list). The AC-
+CESSED bit in the PTEs will be cleared afterwards.
+
+When merging two pages, if the original page is anonymous-
+mapped, then the copy page can be merged by simply up-
+dating all PTEs pointing to the copy page to instead point
+to the original page, and then updating the original page’s
+reverse mappings to include these PTEs. If the original page
+is ﬁle-mapped, then merging is more intricate, additionally
+involving the creation of a new virtual memory area (vma
+structure) that maps to the original page’s ﬁle position and
+using this structure to replace the virtual memory area of
+the (anonymous) copy page in the relevant task structure.
+
+For security reasons, merging of two pages requires ﬂush-
+ing the original physical page from the LLC. We will elabo-
+rate on this point in Sec. 3.3.
+
+Interacting with KSM. Page deduplication can also be
+triggered by existing memory deduplication mechanisms (e.g.,
+KSM). To maintain the state of physical pages, CacheBar
+instruments every reference to _mapcount within KSM and
+updates counter accordingly. KSM is capable of merg-
+ing more pages than our built-in page deduplication mecha-
+nisms. However, CacheBar still relies on the built-in page
+deduplication mechanisms for several reasons. First, KSM
+can merge only anonymous-mapped pages, while CacheBar
+needs to frequently merge an anonymous-mapped page (a
+copy) with a ﬁle-mapped page (the original). Second, KSM
+may not be enabled in certain settings, which will lead to
+ever growing copy_lists. Third, KSM must compare page
+contents byte-by-byte before merging two pages, whereas
+CacheBar deduplicates pages on the same copy_list,
+avoiding the expensive page content comparison.
+
+3.3 Security
+
+Copy-on-access is intuitively secure by design, as no two
+security domains may access the same physical page at the
+same time, rendering Flush-Reload attacks seemingly im-
+possible. To show security formally, we subjected our design
+to model checking in order to prove that copy-on-access is
+secure against Flush-Reload attacks. Model checking is an
+approach to formally verify a speciﬁcation of a ﬁnite-state
+
+Figure 2: Structure of copy-on-access page lists.
+
+access to these virtual pages will induce a page fault. When
+a page fault is triggered, CacheBar checks if the page is
+present in physical memory; if so, and if the physical page
+is in the shared state, the COA bit of the current PTE
+for this page will be cleared so that additional accesses to
+this physical page from the current process will be allowed
+without page faults. The physical page will also transition
+to the accessed state.
+
+accessed ⇒ exclusive/shared. If the page is already in
+the accessed state when a domain other than the owner
+accesses it, the page fault handler will allocate a new physi-
+cal page, copy the content of the original page into the new
+page, and change the PTEs in the accessing container so that
+they point to the new page. Since multiple same-content
+copies in one domain burdens both performance and mem-
+ory but contributes nothing for security, the fault handler
+will reuse a copy belonging to that domain if it exists. After
+copy-on-access, the original page can either be exclusive or
+shared. All copy pages are anonymous-mapped, since only
+a single ﬁle-mapped page for the same ﬁle section is allowed.
+A transition from the accessed state to shared or ex-
+clusive state can also be triggered by a timeout mechanism.
+CacheBar implements a periodic timer (every ∆accessed =
+1s). Upon timer expiration, all physical pages in the ac-
+cessed state that were not accessed during this ∆accessed
+interval will be reset to the shared state by clearing its
+owner ﬁeld, so that pages that are infrequently accessed are
+less likely to trigger copy-on-access. If an accessed page is
+found for which its counter shows the number of domains
+mapped to it is 1, then the daemon instead clears the COA
+bit of all PTEs for that page and marks the page exclusive.
+Instead of keeping a list of accessed pages, CacheBar
+maintains a list of pages that are in either shared or ac-
+cessed state, denoted original_list (shown in Fig. 2).
+Each node in the list also maintains a list of copies of the
+page it represents, dubbed copy_list. These lists are at-
+tached onto the struct page through track_ptr. When-
+ever a copy is made from the page upon copy-on-access, it is
+inserted into the copy_list of the original page. Whenever
+a physical page transitions to the unmapped state, it is re-
+moved from whichever of original_list or copy_list
+it is contained in. In the former case, CacheBar will des-
+ignate a copy page of the original page as the new original
+page and adjust the lists accordingly.
+
+For security reasons that will be explained in Sec. 3.3, we
+further require ﬂushing the entire memory page out of the
+cache after transitioning a page from the accessed state
+to the shared state due to this timeout mechanism. This
+page-ﬂushing procedure is implemented by issuing clflush
+
+874concurrent system expressed as temporal logic formulas, by
+traversing the ﬁnite-state machine deﬁned by the model. In
+our study, we used the Spin model checker, which oﬀers eﬃ-
+cient ways to model concurrent systems and verify temporal
+logic speciﬁcations.
+
+the memory block (sets pages[virt] to 0) before Reloading
+it (setting pages[virt] to 1), if the non-interference prop-
+erty holds, then the attacker should always ﬁnd pages[virt]
+to be 0 upon Reloading the page. The model checker checks
+for violation of this property.
+
+System modeling. We model a physical page in Fig. 1 us-
+ing a byte variable in the Promela programming language,
+and two physical pages as an array of two such variables,
+named pages. We model two security domains (e.g., con-
+tainers), an attacker domain and a victim domain, as two
+processes in Promela. Each process maps a virtual page,
+virt, to one of the physical pages. The virtual page is mod-
+eled as an index to the pages[] array; initially virt for
+both the attacker and the victim point to the ﬁrst physical
+page (i.e., virt is 0). The victim process repeatedly sets
+pages[virt] to 1, simulating a memory access that brings
+pages[virt] into cache. The attacker process Flushes the
+virtual page by assigning 0 to pages[virt] and Reloads
+it by assigning 1 to pages[virt] after testing if it already
+equals to 1. Both the Flush and Reload operations are
+modeled as atomic to simplify the state exploration.
+
+We track the state and owner of the ﬁrst physical page
+using another two variables, state and owner. The ﬁrst
+page is initially in the shared state (state is shared), and
+state transitions in Fig. 1 are implemented by each process
+when they access the memory. For example, the Reload
+code snippet run by the attacker is shown in Fig. 3. If the
+attacker has access to the shared page (Line 3), versus an
+exclusive copy (Line 16), then it simulates an access to the
+page, which either moves the state of the page to accessed
+(Line 10) if the state was shared (Line 9) or to exclusive
+(Line 14) after making a copy (Line 13) if the state was al-
+ready accessed and not owned by the attacker (Line 12).
+Leakage is detected if pages[virt] is 1 prior to the at-
+tacker setting it as such (Line 19), which the attacker tests
+in Line 18.
+
+1 atomic {
+2 if
+3 ::(virt == 0) ->
+
+4
+
+5
+
+6
+
+7
+
+8
+
+9
+
+10
+
+11
+
+12
+
+13
+
+14
+
+15
+
+if
+::(state == UNMAPPED) ->
+
+assert(0)
+
+::(state == EXCLUSIVE && owner != ATTACKER) ->
+
+assert(0)
+
+::(state == SHARED) ->
+
+state = ACCESSED
+owner = ATTACKER
+
+::(state == ACCESSED && owner != ATTACKER) ->
+
+virt = 1 /* copy-on-access */
+state = EXCLUSIVE
+
+fi
+
+16 ::else -> skip
+17 fi
+18 assert(pages[virt] == 0)
+19 pages[virt] = 1
+20 }
+
+Figure 3: Code snippet for Reload.
+
+To model the dashed lines in Fig. 1, we implemented an-
+other process, called timer, in Promela that periodically
+transitions the physical page back to shared state from ac-
+cessed state, and periodically with a longer interval, merges
+the two pages by changing the value of virt of each domain
+back to 0, owner to none, and state to shared.
+
+The security speciﬁcation is stated as a non-interference
+property. Speciﬁcally, as the attacker domain always Flushes
+
+Automated veriﬁcation. We checked the model using
+Spin. Interestingly, our ﬁrst model-checking attempt sug-
+gested that the state transitions may leak information to
+a Flush-Reload attacker. The leaks were caused by the
+timer process that periodically transitions the model to a
+shared state. After inspecting the design and implemen-
+tation, we found that there were two situations that may
+cause information leaks. In the ﬁrst case, when the timer
+transitions the state machine to the shared state from the
+accessed state, if the prior owner of the page was the vic-
+tim and the attacker reloaded the memory right after the
+transition, the attacker may learn one bit of information. In
+the second case, when the physical page was merged with
+its copy, if the owner of the page was the victim before the
+page became shared, the attacker may reload it and again
+learn one bit of information. Since in our implementation
+of CacheBar, these two state transitions are triggered if
+the page (or its copy) has not been accessed for a while
+(roughly ∆accessed and ∆copy seconds, respectively), the infor-
+mation leakage bandwidth due to each would be approxi-
+mately 1/∆accessed bits per page per second or 1/∆copy bits
+per page per second, respectively.
+
+We improved our CacheBar implementation to prevent
+
+this leakage by enforcing LLC ﬂushes (as described in Sec. 3.2)
+upon these two periodic state transitions. We adapted our
+model accordingly to reﬂect such changes by adding one
+more instruction to assign pages[0] to be 0 right after the
+two timer -induced state transitions. Model checking this
+reﬁned model revealed no further information leakage.
+
+4. CACHEABILITY MANAGEMENT
+
+Another common method to launch side-channel attacks
+via caches is using Prime-Probe attacks, introduced by Os-
+vik et al. [21]. These attacks have recently been adapted
+to use LLCs to great eﬀect, e.g., [20, 12]. Unlike a Flush-
+Reload attack, Prime-Probe attacks do not require the at-
+tacker and victim security domains to share pages. Rather,
+the attacker simply needs to access memory so as to evict
+(Prime) the contents of a cache set and later access (Probe)
+this memory again to determine (by timing the accesses) how
+much the victim evicted from the cache set. A potentially
+eﬀective countermeasure to these attacks, accordingly, is to
+remove the attacker’s ability to Prime and Probe the whole
+cache set and to predict how a victim’s demand for that set
+will be reﬂected in the number of evictions from that set.
+
+4.1 Design
+
+Suppose a w-way set associative LLC, so that each cache
+set has w lines. Let x be the number of cache lines in one set
+that the attacker observes having been evicted in a Prime-
+Probe interval. The Prime-Probe attack is eﬀective today
+because x is typically a good indicator of the demand d that
+the victim security domain had for memory that mapped to
+that cache set during the Prime-Probe interval. In partic-
+ular, if the attacker Primes and Probes all w lines, then
+it can often observe the victim’s demand d exactly, unless
+d > w (in which case the attacker learns at least d ≥ w).
+
+875Figure 4: A cacheable queue for one
+page color in a domain: (a) access to
+page 24 brings it into the queue and
+clears NC bit (“← 0”) in the PTE trig-
+gering the fault; periodically, (b) a
+daemon counts the ACCESSED bits
+(“+0”, “+1”) per page and (c) re-
+orders pages accordingly; to make
+room for a new page, (d) NC bits in
+PTEs pointing to the least recently
+used page are set, and the page is re-
+moved from the queue.
+
+Here we propose to periodically and probabilistically re-
+conﬁgure the budget ki of lines per cache set that the se-
+curity domain i can occupy. After such a reconﬁguration,
+the attacker’s view of the victim’s demand d is clouded by
+the following three eﬀects. First, if the attacker is allotted a
+budget ka < w, then the attacker will be unable to observe
+any evictions at all (i.e., x = 0) if d < w −ka.2 Second, if the
+victim is given allotment kv, then any two victim demands
+d, d′ satisfying d > d′ ≥ kv will be indistinguishable to the
+attacker. Third, the probabilistic assignment of kv results
+in extra ambiguity for the attacker, since x evictions might
+reﬂect the demand d or the budget kv, since x ≤ min{d, kv}
+(if all x evictions are caused by the victim).
+
+To enforce the budget ki of lines that security domain i
+can use in a given cache set, CacheBar maintains for each
+cache set a queue per security domain that records which
+memory blocks are presently cacheable in this set by pro-
+cesses in this domain. Each element in the queue indicates
+a memory block that maps to this cache set; only blocks
+listed in the queue can be cached in that set. The queue is
+maintained with a least recently used (LRU) replacement al-
+gorithm. That is, whenever a new memory block is accessed,
+it will replace the memory block in the corresponding queue
+that is the least recently used.
+
+4.2 Implementation
+
+Implementation of cacheable queues is processor micro-
+architecture dependent. Here we focus our attention on
+Intel x86 processors, which appears to be more vulnera-
+ble to Prime-Probe attacks due to their inclusive last-
+level cache [20]. As x86 architectures only support mem-
+ory management at the page granularity (e.g., by manip-
+ulating the PTEs to cause page faults), CacheBar con-
+trols the cacheability of memory blocks at page granularity.
+CacheBar uses reserved bits in each PTE to manage the
+cacheability of, and to track accesses to, the physical page
+to which it points, since a reserved bit set in a PTE in-
+duces a page fault upon access to the associated virtual page,
+for which the backing physical page cannot be retrieved or
+cached (if it is not already) before the bit is cleared [11, 23].
+We hence use the term domain-cacheable to refer to a phys-
+ical page that is “cacheable” in the view of all processes in a
+particular security domain, which is implemented by modi-
+fying all relevant PTEs (to have no reserved bits set) in the
+
+2This statement assumes a LRU replacement policy and
+that the victim is the only security domain that runs in the
+Prime-Probe interval. If it was not the only security do-
+main to run, then the ambiguity of the observable evictions
+will additionally cause diﬃculties for the attacker.
+
+processes of that security domain. By deﬁnition, a physi-
+cal page that is domain-cacheable to one container may not
+necessarily be domain-cacheable to another.
+
+To ensure that no more than ki memory blocks from all
+processes in container i can occupy lines in a given cache
+set, CacheBar ensures that no more than ki of those pro-
+cesses’ physical memory pages, of which contents can be
+stored in that cache set, are domain-cacheable at any point
+in time. Physical memory pages of which contents can be
+stored in the same cache set are said to be of the same color,
+and so to implement this property, CacheBar maintains,
+per container and per color (rather than per cache set), one
+cacheable queue, each element of which is a physical mem-
+ory page that is domain-cacheable in this container. Since
+the memory blocks in each physical page map to diﬀerent
+cache sets, limiting the domain-cacheable pages of a color
+to ki also limits the number of cache lines that blocks from
+these pages can occupy in the same cache set to ki.
+
+To implement a non-domain-cacheable memory, CacheBar
+
+uses one reserved bit, which we denote by NC, in all PTEs
+within the domain mapped to that physical page. As such,
+accesses to any of these virtual pages will be trapped into the
+kernel and handled by the page fault handler. Upon detect-
+ing page faults of this type, the page fault handler will move
+the accessed physical page into the corresponding cacheable
+queue, clear the NC bit in the current PTE3, and remove a
+least recently used physical page from the cacheable queue
+and set the NC bits in this domain’s PTEs mapped to that
+page. A physical page removed from the cacheable queue
+will be ﬂushed out of the cache using clflush instructions
+on all of its memory blocks to ensure that no residue remains
+in the cache. CacheBar will ﬂush the translation lookaside
+buﬀers (TLB) of all processors to ensure the correctness of
+page cacheabilities every time PTEs are altered. In this way,
+CacheBar limits the number of domain-cacheable pages of
+a single color at any time to ki.
+
+To maintain the LRU property of the cacheable queue, a
+daemon periodically re-sorts the queue in descending order
+of recent access count. Speciﬁcally, the daemon traverses
+the domain’s PTEs mapped to the physical frame within
+that domain’s queue and counts the number having their
+ACCESSED bit set, after which it clears these ACCESSED
+bits. It then orders the physical pages in the cacheable queue
+by this count (see Fig. 4). In our present implementation,
+this daemon is the same daemon that resets pages from the
+
+3We avoid the overhead of traversing all PTEs in the con-
+tainer that map to this physical page. Access to those virtual
+pages will trigger page faults to make these updates without
+altering the cacheable queue.
+
+876security domain i. This drawing is memoryless and inde-
+pendent of the draws for other security domains. Let Ki
+denote the random variable distributed according to how ki
+is determined. The random variables that we presume can
+be observed by the attacker domains include K1, . . . , Km;
+
+let Ka = min(cid:8)w,Pm
+
+i=1 Ki(cid:9) denote the number of cache lines
+
+allocated to the attacker domains. We also presume the at-
+tacker can accurately measure the number X of its cache
+lines that are evicted during the victim’s execution.
+
+Let Pd (E) denote the probability of event E in an exe-
+cution period during which the victim’s cache usage would
+populate d lines (of this color) if it were allowed to use all
+w lines, i.e., if k0 = w. We (the defender) would like to dis-
+tribute K0, . . . , Km so as to minimize the statistical distance
+between eviction distributions observable by the attacker for
+diﬀerent victim demands d, d′, i.e., to minimize
+
+X0≤d<d′≤wXx
+
+|Pd (X = x) − Pd′ (X = x) |
+
+(1)
+
+We begin by deriving an expression for Pd (X = x). Below
+we make the conservative assumption that all evictions are
+caused by the victim’s behavior; in reality, caches are far
+noisier. We ﬁrst consider the case x = 0, i.e., that the
+attacker domains observe no evictions.
+
+Pd(cid:16)X = 0(cid:12)(cid:12)(cid:12)
+
+K0 = k0
+
+∧ Ka = ka(cid:17) =(cid:26)1 if w ≥ ka + min{k0, d}
+
+0 otherwise
+
+“min{k0, d}” is used above because any victim demand for
+memory blocks that map to this cache set beyond k0 will
+back-ﬁll the cache lines invalidated when CacheBar ﬂushes
+other blocks from the victim’s cacheability queue, rather
+than evicting others. Since K0 and Ka are independent,
+
+Pd (X = 0) =
+
+P (K0 = k0) · P (Ka = ka)
+
+P (K0 = k0) · P (Ka = ka)
+
+(2)
+
+Note that we have dropped the “d” subscripts from the prob-
+abilities on the right, since K0 and Ka are distributed inde-
+pendently of d. And, since K1, . . . , Km are independent,
+
+m
+
+m
+
+if ka < w
+
+P (Ki = ki)
+
+P (Ki = ki)
+
+Yi=1
+Yi=1
+
+
+Xk1+...+km=ka
+Xk1+...+km≥w
+
+∧ Ka = ka(cid:17) =(cid:26)1 if x+w = ka +min{k0, d}
+
+0 otherwise
+
+K0 = k0
+
+if ka = w
+
+(3)
+
+P (Ka = ka) =
+
+Similarly, for x ≥ 1,
+
+Pd(cid:16)X = x(cid:12)(cid:12)(cid:12)
+
+and so for x ≥ 1,
+
+Pd (X = x) =
+
+P (K0 = k0) · P (Ka = x+w−k0)
+
+d
+
+w−k0
+
+Xk0=0
+Xka=0
+Xka =0
+Xk0=d+1
+
+w−d
+
+w
+
++
+
+d
+
+Xk0 =0
+Xk0=d+1
+
+w
+
++
+
+P (K0 = k0) · P (Ka = x+w−d)
+
+(4)
+
+From here, we proceed to solve for the best distribution
+for K0, . . . , Km to minimize Eqn. 1 subject to constraints
+
+Figure 5: Page fault handler for CacheBar.
+
+accessed state to shared state (see Sec. 3), which already
+checks and resets the ACCESSED bits in copies’ PTEs.
+Again, this daemon runs every ∆accessed = 1s seconds in our
+implementation. This daemon also performs the task of re-
+setting ki for each security domain i, each time it runs.
+
+Interacting with copy-on-access. The cacheable queues
+work closely with the copy-on-access mechanisms. In partic-
+ular, as both the COA and NC bits may trigger a page fault
+upon page accesses, the page handler logic must incorporate
+both (see Fig. 5). First, a page fault is handled as normal
+unless it is due to one of the reserved bits set in the PTE.
+As CacheBar is the only source of reserved bits, it takes
+over page fault handling from this point. CacheBar ﬁrst
+checks the COA bit in the PTE. If it is set, the correspond-
+ing physical page is either shared, in which case it will be
+transitioned to accessed, or accessed, in which case it will
+be copied and transitioned to either shared or exclusive.
+CacheBar then clears the COA bit and, if no other re-
+served bits are set, the fault handler returns. Otherwise, if
+the NC bit is set, the associated physical page is not in the
+cacheable queue for its domain, and so CacheBar enqueues
+the page and, if the queue is full, removes the least-recently-
+used page from the queue. If the NC bit is clear, this page
+fault is caused by unknown reasons and CacheBar turns
+control over to the generic handler for reserved bits.
+
+4.3 Security
+
+Recall that ki is the number of cache lines in a certain
+cache set that is available to domain i for a period. While
+the budget ki is in eﬀect, each access to a memory block
+that maps to this cache set, beyond the in-queue ki memory
+blocks, will incur a page fault (because they are all in dif-
+ferent pages). Because the page-fault processing time will
+overwhelm the timing granularity of modern Prime-Probe
+attacks by an order of magnitude, the attacker i realistically
+needs to restrict himself to accessing ki pages in his Probe
+phase and hence to occupying ki lines in that cache set.
+
+The security of this design hinges critically on how each
+ki is set by the daemon. When ki is reset, it is drawn from
+a distribution. In the remainder of this section we present
+how this distribution is determined.
+
+Suppose there are (at most) m domains on a host that are
+owned by the attacker—which might be all domains on the
+host except the victim—and let w be the number of cache
+lines per LLC set. Below we consider domain 0 to be the
+“victim” domain being subjected to Prime-Probe attacks
+by the “attacker” domains 1, . . . , m. Of course, the attacker
+i=1 ki cache lines available to
+
+them for conducting their Prime-Probe attacks.
+
+domains make use of all Pm
+
+Periodically, CacheBar draws a new value ki for each
+
+877Eqns. 2–4. That is, we specify those constraints, along with
+
+∀i, i′, k : P (Ki = k) = P (Ki′ = k)
+
+w
+
+∀i :
+
+P (Ki = ki) = 1
+
+Xki =0
+
+∀i, ki : P (Ki = ki) ≥ 0
+
+(5)
+
+(6)
+
+(7)
+
+and then solve for each P (Ki = ki) to minimize Eqn. 1.
+
+Unfortunately, solving to minimize Eqn. 1 alone simply
+results in a distribution that results in no use of the cache
+at all (e.g., P (Ki = 0) = 1 for each i). As such, we need to
+rule out such degenerate and “unfair” cases:
+
+∀i : P (Ki < w/(m + 1)) = 0
+
+(8)
+
+Also, to encourage cache usage, we counterbalance Eqn. 1
+with a second goal that values greater use of the cache. We
+express this goal as minimizing the earth mover’s distance [6]
+from the distribution that assigns P (Ki = w) = 1, i.e.,
+
+w
+
+(w − k) · P (K0 = k)
+
+Xk=0
+
+(9)
+
+As such, our ﬁnal optimization problem seeks to balance
+Eqn. 1 and Eqn. 9. Let constant γ denote the maximum (i.e.,
+worst) possible value of Eqn. 1 (i.e., when P (Ki = w) = 1
+for each i) and δ denote the maximum (i.e., worst) possible
+value of Eqn. 9 (i.e., when P (Ki = 0) = 1 for each i). Then,
+given a parameter ǫ, 0 < ǫ < 1, our optimization computes
+distributions for K0, . . . , Km so as to minimize u subject to
+
+u =
+
+u ≥
+
+1
+
+γ 
+ X0≤d<d′≤wXx
+δ(1 + ǫ)   w
+Xk=0
+
+1
+
+|Pd (X = x) − Pd′ (X = x) |
+
+
+(w − k) · P (K0 = k)!
+
+and constraints Eqns. 2–8.
+
+Our evaluation in Sec. 5.2.2 and Sec. 5.3.1 empirically char-
+acterizes the security and performance that result from set-
+ting ǫ = 0.01 the default setting in CacheBar. Of course,
+other balances could be chosen between these concerns, though
+as we will see below, this setting achieves convincing secu-
+rity while inducing only a modest performance overhead for
+most PaaS workloads.
+
+5. EVALUATION
+
+In this section, we evaluate the security and performance
+
+of CacheBar to validate its design and implementation.
+
+5.1 Setup
+
+Our testbed is a rack mounted DELL server equipped with
+two 2.67GHz Intel Xeon 5550 processors. Each processor
+contains 4 physical cores (hyperthreading disabled) sharing
+an 8MB last-level cache (L3). Each core has a 32KB L1 data
+and instruction cache and a 256KB L2 uniﬁed cache. The
+rack server is equipped with 128GB DRAM and 1000Mbps
+NIC connected to a 1000Mbps ethernet.
+
+We implemented CacheBar as a kernel extension for
+Linux kernel 3.13.11.6 that runs Ubuntu 14.04 server edi-
+tion. Our implementation adds ∼7000 lines of code to this
+Linux kernel. We set up containers using Docker 1.7.1.
+
+ 250
+ 200
+ 150
+ 100
+
+s
+e
+l
+c
+y
+c
+ 
+U
+P
+C
+
+unshared
+
+shared
+
+ 250
+ 200
+ 150
+ 100
+
+s
+e
+l
+c
+y
+c
+ 
+U
+P
+C
+
+unshared
+
+shared
+
+(a) CacheBar disabled
+
+(b) CacheBar enabled
+
+Figure 6: Reload timings in Flush-Reload attacks on
+a shared address vs. on an unshared address
+
+5.2 Security Evaluation
+
+We evaluated the eﬀectiveness of CacheBar in defending
+
+against both Flush-Reload and Prime-Probe attacks.
+
+5.2.1 Flush-Reload Attacks
+
+Although we used Spin model checker to validate the
+security of our copy-on-access design (Sec. 3), we empiri-
+cally tested our implementation to validate its eﬀectiveness.
+To do so, we constructed a Flush-Reload covert channel
+between sender and receiver processes, which were isolated
+in diﬀerent containers. Both the sender and receiver were
+linked to a shared library, libcrypto.so.1.0.0, and were
+pinned to run on diﬀerent cores of the same socket, thus
+sharing the same last-level cache. The sender ran in a loop,
+repeatedly accessing one memory location (the beginning
+address of function AES_decrypt()). The receiver exe-
+cuted Flush-Reload attacks on the same memory address,
+by ﬁrst Flushing the memory block out of the shared LLC
+with an clflush instruction and then Reloading the block
+by accessing it directly while measuring the access latency.
+The interval between Flush and Reload was set to 2500
+cycles. The experiment was run for 500,000 Flush-Reload
+trials. We then repeated this experiment with the sender
+accessing an unshared address, to form a baseline.
+
+Fig. 6(a) shows the results of this experiment, when run
+over unmodiﬁed Linux. The three horizontal lines forming
+the “box” in each boxplot represents the ﬁrst, second (me-
+dian), and third quartiles of the Flush-Reload measure-
+ments; whiskers extend to cover all points that lie within
+1.5× the interquartile range. As can be seen in this ﬁgure,
+the times observed by the receiver to Reload the shared ad-
+dress were clearly separable from the times to Reload the
+unshared address, over unmodiﬁed Linux. With CacheBar
+enabled, however, these measurements are no longer separa-
+ble (Fig. 6(b)). Certain corner cases are not represented in
+Fig. 6. For example, we found it extremely diﬃcult to con-
+duct experiments to capture the corner cases where Flush
+and Reload takes place right before and after physical page
+mergers, as described in Sec. 3.3. As such, we rely on our
+manual inspection of the implementation in these cases to
+check correctness and argue these corner cases are very dif-
+ﬁcult to exploit in practice.
+
+5.2.2 Prime-Probe Attacks
+
+We evaluated the eﬀectiveness of CacheBar against Prime-
+
+Probe attacks by measuring its ability to interfere with
+a simulated attack. Because the machine architecture on
+which we performed these tests had a w-way LLC with
+w = 16, we limited our experiments to only a single at-
+tacker container (i.e., m = 1), but an architecture with a
+larger w could accommodate more.4
+
+4For example, on an Itanium 2 processor with a 64-way LLC,
+
+878In our simulation, a process in the attacker container
+repeatedly performed Prime-Probe attacks on a speciﬁc
+cache set, while a process in a victim container accessed
+data that were retrieved into the same cache set at the
+rate of d accesses per attacker Prime-Probe interval. The
+cache lines available to the victim container and attacker
+container, i.e., kv and ka respectively, were ﬁxed in each ex-
+periment. The calculations in Sec. 4.3 implied that kv and ka
+could take on values from {4, 5, 6, . . . , 14}. In each test with
+ﬁxed kv and ka, we allowed the victim to place a demand
+of (i.e., retrieve memory blocks to ﬁll) d ∈ {0, 1, 2, ..., 16}
+cache lines of the cache set undergoing the Prime-Probe
+attack by the attacker. The attacker’s goal was to classify
+the victim’s demand into one of six classes: none = {0},
+one = {1}, few = {2, 3, 4}, some = {5, 6, 7, 8}, lots =
+{9, 10, 11, 12}, and most = {13, 14, 15, 16}.
+
+To make the attack easier, we permitted the attacker to
+know ka; i.e., the attacker trained a diﬀerent classiﬁer per
+value of ka, with knowledge of the demand d per Prime-
+Probe trial, and then tested against additional trial re-
+sults to classify unknown victim demands. Speciﬁcally, after
+training a na¨ıve Bayes classiﬁer on 500,000 Prime-Probe
+trials per (d, ka, kv) triple, we tested it on another 500,000
+trials. To ﬁlter out Probe readings due to page faults, ex-
+cessively large readings were discarded from our evaluation.
+The tests without CacheBar yielded the confusion matrix
+in Table 7(a), with overall accuracy of 67.5%. In this table,
+cells with higher numbers have lighter backgrounds, and so
+the best attacker would be one who achieves white cells along
+the diagonal and dark-gray cells elsewhere. As can be seen
+there, classiﬁcation by the attacker was very accurate for
+d falling into none, one, or lots; e.g., d = 1 resulted in
+a classiﬁcation of one with probability of 0.80. Other de-
+mands had lower accuracy, but were almost always classiﬁed
+into adjacent classes; i.e., every class of victim demand was
+classiﬁed correctly or as an adjacent class (e.g., d ∈ few was
+classiﬁed as one, few, or some) at least 96% of the time.
+
+In contrast, Fig. 7(b) shows the confusion matrix for a
+na¨ıve Bayes classiﬁer trained and tested using Prime-Probe
+trials conducted with CacheBar enabled. Speciﬁcally, these
+values were calculated using
+
+P(cid:0)class = c(cid:12)(cid:12) d ∈ c′(cid:1)
+= X4≤ka,kv≤14  P(cid:16)class = c(cid:12)(cid:12)(cid:12)
+
+· P (Ka = ka) · P (Kv = kv) !
+d ∈ c′ ∧ Kv = kv ∧ Ka = ka(cid:17)
+
+where class denotes the classiﬁcation obtained by the adver-
+sary using the na¨ıve Bayes classiﬁer; c, c′ ∈ {none, one,
+few, some, lots, most}; and P (Ka = ka) and P (Kv = kv)
+are calculated as described in Sec. 4.3. The factor
+
+P(cid:0)class = c(cid:12)(cid:12) d ∈ c′ ∧ Kv = kv ∧ Ka = ka(cid:1) was measured em-
+
+pirically. Though space limits preclude reporting the full
+class confusion matrix for each kv, ka pair, the accuracy
+of the na¨ıve Bayes classiﬁer per kv, ka pair, averaged over
+all classes c, is shown in Fig. 8. As in Fig. 7, cells with
+larger values in Fig. 8 are more lightly colored, though in this
+case, the diagonal has no particular signiﬁcance. Rather, we
+would expect that when the attacker and victim are each
+
+CacheBar could accommodate m = 3 or larger. That said,
+we are unaware of prior works that have successfully con-
+ducted Prime-Probe attacks from multiple colluding at-
+tackers, which would itself face numerous challenges (e.g.,
+coordinating Probes by multiple processes).
+
+m
+
+i
+t
+c
+i
+V
+
+d
+n
+a
+m
+e
+d
+
+m
+
+i
+t
+c
+i
+V
+
+d
+n
+a
+m
+e
+d
+
+Classiﬁcation by attacker
+
+none one
+.04
+.80
+.16
+.00
+.00
+.00
+
+.96
+.01
+.00
+.00
+.00
+.00
+
+few some
+.00
+.19
+.50
+.07
+.00
+.00
+
+.00
+.01
+.30
+.54
+.03
+.03
+
+lots most
+.00
+.00
+.04
+.34
+.84
+.56
+
+.00
+.00
+.00
+.04
+.13
+.41
+
+d
+
+none
+one
+few
+some
+lots
+most
+
+(a) Without CacheBar
+
+Classiﬁcation by attacker
+
+none one
+.16
+.36
+.14
+.10
+.06
+.07
+
+.33
+.16
+.13
+.09
+.08
+.10
+
+few some
+.26
+.19
+.40
+.16
+.10
+.18
+
+.18
+.19
+.19
+.37
+.16
+.18
+
+lots most
+.04
+.06
+.09
+.20
+.46
+.18
+
+.02
+.04
+.05
+.07
+.13
+.29
+
+d
+
+none
+one
+few
+some
+lots
+most
+
+(b) With CacheBar
+
+Figure 7: Confusion matrix of na¨ıve Bayes classiﬁer
+
+a
+k
+
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+
+4
+
+.18
+.19
+.17
+.17
+.33
+.20
+.41
+.45
+.55
+.55
+.53
+
+5
+
+.17
+.17
+.31
+.33
+.35
+.26
+.31
+.45
+.50
+.53
+.56
+
+6
+
+.17
+.30
+.24
+.22
+.32
+.31
+.27
+.40
+.59
+.68
+.45
+
+7
+
+.17
+.32
+.18
+.22
+.23
+.28
+.35
+.45
+.63
+.68
+.65
+
+8
+
+.17
+.27
+.21
+.19
+.43
+.44
+.50
+.47
+.49
+.54
+.46
+
+kv
+9
+
+.17
+.27
+.17
+.31
+.37
+.38
+.55
+.54
+.48
+.65
+.62
+
+10
+
+.17
+.20
+.20
+.33
+.43
+.34
+.53
+.54
+.54
+.52
+.48
+
+11
+
+.17
+.26
+.27
+.33
+.42
+.34
+.31
+.57
+.49
+.56
+.68
+
+12
+
+.36
+.33
+.43
+.46
+.32
+.46
+.53
+.67
+.56
+.57
+.55
+
+13
+
+.22
+.46
+.39
+.48
+.38
+.39
+.50
+.50
+.58
+.66
+.57
+
+14
+
+.33
+.39
+.41
+.54
+.49
+.56
+.62
+.50
+.57
+.66
+.53
+
+Figure 8: Accuracy per values of kv and ka
+
+limited to fewer lines in the cache set (i.e., small values of ka
+and kv, in the upper left-hand corner of Fig. 8) the accuracy
+of the attacker will suﬀer, whereas when the attacker and
+victim are permitted to use more lines of the cache (i.e., in
+the lower right-hand corner) the attacker’s accuracy would
+improve. Fig. 8 supports these general trends.
+
+Returning to Fig. 7(b), we see that CacheBar substan-
+tially degrades the adversary’s classiﬁcation accuracy, which
+overall is only 33%. Moreover, the adversary is not only
+wrong more often, but is also often “more wrong” in those
+cases. That is, whereas in Fig. 7(a) shows that each class of
+victim demand was classiﬁed as that demand or an adjacent
+demand at least 96% of the time, this property no longer
+holds true in Fig. 7(b). Indeed, the attacker’s best case in
+this regard is classifying victim demand lots, which it clas-
+siﬁes as some, lots, or most 75% of the time. In the case
+of a victim demand of most, this number is only 47%.
+
+5.3 Performance Evaluation
+
+In this section we describe tests we have run to evalu-
+ate the performance impact of CacheBar relative to an
+unmodiﬁed Linux kernel. As mentioned previously, we are
+motivated by side-channel prevention in PaaS clouds, and
+so we focused our evaluation on typical PaaS applications.
+In order to increase server utilization and reduce cost,
+most public PaaS clouds isolate tenants within the same
+operating system using Linux containers. While a web ap-
+plication may contain web servers, programming language
+runtimes, databases, and a set of middleware that enrich its
+
+879PaaS cloud
+
+Supported server engines (+ application languages)
+
+Table 1: Server+language support in selected PaaS clouds
+
+AppFog
+Azure
+Elastic Beanstalk
+Engine Yard
+
+Google Cloud
+
+Heroku
+HP Stackato
+
+OpenShift
+
+Tomcat, Apache, Nginx, IIS (Java, Python, PHP, Node.js, Ruby, Go)
+Tomcat, Jetty, Apache, Nginx, GlassFish, Wildfly, IIS (Java, Python, PHP, Node.js, Ruby, .NET)
+Tomcat, Apache, Nginx, Passenger, Puma, IIS (Java, Python, PHP, Node.js, Ruby, Go, .NET)
+Nginx, Rack, Passenger, Puma, Unicorn, Trinidad (Java, PHP, Node.js, and Ruby)
+JBoss, Wildfly, Tomcat, Apache, Nginx, Zend, Passenger, Mongrel, Thin, IIS (Java, Python, PHP,
+Node.js, Ruby, ASP.NET, Go)
+Jetty, Tomcat, Tornado, Nginx, Apache, Mongrel, Thin, Puma, Unicorn, Hypnotoad, Starman, Mongoose,
+Yaws, Mochiweb (Java, Python, PHP, Node.js, Ruby, Go, Perl, C, Erlang, Scala, Clojure)
+Apache, Apache TomEE, Nginx (Java, Python, PHP, Node.js, Ruby, Perl, Erlang, Scala, Clojure, ASP.NET)
+JBoss, Wildfly, Tomcat, Apache, Spring, Tornado, Zend, Vert.x (Java, Python, PHP, Node.js, Ruby, Perl,
+Ceylon)
+
+rate w/o CacheBar
+rate w CacheBar
+
+time w/o CacheBar
+time w CacheBar
+
+rate w/o CacheBar
+rate w CacheBar
+
+time w/o CacheBar
+time w CacheBar
+
+c
+e
+s
+ 
+r
+e
+p
+
+ 
+s
+e
+s
+n
+o
+p
+s
+e
+R
+
+ 160
+
+ 120
+
+ 80
+
+ 40
+
+ 0
+
+130
+
+ 3
+
+ 2
+
+ 1
+
+142
+
+ 0
+144
+
+)
+s
+
+m
+
+(
+ 
+e
+m
+
+i
+t
+ 
+e
+s
+n
+o
+p
+s
+e
+R
+
+c
+e
+s
+ 
+r
+e
+p
+
+ 
+s
+e
+s
+n
+o
+p
+s
+e
+R
+
+ 40
+
+ 30
+
+ 20
+
+ 10
+
+ 0
+
+ 5
+
+ 4
+
+ 3
+
+ 2
+
+ 1
+
+ 0
+
+)
+s
+
+m
+
+(
+ 
+e
+m
+
+i
+t
+ 
+e
+s
+n
+o
+p
+s
+e
+R
+
+30 31 32 33 34 35 36 37
+
+Requests per second
+
+132
+
+134
+
+140
+Requests per second
+
+138
+
+136
+
+)
+c
+e
+s
+/
+s
+t
+s
+e
+u
+q
+e
+r
+(
+ 
+t
+u
+p
+h
+g
+u
+o
+r
+h
+T
+
+rate w/o CacheBar
+rate w CacheBar
+
+time w/o CacheBar
+time w CacheBar
+
+ 160
+
+ 120
+
+ 80
+
+ 40
+
+ 0
+
+4
+
+ 5
+
+ 4
+
+ 3
+
+ 2
+
+ 1
+
+ 0
+
+)
+s
+
+m
+
+(
+ 
+e
+m
+
+i
+t
+ 
+e
+s
+n
+o
+p
+s
+e
+R
+
+16
+
+8
+
+6
+14
+Number of containers
+
+10
+
+12
+
+(a) 4 webservers
+
+(b) 16 webservers
+
+(c) diﬀerent numbers of webservers
+
+Figure 9: Average throughput and response time per Apache+PHP-FPM server, each in a separate container
+
+)
+c
+e
+s
+/
+s
+t
+s
+e
+u
+q
+e
+r
+(
+ 
+t
+u
+p
+h
+g
+u
+o
+r
+h
+T
+
+ 40
+
+ 30
+
+ 20
+
+ 10
+
+ 0
+
+w/o CacheBar
+
+w CacheBar
+
+w/o CacheBar
+
+w CacheBar
+
+34
+
+32
+
+36
+
+34
+
+34
+
+32
+
+34
+
+24
+
+33
+
+27
+
+28
+
+34
+
+36
+
+32
+
+java-tomcat
+
+ruby-puma
+python-tornado
+python-apache+cgi
+
+ruby-unicorn
+ruby-passenger
+
+ruby-mongrel
+ruby-thin
+
+)
+s
+
+m
+
+(
+ 
+e
+m
+
+i
+t
+ 
+e
+s
+n
+o
+p
+s
+e
+R
+
+ 0.8
+
+ 0.6
+
+ 0.4
+
+ 0.2
+
+ 0
+
+15.0%
+
+8.4%
+
+11.9%
+
+11.7% 2.4% 9.4%
+
+27.9%74.7%
+
+33.8%
+
+Browse
+
+Login
+
+PostSelfWall
+
+AddFriend
+
+SendMessage
+
+Register
+ReceiveMessage
+
+Update
+
+Logout
+
+rate w/o CacheBar
+rate w CacheBar
+
+time w/o CacheBar
+time w CacheBar
+
+c
+e
+s
+ 
+r
+e
+p
+
+ 
+s
+e
+s
+n
+o
+p
+s
+e
+R
+
+ 8
+
+ 6
+
+ 4
+
+ 2
+
+ 0
+
+0.3%
+
+-3.0%
+
+1.3% -0.9%
+
+1.2%
+
+2.4% 2.7%
+
+4
+
+16
+1
+Number of containers
+
+8
+
+ 12
+
+4.2%
+
+)
+s
+
+m
+
+(
+ 
+e
+m
+
+i
+t
+ 
+e
+s
+n
+o
+p
+s
+e
+R
+
+ 8
+
+ 4
+
+ 0
+
+Figure 10: By webserver+language
+
+Figure 11: By operation
+
+Figure 12: Media streaming
+
+functionality, in all PaaS clouds we have studied, language
+runtimes and web servers are located on diﬀerent servers
+from databases and middleware; web/app servers controlled
+by diﬀerent tenants may share the same OS, however. Be-
+cause users of PaaS clouds do not have the permission to ex-
+ecute arbitrary code on databases and middleware that are
+typically shared by multiple tenants, the targets of the side-
+channel attacks we consider in this paper are primarily web
+servers that supports various language runtimes, which may
+be co-located with the adversary-controlled malicious web
+servers on which arbitrary code can be executed. We con-
+ducted a survey to understand the popular web/app servers
+that are used in major PaaS clouds, and the programming
+languages they support; see Table 1.
+
+5.3.1 Runtime and Throughput Overhead
+
+Our experiments explored CacheBar’s performance (1)
+per the number of container (and webserver) instances; (2)
+for diﬀerent combinations of webserver and application lan-
+guage; (3) for complex workloads characteristic of a social
+networking website; and (4) for media-streaming workloads.
+
+Webserver performance. In the ﬁrst experiments, each
+container ran an Apache 2.4.7 web server with PHP-FPM
+and SSL enabled. We set up one client per server using
+autobench; clients were spread across four computers, each
+with the same networking capabilities as the (one) server
+computer (not to mention more cores and memory than the
+
+server computer), to ensure that any bottlenecks were on
+the server machine. Each client repeatedly requested a web
+page and recorded its achievable throughputs and response
+times at those throughput rates. The content returned to
+each client request was the 86KB output of phpinfo().
+
+Fig. 9 shows the throughputs and response times when
+clients sent requests using SSL without reusing connections.
+In particular, Fig. 9(a) shows the achieved response rates
+(left axis) and response times (right axis), averaged over all
+containers, as a function of oﬀered load when there were
+four containers (and so four web servers). Bars depict av-
+erage response rates running over unmodiﬁed Linux (“rate
+w/o CacheBar”) or CacheBar (“rate w CacheBar”), and
+lines depict average response times running over unmodi-
+ﬁed Linux (“time w/o CacheBar”) or CacheBar (“time w
+CacheBar”). Fig. 9(b) shows the same information for 16
+containers. As can be seen in these ﬁgures, the throughput
+impact of CacheBar was minimal, while the response time
+increased by around 20%. Fig. 9(c) shows this information
+in another way, with the number of containers (and hence
+servers) increasing along the horizontal-axis.
+In Fig. 9(c),
+each bar represents the largest request rate at which the
+responses could keep up.
+
+Webserver+language combinations. Next, we selected
+other common webserver+app-language combinations, namely
+Java over a Tomcat web server, Python over Apache+cgi,
+Python over Tornado, and Ruby over Puma. For each con-
+
+880ﬁguration, we instantiated 16 containers and set each up
+to dynamically generate 80KB random strings for clients.
+We also did tests using another four web servers running
+the same Ruby application, namely Passenger, Unicorn,
+Thin, and Mongrel. Fig. 10 shows the throughput that
+resulted in each case, over Linux and over CacheBar. As
+shown there, the throughput overheads were modest for most
+of the server+language combinations that we considered.
+The worst case was Python over Apache+cgi, which suf-
+fered a throughput degradation with CacheBar of 25%;
+other degradations were much more modest.
+
+Impact on a more complex workload. To test eﬀects on
+more complex workloads, we used the webserver instance in
+CloudSuite [8] that implements a social community website
+written in PHP over Nginx on our CacheBar-protected
+machine. This implementation queries a MySQL database
+and caches results using Memcached; in keeping with PaaS
+architectures, the database and Memcached server were im-
+plemented on another machine without protection, since ten-
+ants cannot typically execute directly on these machines. We
+used the Faban tool to generate a mix of requests to the
+webserver, including browse (7.9%), login (7.5%), post
+(24.9%), addFriend (7.3%), sendMsg (44.0%), register
+(0.8%), and logout (7.5%). In addition, a background ac-
+tivity happened on the webserver every 10s, which was ei-
+ther receiveMsg or update with equal likelihood. Fig. 11
+shows that the responsiveness of the various common op-
+erations suﬀered little with CacheBar, between 2% and
+15% overhead. Three operations (register, update, and
+logout) suﬀered over 25% overhead, but these operations
+were rare in the Faban workload (and presumably in prac-
+tice).
+
+Media streaming in CloudSuite.
+In addition to the
+webserver benchmark setup used above, CloudSuite oﬀers
+a media streaming server running over Nginx that serves
+3.1GB static video ﬁles at diﬀerent levels of quality. We
+set up a client process per server to issue a mix of requests
+for videos at diﬀerent quality levels and, through a binary
+search, to ﬁnd the peak request rate the server can sustain
+while keeping the failure rate below a threshold. Fig. 12
+shows that CacheBar aﬀected this application least of all,
+in both throughput and response time.
+
+SPEC CPU 2006 benchmarks. For completeness, we
+measured the impact of CacheBar on nine SPEC CPU
+2006 benchmarks. Six resulted in reasonable overheads:
+hmmer (13.3% overhead), gamess (3.5%), gromacs (13.1%),
+namd (14.3%), povray (0.4%), and tonto (16.8%). How-
+ever, three exhibited substantially higher overheads: perl-
+bench (225%), bzip2 (76%), and h264ref (143%).
+(Over-
+heads caused by copy-on-access alone were below 5%.) It
+is not surprising that limiting cache usage using cacheable
+queue can interfere with some workloads. CacheBar is not
+a panacea and is best suited for the PaaS workloads that
+formed the core of our evaluation.
+
+5.3.2 CacheBar’s Memory Savings
+
+To measure the memory savings that copy-on-access oﬀers
+over disabling memory sharing between containers, we mea-
+sured the total unique physical memory pages used across
+various numbers of webservers, each in its own container,
+when running over (i) unmodiﬁed Linux, (ii) Linux with-
+out cross-container memory sharing, and (iii) CacheBar-
+
+)
+
+B
+M
+
+(
+ 
+
+d
+a
+e
+h
+r
+e
+v
+o
+
+ 
+
+y
+r
+o
+m
+e
+M
+
+ 600
+
+ 450
+
+ 300
+
+ 150
+
+ 0
+
+Non-cross-shared-busy
+Non-cross-shared-idle
+CacheBar-busy
+CacheBar-idle
+
+4
+
+8
+
+12 16 20 24 28 32 36 42
+Number of containers
+
+Figure 13: Memory overhead comparison
+
+enabled Linux. We used the system diagnosis tool smem for
+memory accounting, speciﬁcally by accumulating the PSS
+(proportional set size) ﬁeld output by smem for each pro-
+cess, which reports the process’ shared memory pages di-
+vided by the number of processes sharing these pages, plus
+the process’ unshared memory pages and all kernel pages.
+
+Fig. 13 shows the memory overhead of Linux without cross-
+container sharing and with CacheBar, computed by sub-
+tracting the memory measured for unmodiﬁed Linux from
+the memory measured for each of these systems. We grew
+the number of containers to 16 in each case, and then extrap-
+olated to larger numbers of containers using best-ﬁt lines. As
+can be seen in Fig. 13, the overhead of CacheBar is vir-
+tually zero (“CacheBar-idle”) with negligible query load.
+“Non-cross-shared-busy” and “CacheBar-busy” shows the
+same measures in an experiment where every fourth server
+was subjected to a slightly more active load of four requests
+per second. This was enough to induce CacheBar’s copy-
+on-access mechanism to copy some memory pages. Again,
+however, the memory overhead of CacheBar was much less
+than of disabling cross-container sharing altogether.
+
+6. CONCLUSION
+
+We have presented two techniques to defend against side-
+channel attacks via LLCs, namely (i) copy-on-access for phys-
+ical pages shared among multiple security domains, to in-
+terfere with Flush-Reload attacks, and (ii) cacheability
+management for pages to limit the number of cache lines
+per cache set that an adversary can occupy simultaneously,
+to mitigate Prime-Probe attacks. We described the im-
+plementation of these techniques in a memory-management
+subsystem called CacheBar for Linux, to interfere with
+LLC-based side-channel attacks across containers. Using
+formal analysis (model checking for copy-on-access, and prob-
+abilistic modeling for cacheability management), we devel-
+oped designs that mitigate side-channel attacks in our em-
+pirical evaluations. Our experiments also conﬁrmed that the
+overheads of our approach are modest for PaaS workloads.
+
+Acknowledgments. This work was supported in part by
+NSF grants 1330599 and 1566444.
+
+7. REFERENCES
+[1] A. Arcangeli, I. Eidus, and C. Wright. Increasing
+
+memory density by using KSM. In Linux Symposium,
+2009.
+
+[2] Y. Azar, S. Kamara, I. Menache, M. Raykova, and
+
+B. Shepard. Co-location-resistant clouds. In 6th ACM
+Cloud Computing Security Workshop, 2014.
+
+[3] E. Bosman, K. Razavi, H. Bos, , and C. Giuﬀrida.
+Dedup est machina: Memory deduplication as an
+
+881advanced exploitation vector. In 37th IEEE
+Symposium on Security and Privacy, 2016.
+
+[4] B. Coppens, I. Verbauwhede, K. D. Bosschere, and
+B. D. Sutter. Practical mitigations for timing-based
+side-channel attacks on modern x86 processors. In
+30th IEEE Symposium on Security and Privacy, 2009.
+
+[5] S. Crane, A. Homescu, S. Brunthaler, P. Larsen, and
+
+M. Franz. Thwarting cache side-channel attacks
+through dynamic software diversity. In ISOC Network
+and Distributed System Security Symposium, 2015.
+
+[6] L. Elizaveta and P. Bickel. The earth mover’s distance
+
+is the Mallows distance. In 8th International
+Conference on Computer Vision, 2001.
+
+[7] F. J. T. F´abrega, F. Javier, and J. D. Guttman. Copy
+
+on write, 1995.
+
+[8] M. Ferdman et al. Clearing the clouds: a study of
+
+emerging scale-out workloads on modern hardware. In
+ACM SIGPLAN Notices, 2012.
+
+and countermeasures: the case of AES. In Topics in
+Cryptology–CT-RSA, 2006.
+
+[22] R. Owens and W. Wang. Non-interactive OS
+ﬁngerprinting through memory de-duplication
+technique in virtual machines. In 30th IEEE
+International Performance Computing and
+Communications Conference, 2011.
+
+[23] S. Raikin et al. Tracking mechanism coupled to
+
+retirement in reorder buﬀer for indicating sharing
+logical registers of physical register in record indexed
+by logical register, 2014. US Patent 8,914,617.
+[24] H. Raj, R. Nathuji, A. Singh, and P. England.
+
+Resource management for isolation enhanced cloud
+services. In ACM Cloud Computing Security
+Workshop, 2009.
+
+[25] A. Rane, C. Lin, and M. Tiwari. Raccoon: Closing
+
+digital side-channels through obfuscated execution. In
+24th USENIX Security Symposium, 2015.
+
+[9] D. Gruss, C. Maurice, and K. Wagner. Flush+Flush:
+
+[26] J. Shi, X. Song, H. Chen, and B. Zang. Limiting
+
+A stealthier last-level cache attack. CoRR,
+abs/1511.04594, 2015.
+
+[10] D. Gullasch, E. Bangerter, and S. Krenn. Cache games
+
+– bringing access-based cache attacks on AES to
+practice. In 32nd IEEE Symposium on Security and
+Privacy, 2011.
+
+[11] Intel. Intel R(cid:13) 64 and IA-32 Architectures Software
+
+Developer’s Manual, 2010.
+
+[12] G. Irazoqui, T. Eisenbarth, and B. Sunar. S$A: A
+
+shared cache attack that works across cores and deﬁes
+VM sandboxing—and its application to AES. In 36th
+IEEE Symposium on Security and Privacy, 2015.
+
+[13] G. Keramidas, A. Antonopoulos, D. N. Serpanos, and
+
+S. Kaxiras. Non deterministic caches: A simple and
+eﬀective defense against side channel attacks. Design
+Automation for Embedded Systems, 12(3), 2008.
+
+[14] T. Kim, M. Peinado, and G. Mainar-Ruiz.
+
+STEALTHMEM: System-level protection against
+cache-based side channel attacks in the cloud. In
+USENIX Security Symposium, 2012.
+
+[15] R. K¨onighofer. A fast and cache-timing resistant
+
+implementation of the AES. In Topics in
+Cryptology–CT-RSA, 2008.
+
+[16] M. Li, Y. Zhang, K. Bai, W. Zang, M. Yu, and X. He.
+
+Improving cloud survivability through dependency
+based virtual machine placement. In International
+Conference on Security and Cryptography, 2012.
+
+[17] P. Li, D. Gao, and M. K. Reiter. StopWatch: A cloud
+
+architecture for timing channel mitigation. ACM
+Trans. Information and System Security, 17(2), 2014.
+
+[18] F. Liu, Q. Ge, Y. Yarom, F. Mckeen, C. Rozas,
+
+G. Heiser, and R. B. Lee. Catalyst: Defeating
+last-level cache side channel attacks in cloud
+computing. In 22nd IEEE Symposium on High
+Performance Computer Architecture, 2016.
+
+[19] F. Liu and R. B. Lee. Random ﬁll cache architecture.
+In 47th Annual IEEE/ACM International Symposium
+on Microarchitecture, 2014.
+
+[20] F. Liu, Y. Yarom, Q. Ge, G. Heiser, and R. B. Lee.
+
+Last-level cache side-channel attacks are practical. In
+36th IEEE Symposium on Security and Privacy, 2015.
+[21] D. A. Osvik, A. Shamir, and E. Tromer. Cache attacks
+
+cache-based side-channel in multi-tenant cloud using
+dynamic page coloring. In Workshops of the 41st
+IEEE/IFIP International Conference on Dependable
+Systems and Networks, 2011.
+
+[27] D. Stefan, P. Buiras, E. Z. Yang, A. Levy, D. Terei,
+A. Russo, and D. Mazi`eres. Eliminating cache-based
+timing attacks with instruction-based scheduling. In
+Computer Security–ESORICS, 2013.
+
+[28] E. Tromer, D. A. Osvik, and A. Shamir. Eﬃcient
+
+cache attacks on AES, and countermeasures. Journal
+of Cryptology, 23(1), 2010.
+
+[29] V. Varadarajan, T. Ristenpart, and M. Swift.
+
+Scheduler-based defenses against cross-VM side
+channels. In 23rd USENIX Security Symposium, 2014.
+
+[30] B. C. Vattikonda, S. Das, and H. Shacham.
+
+Eliminating ﬁne grained timers in Xen. In 3rd ACM
+Cloud Computing Security Workshop, 2011.
+
+[31] Z. Wang and R. B. Lee. A novel cache architecture
+
+with enhanced performance and security. In 41st
+IEEE/ACM International Symposium on
+Microarchitecture, 2008.
+
+[32] J. C. Wray. An analysis of covert timing channels. In
+
+1991 IEEE Symposium on Security and Privacy, 1991.
+
+[33] Y. Yarom and K. E. Falkner. FLUSH+RELOAD: A
+
+high resolution, low noise, L3 cache side-channel
+attack. In USENIX Security Symposium, 2014.
+
+[34] Y. Zhang, A. Juels, M. K. Reiter, and T. Ristenpart.
+
+Cross-VM side channels and their use to extract
+private keys. In ACM Conference on Computer &
+Communications Security, 2012.
+
+[35] Y. Zhang, A. Juels, M. K. Reiter, and T. Ristenpart.
+Cross-tenant side-channel attacks in PaaS clouds. In
+ACM Conference on Computer & Communications
+Security, 2014.
+
+[36] Y. Zhang, M. Li, K. Bai, M. Yu, and W. Zang.
+
+Incentive compatible moving target defense against
+VM-colocation attacks in clouds. In 27th IFIP
+Information Security and Privacy Conference, 2012.
+
+[37] Y. Zhang and M. K. Reiter. D¨uppel: Retroﬁtting
+
+commodity operating systems to mitigate cache side
+channels in the cloud. In ACM Conference on
+Computer & Communications Security, 2013.
+
+882

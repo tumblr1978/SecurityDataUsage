@@ -1,0 +1,2046 @@
+The Most Dangerous Code in the World:
+
+Validating SSL Certiﬁcates in Non-Browser Software
+
+Martin Georgiev
+
+The University of Texas
+
+at Austin
+
+Rishita Anubhai
+Stanford University
+
+Subodh Iyengar
+Stanford University
+
+Dan Boneh
+
+Stanford University
+
+Suman Jana
+
+The University of Texas
+
+at Austin
+
+Vitaly Shmatikov
+
+The University of Texas
+
+at Austin
+
+ABSTRACT
+
+SSL (Secure Sockets Layer) is the de facto standard for secure In-
+ternet communications. Security of SSL connections against an
+active network attacker depends on correctly validating public-key
+certiﬁcates presented when the connection is established.
+
+We demonstrate that SSL certiﬁcate validation is completely bro-
+ken in many security-critical applications and libraries. Vulnerable
+software includes Amazon’s EC2 Java library and all cloud clients
+based on it; Amazon’s and PayPal’s merchant SDKs responsible
+for transmitting payment details from e-commerce sites to payment
+gateways; integrated shopping carts such as osCommerce, ZenCart,
+Ubercart, and PrestaShop; AdMob code used by mobile websites;
+Chase mobile banking and several other Android apps and libraries;
+Java Web-services middleware—including Apache Axis, Axis 2,
+Codehaus XFire, and Pusher library for Android—and all applica-
+tions employing this middleware. Any SSL connection from any of
+these programs is insecure against a man-in-the-middle attack.
+
+The root causes of these vulnerabilities are badly designed APIs
+of SSL implementations (such as JSSE, OpenSSL, and GnuTLS)
+and data-transport libraries (such as cURL) which present devel-
+opers with a confusing array of settings and options. We analyze
+perils and pitfalls of SSL certiﬁcate validation in software based on
+these APIs and present our recommendations.
+
+Categories and Subject Descriptors
+
+C.2.0 [Computer-Communication Networks]: General—Secu-
+rity and protection; K.4.4 [Computers and Society]: Electronic
+Commerce—Security
+
+Keywords
+
+SSL, TLS, HTTPS, public-key infrastructure, public-key certiﬁ-
+cates, security vulnerabilities
+
+1.
+
+INTRODUCTION
+
+Originally deployed in Web browsers, SSL (Secure Sockets Lay-
+er) has become the de facto standard for secure Internet communi-
+
+Permission to make digital or hard copies of all or part of this work for
+personal or classroom use is granted without fee provided that copies are
+not made or distributed for proﬁt or commercial advantage and that copies
+bear this notice and the full citation on the ﬁrst page. To copy otherwise, to
+republish, to post on servers or to redistribute to lists, requires prior speciﬁc
+permission and/or a fee.
+CCS’12, October 16–18, 2012, Raleigh, North Carolina, USA.
+Copyright 2012 ACM 978-1-4503-1651-4/12/10 ...$15.00.
+
+cations. The main purpose of SSL is to provide end-to-end security
+against an active, man-in-the-middle attacker. Even if the network
+is completely compromised—DNS is poisoned, access points and
+routers are controlled by the adversary, etc.—SSL is intended to
+guarantee conﬁdentiality, authenticity, and integrity for communi-
+cations between the client and the server.
+
+Authenticating the server is a critical part of SSL connection es-
+tablishment.1 This authentication takes place during the SSL hand-
+shake, when the server presents its public-key certiﬁcate. In order
+for the SSL connection to be secure, the client must carefully verify
+that the certiﬁcate has been issued by a valid certiﬁcate authority,
+has not expired (or been revoked), the name(s) listed in the certiﬁ-
+cate match(es) the name of the domain that the client is connecting
+to, and perform several other checks [14, 15].
+
+SSL implementations in Web browsers are constantly evolving
+through “penetrate-and-patch” testing, and many SSL-related vul-
+nerabilities in browsers have been repaired over the years. SSL,
+however, is also widely used in non-browser software whenever
+secure Internet connections are needed. For example, SSL is used
+for (1) remotely administering cloud-based virtual infrastructure
+and sending local data to cloud-based storage, (2) transmitting cus-
+tomers’ payment details from e-commerce servers to payment pro-
+cessors such as PayPal and Amazon, (3) logging instant messenger
+clients into online services, and (4) authenticating servers to mobile
+applications on Android and iOS.
+
+These programs usually do not implement SSL themselves. In-
+stead, they rely on SSL libraries such as OpenSSL, GnuTLS, JSSE,
+CryptoAPI, etc., as well as higher-level data-transport libraries,
+such as cURL, Apache HttpClient, and urllib, that act as wrappers
+around SSL libraries. In software based on Web services, there is
+an additional layer of abstraction introduced by Web-services mid-
+dleware such as Apache Axis, Axis 2, or Codehaus XFire.
+
+Our contributions. We present an in-depth study of SSL connec-
+tion authentication in non-browser software, focusing on how di-
+verse applications and libraries on Linux, Windows, Android, and
+iOS validate SSL server certiﬁcates. We use both white- and black-
+box techniques to discover vulnerabilities in validation logic. Our
+main conclusion is that SSL certiﬁcate validation is completely bro-
+ken in many critical software applications and libraries. When
+presented with self-signed and third-party certiﬁcates—including
+a certiﬁcate issued by a legitimate authority to a domain called
+AllYourSSLAreBelongTo.us —they establish SSL connec-
+tions and send their secrets to a man-in-the-middle attacker.
+
+1SSL also supports client authentication, but we do not analyze it
+in this paper.
+
+38This is exactly the attack that SSL is intended to protect against.
+It does not involve compromised or malicious certiﬁcate authori-
+ties, nor forged certiﬁcates, nor compromised private keys of legit-
+imate servers. The only class of vulnerabilities we exploit are logic
+errors in client-side SSL certiﬁcate validation.
+
+The root cause of most of these vulnerabilities is the terrible de-
+sign of the APIs to the underlying SSL libraries.
+Instead of ex-
+pressing high-level security properties of network tunnels such as
+conﬁdentiality and authentication, these APIs expose low-level de-
+tails of the SSL protocol to application developers. As a conse-
+quence, developers often use SSL APIs incorrectly, misinterpreting
+and misunderstanding their manifold parameters, options, side ef-
+fects, and return values. In several cases, we observed developers
+introducing new vulnerabilities when attempting to “ﬁx” certiﬁcate
+validation bugs. Furthermore, deveopers often do not understand
+which security properties are or are not provided by a given SSL
+implementation: for example, they use SSL libraries that do not
+validate certiﬁcates even when security is essential (e.g., connect-
+ing to a payment processor). More prosaic, yet deadly causes in-
+clude intermediate layers of the software stack silently disabling
+certiﬁcate validation and developers turning off certiﬁcate valida-
+tion accidentally (e.g., for testing) or intentionally.
+
+2. OVERVIEW OF OUR RESULTS
+
+Our study uncovered a wide variety of SSL certiﬁcate valida-
+tion bugs. Affected programs include those responsible for manag-
+ing cloud-based storage and computation, such as Amazon’s EC2
+Java client library and Elastic Load Balancing API Tools, Apache
+Libcloud, Rackspace iOS client, and Windows-based cloud storage
+clients such as ElephantDrive and FilesAnywhere.
+
+Java-based Web-services middleware, such as Apache Axis, Axis
+2, and Codehaus XFire, is broken, too. So is the Android library
+for Pusher notiﬁcation API and Apache ActiveMQ implementation
+of Java Message Service. All programs employing this middleware
+are generically insecure.
+
+Certiﬁcate validation bugs are pervasive in “merchant SDKs,”
+which typically run on e-commerce servers (e.g., online stores) and
+are responsible for transmitting customers’ ﬁnancial details to pay-
+ment processing gateways. Broken libraries include Amazon Flex-
+ible Payments Service (both Java and PHP), as well as PayPal Pay-
+ments Standard and PayPal Invoicing (both in PHP), PayPal Pay-
+ments Pro, Mass Pay, and Transactional Information SOAP (all in
+Java). Most payment modules for integrated shopping carts, such
+as ZenCart, Ubercart, PrestaShop, and osCommerce, do not val-
+idate certiﬁcates, either. A man-in-the-middle attack enables the
+attacker to harvest credit card numbers, names, addresses, etc. of
+the customers of any merchant who uses one of these programs for
+payment processing. Mobile app providers who use AdMob’s sam-
+ple code to link app instances to their AdMob accounts are vulner-
+able, too, enabling the attacker to capture the developer’s account
+credentials and gain access to all of her Google services.
+
+Instant messenger clients such as Trillian and AIM do not val-
+idate certiﬁcates correctly, either. A man-in-the-middle attack on
+Trillian yields login credentials for all Google (including Gmail),
+Yahoo!, and Windows Live services (including SkyDrive).
+
+Not the most interesting technically, but perhaps the most devas-
+tating (because of the ease of exploitation) bug is the broken certiﬁ-
+cate validation in the Chase mobile banking app on Android. Even
+a primitive network attacker—for example, someone in control of
+a malicious Wi-Fi access point—can exploit this vulnerability to
+harvest the login credentials of Chase mobile banking customers.
+Other insecure Android software includes Breezy, a “secure” print-
+ing app, and the ACRA library for application crash reporting.
+
+In summary, SSL connections established by any of the above
+programs are insecure against a man-in-the-middle attack. All
+vulnerabilities have been empirically conﬁrmed.
+
+Causes. For the most part, the actual SSL libraries used in these
+programs are correct. Yet, regardless of which well-known library
+the software relies on—whether JSSE, OpenSSL, GnuTLS, or Cryp-
+toAPI, used directly or wrapped into a data-transport library such
+as Apache HttpClient or cURL—it often ﬁnds a way to end up with
+broken or disabled SSL certiﬁcate validation.
+
+The primary cause of these vulnerabilities is the developers’ mis-
+understanding of the numerous options, parameters, and return val-
+ues of SSL libraries. For example, Amazon’s Flexible Payments
+Service PHP library attempts to enable hostname veriﬁcation by
+setting cURL’s CURLOPT_SSL_VERIFYHOST parameter to true. Un-
+fortunately, the correct, default value of this parameter is 2; setting
+it to true silently changes it to 1 and disables certiﬁcate validation.
+PayPal Payments Standard PHP library introduced the same bug
+when updating a previous, broken implementation. Another ex-
+ample is Lynx, a text-based browser which is often used program-
+matically and thus included in our study. It checks for self-signed
+certiﬁcates—but only if GnuTLS’s certiﬁcate validation function
+returns a negative value. Unfortunately, this function returns 0 for
+certain errors, including certiﬁcates signed by an untrusted author-
+ity. Chain-of-trust veriﬁcation in Lynx is thus broken.
+
+Developers often misunderstand security guarantees provided by
+SSL libraries. For example, JSSE (Java Secure Socket Extension)
+has multiple interfaces for managing SSL connections. The “ad-
+vanced” SSLSocketFactory API silently skips hostname veriﬁca-
+tion if the algorithm ﬁeld in the SSL client is NULL or an empty
+string rather than HTTPS. This is mentioned in passing in the JSSE
+reference guide, yet many Java implementations of SSL-based pro-
+tocols use SSLSocketFactory without performing their own host-
+name veriﬁcation. Vulnerable libraries include Apache HttpClient
+version 3.* and the Weberknecht implementation of WebSockets.
+Any Java program based on these libraries is generically insecure
+against a man-in-the-middle attack. Vulnerable programs include
+SOAP Web-services middleware such as Apache Axis and Code-
+haus XFire, as well as any software built on top of it (for ex-
+ample, Amazon’s EC2 client library), any Android app that uses
+Pusher API to manage real-time messaging (for example, GitHub’s
+Gaug.es), clients of Apache ActiveMQ servers, etc.
+
+Other bugs include using incorrect regular expressions for host-
+name matching, not checking the results of certiﬁcate validation
+correctly, accidentally or deliberately disabling validation, etc.
+
+Lessons. First, the state of adversarial testing appears to be excep-
+tionally poor even for critical software such as mobile banking apps
+and merchant SDKs responsible for managing secure connections
+to payment processors. Most of the vulnerabilities we found should
+have been discovered during development with proper unit testing.
+Second, many SSL libraries are unsafe by default, requiring high-
+er-level software to correctly set their options, provide hostname
+veriﬁcation functions, and interpret return values. As we show,
+software that relies on these libraries is often not up to the task.
+
+Third, even safe-by-default libraries, such as cURL’s wrapper
+around OpenSSL, are misused by developers that misinterpret the
+meaning of various options. This calls for better documentation and
+more rigorous formalization of API semantics. In particular, APIs
+should present high-level abstractions to developers, such as “con-
+ﬁdential and authenticated tunnel,” as opposed to requiring them to
+explicitly deal with low-level details such as hostname veriﬁcation.
+Fourth, SSL bugs are often hidden deep inside layers of middle-
+ware, above the actual SSL implementation but below the applica-
+
+39tion, making the problem hard to locate and repair, and effectively
+taking it out of application developers’ hands.
+
+cates have not expired and that the certiﬁcates of the intermediate
+CAs have the CA bit set in the “Basic Constraints” ﬁeld.
+
+Fifth, least interesting technically but still critically important,
+we observed many cases of developers deliberately disabling cer-
+tiﬁcate validation, while assuring both users and higher-level pro-
+grams that SSL is being supported but not informing them that pro-
+tection against active attacks has been turned off.
+
+3. OVERVIEW OF SSL
+
+3.1 Threat model
+
+We assume an active, man-in-the-middle network attacker who
+may control network routers or switches, Wi-Fi access points, and/or
+DNS. She may also control one or more servers and possess valid
+SSL certiﬁcates for these servers. When an SSL client attempts to
+connect to a legitimate server, the attacker can mislead it about the
+server’s network address (e.g., through DNS poisoning) and trick it
+into connecting to an attacker-controlled server instead.
+
+Our attacker (1) does not have access to the private keys of le-
+gitimate servers, (2) does not control any certiﬁcate authorities, (3)
+cannot forge certiﬁcates. Even if she succeeds in spooﬁng the ad-
+dress of a legitimate server, a correctly implemented SSL client
+should refuse to accept the malicious server’s certiﬁcate because of
+a mismatch between the name(s) on the certiﬁcate and the domain
+to which the client is connecting.
+
+target of our attacks
+
+SSL Client
+
+SSL Server
+
+validate
+
+server cert.
+
+client hello
+
+server
+server
+
+hello
+cert.
+
+client cert. request
+
+(optional)
+
+client key exchange
+
+client cert.
+
+(optional)
+
+change cipher spec
+
+encrypted data
+
+validate
+
+client cert.
+(optional)
+
+Figure 1: Simpliﬁed overview of SSL handshake.
+
+3.2 SSL certiﬁcate validation
+
+An SSL connection starts with a handshake between the client
+and the server. The handshake protocol is summarized in Figure 1;
+see RFC 6101 [16] for a complete description.
+
+We focus on the client’s validation of the server certiﬁcate. All
+SSL implementations we tested use X.509 certiﬁcates. The com-
+plete algorithm for validating X.509 certiﬁcates can be found in
+RFC 5280 [15] and RFC 2818 [14]. In this paper, we consider two
+of the checks; both are critical for security against active attacks.
+
+Chain-of-trust veriﬁcation. Each X.509 certiﬁcate has an “issuer”
+ﬁeld that contains the name of the certiﬁcate authority (CA) that
+issued the certiﬁcate. Every SSL client is conﬁgured with a list of
+certiﬁcates for trusted root CAs.
+
+In addition to its own certiﬁcate, the server sends the certiﬁcate
+of the issuing CA. If the issuing CA is not a root CA, the server
+also sends a list of certiﬁcates of higher-level CAs all the way to
+a root CA. The client attempts to build a chain starting from the
+server’s certiﬁcate at the bottom. Each certiﬁcate in the chain must
+be signed by the CA immediately above it; the root CA must be one
+of the client’s trusted CAs. The client also veriﬁes that the certiﬁ-
+
+Hostname veriﬁcation. After the chain of trust is established, the
+client must verify the server’s identity. RFC 2818 advises the im-
+plementors to use “SubjectAltNames” as the main source of server
+identiﬁers and support “Common Name” for backward compatibil-
+ity only, but most of the software we tested does it the other way
+around and checks “Common Name” ﬁrst. After building the list
+of server identiﬁers, the client attempts to match the fully qualiﬁed
+DNS name of the requested server to one of the identiﬁers.
+
+If the client ﬁnds an exact match in the list of server identi-
+ﬁers, veriﬁcation is done by straightforward string comparison. The
+client may also ﬁnd a wildcard name in the list of identiﬁers. The
+rules for wildcard matching are fairly complex [14, 17], especially
+concerning international character sets.
+
+Certiﬁcate revocation and X.509 extensions. This paper focuses
+on verifying the server’s identity, but full certiﬁcate validation in-
+volves many more checks. These checks are essential for security,
+yet are handled poorly or not at all by non-browser software.
+
+For example, some SSL libraries such as OpenSSL implement
+certiﬁcate revocation, but require the application to provide the
+certiﬁcate revocation list (CRL). The applications we analyzed do
+not avail themselves of this facility. Furthermore, libraries such as
+JSSE require the application to check validity of the CRL on its
+own. Most applications don’t bother. Other SSL libraries, such as
+Python’s ssl, do not expose a method for CRL checking.
+
+Some X.509 certiﬁcate extensions contain security-critical infor-
+mation such as key usage (e.g., is the CA allowed to use this key for
+signing certiﬁcates?), name constraints (restricting the names that
+a sub-CA can certify), and certiﬁcate policies, described in RFC
+2527 [13]. For instance, a CA may assign different levels of trust
+to different sub-CAs, but the application must provide a policy that
+takes advantage of this information. In practice, these extensions
+are largely neglected. For example, until recently OpenSSL did not
+validate name constraints correctly, while cURL does not even have
+an interface for specifying the application’s certiﬁcate policy.
+
+Attacks exploiting improper treatment of certiﬁcate revocation
+and X.509 extensions are somewhat different from the “pure” man-
+in-the-middle model considered in this paper. We leave their de-
+tailed analysis to future work.
+
+4. SSL ABSTRACTIONS
+
+Depending on its needs, an application can “plug” into SSL at
+different levels of abstraction. At the lowest level, there are many
+popular SSL implementations with different features, licenses, and
+hardware requirements: OpenSSL, JSSE, CryptoAPI, NSS, yaSSL,
+GnuTLS, BouncyCastle, and others. These libraries are mostly
+oblivious to protocols transported over SSL. Therefore, to avoid
+having to parse HTTP messages on their own, applications that in-
+volve HTTP over SSL (HTTPS) typically do not use them directly.
+Instead, they employ one of the many HTTPS libraries (see Sec-
+tion 4.2), which in turn use SSL libraries internally. Applications
+that use SOAP- or REST-based Web services require additional
+middleware on top of HTTPS or WebSockets (see Figure 2).
+
+4.1 SSL libraries
+
+OpenSSL. OpenSSL only provides chain-of-trust veriﬁcation; ap-
+plications must supply their own hostname veriﬁcation code. This
+is typical for low-level SSL libraries. Different application-layer
+protocols such as HTTPS, LDAP, etc. have different notions of
+what constitutes a valid hostname and what it means for a hostname
+to match the name(s) listed in the certiﬁcate. Therefore, hostname
+
+40Applications
+
+SOAP
+
+Applications
+
+REST
+
+Axis
+
+...
+
+CXF
+
+Applications
+
+Pusher
+
+...
+
+HTTP
+
+Web Socket
+
+HttpsClient
+
+...
+
+cURL
+
+Weberknecht
+
+...
+
+...
+
+IM
+
+SSL
+
+TCP
+
+JSSE
+
+...
+
+GnuTLS
+
+...
+
+OpenSSL
+
+OS NetworkingStack
+
+user−land
+libraries
+
+kernel
+
+Figure 2: Protocol stack.
+
+veriﬁcation must be managed either by the application itself, or by
+a data-transport wrapper such as cURL.
+
+Proper hostname veriﬁcation for OpenSSL and CryptoAPI is dis-
+cussed in [21, Chap. 10.8], assuming the chain of trust has been
+veriﬁed correctly. As discussed in [21, Chap. 10.5], the latter is
+error-prone due to the complexity of the underlying API. OpenSSL
+allows applications to customize chain-of-trust veriﬁcation by pro-
+viding a callback function or modifying conﬁguration variables such
+as “verify depth” and “verify mode” as shown in Figure 3.
+
+A program using OpenSSL can perform the SSL handshake by
+invoking the SSL_connect function. A high-level overview of the
+handling of different conﬁgurations and callbacks is shown in Al-
+gorithm 1. They can have complex interactions.
+
+Some certiﬁcate validation errors are signaled through the return
+values of SSL_connect, while for other errors SSL_connect returns
+OK but sets internal “verify result” ﬂags. Applications must call
+SSL_get_ verify_result function to check if any such errors oc-
+curred. This approach is error-prone (see Section 7.6).
+
+Algorithm 1 Outline of SSL_connect control ﬂow.
+
+while chain of trust contains no trusted CA do
+
+if chain length <verify_depth then
+
+Try to extend chain of trust by 1 level
+Set ERROR appropriately if any error
+
+else
+
+Set ERROR to ‘incomplete chain’
+
+end if
+if ERROR then
+
+verify_result = error
+if verify_callback == NULL then
+
+if verify_mode != 0 then
+
+Print error and terminate connection.
+
+end if
+
+else
+
+ret = verify_callback(preverify_ok = 0, . . . )
+if (verify_mode != 0) and (ret == 0) then
+
+Print error and terminate connection.
+
+end if
+
+end if
+if ERROR is not related to incorrect parsing then
+
+return 1
+
+else
+
+return ERROR
+
+end if
+
+else
+
+ret = verify_callback(preverify_ok = 1, . . . )
+if (verify_mode != 0) and (ret == 0) then
+
+Print error and terminate connection.
+
+end if
+
+end if
+
+end while
+return 1
+
+SSL_CTX_set_verify_depth
+
+SSL_set_verify_depth
+
+SSL_CTX_set_verify
+
+SSL_new
+
+SSL_set_verify
+
+SSL_set_fd
+
+verify
+mode
+default:
+
+0
+
+verify
+callback
+default:
+None
+
+verify
+depth
+default:
+
+9
+
+fd
+
+SSL_CTX
+
+SSL
+
+OpenSSL’s
+
+internal
+
+data
+
+structures
+
+verify_result
+
+SSL_get_verify_result
+
+SSL_connect
+(see Algorithm 1)
+
+Figure 3: OpenSSL API for setting up SSL connections with
+the default chain-of-trust veriﬁcation.
+
+The certiﬁcate validation function in GnuTLS, gnutls_certif-
+icate_verify_peers2, has similarly atrocious error reporting. It
+takes a reference to tls_status as an argument and sets it to an
+appropriate error code if validation fails. For some errors (e.g.,
+insufﬁcient credentials or no certiﬁcate found), it returns a negative
+value; for others (e.g., self-signed certiﬁcate), it sets the error code
+but returns zero. In Section 7.4 we show that application developers
+misunderstand this complex relationship between the error status
+and the return value, resulting in broken certiﬁcate validation.
+
+JSSE. Java Secure Socket Extension (JSSE) provides numerous in-
+terfaces through which Java applications—including Android mo-
+bile apps—can establish SSL connections.
+
+The low-level API is SSLSocketFactory. Depending on how the
+SSL client is created, this API may or may not perform hostname
+veriﬁcation. The following code sample is taken from X509Trust
+ManagerImpl.checkIdentity in Java 6 update 31:
+
+private void checkIdentity(String hostname,
+
+X509Certificate cert, String algorithm)
+
+throws CertificateException {
+if (algorithm != null && algorithm.length() != 0) {
+
+....
+
+if (algorithm.equalsIgnoreCase("HTTPS")) {
+
+HostnameChecker.getInstance(HostnameChecker.TYPE
+
+_TLS).match(hostname, cert);
+
+} else if (algorithm.equalsIgnoreCase("LDAP")) {
+
+HostnameChecker.getInstance(HostnameChecker.TYPE
+
+_LDAP).match(hostname, cert);
+
+} else {
+
+throw new CertificateException(
+
+"Unknown identification algorithm: " + algorithm);
+
+}
+
+}
+
+}
+
+The checkIdentity method throws an exception if the algorithm
+ﬁeld is set to anything other than HTTPS or LDAP. This is different
+from, for example, OpenSSL, which returns a value even if veriﬁ-
+cation fails and expects the application to check this value.
+
+JSSE APIs such as HttpsClient and HttpsURLConnection call
+try SetHostnameVerification when creating SSL clients. This
+method sets the algorithm ﬁeld to HTTPS. The above code thus
+invokes HostnameChecker and veriﬁes the name in the certiﬁcate.
+
+If the algorithm ﬁeld in the client data structure is NULL or an
+empty string, checkIdentity silently skips hostname veriﬁcation
+without throwing an exception. We conjecture that this behav-
+ior is designed to accommodate implementors of certiﬁcate-based
+protocols other than HTTPS or LDAP who may want to re-use
+
+41JSSE’s default trust manager for chain-of-trust veriﬁcation but pro-
+vide their own, protocol-speciﬁc hostname veriﬁcation.
+
+On February 14, 2012, Java 7 update 3 was released. The code
+for certiﬁcate validation is different from Java 6, but its behav-
+ior is similar: if the algorithm ﬁeld is NULL or an empty string,
+checkIdentity is never invoked.
+
+private void checkTrusted(X509Certificate[] chain,
+
+String authType, Socket socket, boolean isClient)
+throws CertificateException {
+
+...
+/ /
+String identityAlg = sslSocket.getSSLParameters().
+
+c h e c k e n d p o i n t
+
+i d e n t i t y
+
+getEndpointIdentificationAlgorithm();
+
+if (identityAlg != null && identityAlg.length != 0)
+
+{
+
+String hostname = session.getPeerHost();
+checkIdentity(hostname, chain[0], identityAlg);
+
+}
+
+}
+
+In SSL clients created using “raw” SSLSocketFactory (as op-
+posed to HttpsClient or HttpsURLConnection wrappers), the algo-
+rithm ﬁeld is NULL, thus JSSE does not perform hostname veriﬁ-
+cation. The responsibility for hostname veriﬁcation is delegated to
+the software running on top of JSSE. This feature is not explained
+in the API documentation. Instead, the following warning can be
+found deep inside the JSSE reference guide:2
+
+When using raw SSLSockets/SSLEngines you should
+always check the peer’s credentials before sending any
+data. The SSLSocket and SSLEngine classes do not
+automatically verify that the hostname in a URL matches
+the hostname in the peer’s credentials. An application
+could be exploited with URL spooﬁng if the hostname
+is not veriﬁed.
+
+The prevalence of Java software that uses SSLSocketFactory to
+create SSL clients yet does not perform hostname veriﬁcation (see
+Section 4.2) suggests that developers are not aware of this feature.
+The existence of alternative JSSE interfaces that do perform host-
+name veriﬁcation only increases the confusion.
+
+4.2 Data-transport libraries
+
+In practice, most applications rely on data-transport frameworks
+to establish HTTPS connections. These frameworks use SSL li-
+braries internally in a way that is usually opaque to applications.
+Apache HttpClient. Apache HttpClient3 is a client-side HTTP(S)
+Java library based on JDK. The latest version is 4.2.1, published
+on June 29, 2012, but most existing software employs older, 3.*
+versions. Apache HttpClient is used extensively in Web-services
+middleware such as Apache Axis 2 (see Section 8) because native
+JDK does not support SOAP Web services. Furthermore, Apache
+HttpClient provides better performance than JDK for functionali-
+ties such as sending HTTP POST requests.
+
+Apache HttpClient uses JSSE’s SSLSocketFactory to establish
+SSL connections. As explained in Section 4.1, this means that
+Apache HttpClient must perform its own hostname veriﬁcation.
+This leads to numerous vulnerabilities in software based on older
+versions on HttpClient that do not verify hostnames (Section 7.5).
+Furthermore, Apache HttpClient uses HttpHost data structure to
+describe HTTP(S) connections. HttpHost does not have any inter-
+
+2http://docs.oracle.com/javase/6/docs/
+technotes/guides/security/jsse/JSSERefGuide.
+html
+3http://hc.apache.org/httpcomponents-client-
+ga/
+
+nal consistency checks: for example, it allows connections to port
+443 to have HTTP as the scheme. In Section 7.8, we show how this
+leads to errors even in code implemented by SSL experts.
+Weberknecht. Weberknecht4 is a Java implementation of the Web-
+Sockets protocol. It uses SSLSocketFactory but does not perform
+its own hostname veriﬁcation. Any Java program that employs We-
+berknecht is vulnerable to a man-in-the-middle attack.
+cURL. cURL5 is a popular tool and library (libcurl) for fetching
+data from remote servers. Since version 7.10, cURL validates SSL
+certiﬁcates by default.
+Internally, it uses OpenSSL to verify the
+chain of trust and veriﬁes the hostname itself. This functionality is
+controlled by parameters CURLOPT_SSL_VERIFYPEER (default value:
+true) and CURLOPT_SSL_VERIFYHOST (default value: 2).
+
+This interface is almost perversely bad. The VERIFYPEER param-
+eter is a boolean, while a similar-looking VERIFYHOST parameter is
+an integer. The following quote from the cURL manual explains
+the meaning of CURLOPT_SSL_VERIFYHOST:
+
+1 to check the existence of a common name in the SSL
+peer certiﬁcate. 2 to check the existence of a common
+name and also verify that it matches the hostname pro-
+vided.
+In production environments the value of this
+option should be kept at 2 (default value).
+
+Well-intentioned developers not only routinely misunderstand
+these parameters, but often set CURLOPT_SSL_VERIFY HOST to TRUE,
+thereby changing it to 1 and thus accidentally disabling hostname
+veriﬁcation with disastrous consequences (see Section 7.1).
+
+PHP. PHP provides several methods for establishing SSL connec-
+tions. For example, fsockopen, which opens a raw socket to the
+remote server, can be used to connect to SSL servers by putting
+“ssl://” in the URL. Even though fsockopen does not perform any
+certiﬁcate checks whatsoever, PHP application developers routinely
+use it for SSL connection establishment (see Section 9).
+
+PHP also provides a cURL binding, which uses cURL’s default
+settings to establish SSL connections with proper certiﬁcate valida-
+tion. As we show in Sections 7.1, 7.2, and 7.3, application develop-
+ers often set cURL options incorrectly, overriding the defaults and
+breaking certiﬁcate validation.
+
+Python. Several Python modules can be used for SSL connection
+establishment. urllib, urllib2, and httplib connect to SSL servers
+but do not check certiﬁcates. This is clearly documented in a bright
+pink box on the urllib front page:6
+
+Warning: When opening HTTPS URLs, it does not
+attempt to validate the server certiﬁcate. Use at your
+own risk!
+
+Nevertheless, even high-security applications routinely use these
+
+modules for SSL connection establishment (see Section 9).
+
+Python also has an ssl module. This module veriﬁes the certiﬁ-
+cate’s chain of trust, but not the hostname. The application must do
+its own hostname veriﬁcation. In Python version 3, the ssl module
+introduced the match_hostname method for hostname veriﬁcation,
+but it must be explicitly called by the application.
+
+4http://code.google.com/p/weberknecht/
+5http://curl.haxx.se/
+6http://docs.python.org/library/urllib.html
+
+425. SSL IN NON-BROWSER SOFTWARE
+
+We analyze a representative sample of non-browser software ap-
+plications and libraries that use SSL for secure Internet connec-
+tions. Some programs, such as instant messenger clients and sim-
+ple mobile banking apps, are fairly straightforward in their use of
+SSL. Others, especially middleware libraries, use SSL as part of a
+multi-layer software stack. Many of the programs we analyze trans-
+mit extremely sensitive data—private ﬁles of individual users in the
+case of cloud clients, ﬁnancial information of customers in the case
+of merchant SDKs, developer account credentials in the case of
+mobile advertising software—over potentially insecure public net-
+works, thus it is absolutely critical that they use SSL correctly.
+
+Cloud client APIs. As cloud-computing platforms such as Ama-
+zon EC2 grow in popularity, their operators supply client SDKs
+through which third-party software can transmit user data to cloud-
+based storage, manage cloud-based computation (e.g., start and ter-
+minate virtual instances), and access other cloud services. For ex-
+ample, Amazon provides EC2 API tools in Java, PHP, Python, and
+Perl. Apache Libcloud is an example of an independent library for
+accessing multiple cloud providers.
+
+Merchant payment SDKs. Operators of e-commerce websites of-
+ten rely on third parties such as PayPal and Amazon Flexible Pay-
+ments Service (FPS) to process their customers’ payments. Pay-
+ment processors provide merchant SDKs (software development
+kits) in a variety of languages. These libraries are designed to be
+integrated into the back end of e-commerce websites. Merchant
+software uses them to transmit customers’ payment details and/or
+receive notiﬁcations when payments are made by customers.
+
+An online store typically has two options for payment process-
+ing. The ﬁrst option is to have the customer enter payment details
+directly into the payment processor’s website. When the customer
+checks out, the merchant’s website redirects her browser to PayPal
+or Amazon, where the customer enters her name, credit or debit
+card number, etc. The merchant never sees these details. Once the
+payment is complete, the payment processor redirects the customer
+back to the merchant’s website and notiﬁes the merchant.
+
+The merchant’s site runs a daemon listening for IPN (Instant Pay-
+ment Notiﬁcation) calls from the payment processor. Upon receiv-
+ing a notiﬁcation, the merchant is advised to verify that the call in-
+deed originated from the processor (some merchants skip this step,
+opening the door to “shop-for-free” attacks [23]). The merchant
+then completes the transaction with the customer.
+
+The second option is preferred by larger, more established stores.
+It does not require the customer to leave the merchant’s website and
+allows the merchant to collect payment details directly from the
+customer. The back-end software on the merchant’s website then
+transmits these details to the payment processor’s gateway over an
+SSL connection and receives the conﬁrmation that the payment suc-
+ceeded (often over the same SSL connection).
+
+Fig. 4 shows schematically the interaction between the merchant’s
+server and the payment gateway. The SSL client is the merchant’s
+back-end software (running on the merchant’s server), while the
+payment gateway acts as the SSL server.
+
+We analyzed SSL connection establishment in popular merchant
+SDKs, including Java and PHP SDKs for Amazon Flexible Pay-
+ments Service and multiple interfaces to PayPal: Payments Pro,
+Transactional Information, and Mass Pay (all in Java), as well as
+Payments Standard and Invoicing (PHP). We also analyzed both
+Amazon’s and PayPal’s utilities that merchants can use to verify
+the origin of IPN (Instant Payment Notiﬁcation) calls.
+
+We also analyzed several open-source shopping carts written in
+PHP: osCommerce, ZenCart, Ubercart, and PrestaShop. Shopping
+
+Merchant’s
+   Website
+
+Payment
+Gateway
+
+Customer
+
+1
+
+SDK
+
+SSL tunnel
+
+Internet
+
+2
+
+3
+
+1 Credit Card
+   Information
+
+2 Charge Request
+
+3 Payment
+   Confirmation
+
+Figure 4: Merchant SDK interacting with payment processor.
+
+carts are an important component of e-commerce websites. They
+keep track of customers’ shipping and billing information and al-
+low them to purchase multiple items in one transaction. When the
+customer checks out, the shopping cart generates a summary of the
+purchases and the total price and sends it to the payment gateway.
+Shopping carts include modules for many payment processors.
+
+Web-services middleware. Many modern programs rely on Web
+services. A Web service is “a software system designed to support
+interoperable machine-to-machine interaction over a network.”7 A
+service has an interface described in a machine-readable XML for-
+mat. Different providers may provide different concrete implemen-
+tations of this interface. Other systems interact with the service by
+sending and receiving messages.
+
+Messages to and from Web services are sent using XML-based
+Simple Object Access Protocol (SOAP) or REpresentational State
+Transfer (REST). From the viewpoint of the client software, a Web
+service can be thought of as providing a remote procedure call
+(RPC) interface, while SOAP or REST middleware marshals and
+unmarshals arguments of RPC calls.
+
+To interact with such a Web service—for example, if a cloud
+client implemented in Java wants to interact with Amazon EC2 —
+existing Java software often uses SOAP middleware such as Apache
+Axis, Axis 2, or Codehaus XFire (see Section 8). Similarly, if
+an Android app needs real-time “push” notiﬁcations, it may use
+a client-side library to connect to the REST-based Pusher service.8
+These middleware frameworks are responsible for transmitting
+Web-service messages over the network. If the connection must be
+secure, the middleware typically uses SSL but delegates actual SSL
+connection management to a data-transport library such as Apache
+HttpClient or Weberknecht (see Section 4.2).
+
+Mobile advertising. Mobile advertising services such as AdMob
+supply software that providers of mobile apps install on their sites.
+When a new app instance is initialized on a customer’s phone, it
+connects to the provider’s site, which in turn notiﬁes the AdMob
+server so that all ads shown to this app instance will be associated
+with the provider’s account (to enable ad revenue sharing, etc.).
+The connection from the app provider’s site to the AdMob server
+contains the provider’s credentials and must be protected by SSL.
+
+6. EXPERIMENTAL TESTBED
+
+Our primary methodology for the initial discovery of SSL cer-
+tiﬁcate validation bugs is black-box fuzzing. We test applications
+and libraries implementing SSL client functionality on two Dell
+laptops running Microsoft Windows 7 Professional Service Pack
+
+7http://www.w3.org/TR/ws-arch/
+8http://pusher.com
+
+431 and Ubuntu Linux 10.04, respectively. Mobile applications are
+tested on a Nexus One smartphone running Android 2.3.6 and an
+iPad 2 running iOS 4.2.1.
+
+We use local DNS cache poisoning to divert clients’ connections
+to a simulated attack server executing on an old Dell laptop with
+Ubuntu Linux 10.04. To simulate a man-in-the-middle attacker, we
+built two prototypes: one in Java, using JKS keystore to manage
+the attacker’s certiﬁcates and keys, the other in C, using OpenSSL
+for certiﬁcate and key management. We also used Fiddler, a Web
+debugging proxy [9]. If Fiddler encounters a connection request
+to a server it has not seen before, it creates a new certiﬁcate with
+the common name matching the requested name and stores it in
+its repository; otherwise, it retrieves an existing certiﬁcate from
+its repository. Fiddler then presents the certiﬁcate to the client,
+allowing us to simulate a man-in-the-middle attacker who presents
+self-signed certiﬁcates with correct common names. In addition,
+we enabled Fiddler to capture and decrypt HTTPS connections.
+
+Our simulated “man-in-the-middle” server presents the client with
+several certiﬁcates: (1) a self-signed certiﬁcate with the same com-
+mon name as the host the client is attempting to connect to, (2) a
+self-signed certiﬁcate with an incorrect common name, and (3) a
+valid certiﬁcate issued by a trusted certiﬁcate authority to a domain
+called AllYourSSLAreBelongTo.us. If the client establishes
+an SSL connection, the attack server decrypts trafﬁc sent by the
+client. It can then establish its own SSL connection to any legiti-
+mate server speciﬁed by the attacker and forward the client’s trafﬁc.
+The attack server also listens for the legitimate server’s response,
+decrypts and logs it, re-encrypts it with the symmetric key the at-
+tacker shares with the client and forwards it to the client.
+
+If we observed a particular client successfully establishing an
+SSL connection when presented with any of the attack certiﬁcates,
+we analyzed the source code of the client or, in the case of closed-
+source applications, the results of reverse-engineering, decompi-
+lation, and runtime traces (focusing in particular on calls to SSL
+libraries) in order to ﬁnd the root cause of the vulnerability.
+
+The URL veriﬁcation utility—found in src\Amazon\IpnRe-
+turnUrlValidation\SignatureUtilsForOutbound.
+php—is broken in a very similar way. This utility is critically im-
+portant because it is used by merchants to verify the origin of the
+calls informing them that a customer’s payment has been success-
+fully processed (see Section 5). Because Amazon’s PHP SDK does
+not correctly verify the origin of the IPN call, e-commerce sites
+using it may be vulnerable to “shop-for-free” attacks [23].
+
+7.2 PayPal Payments Standard and
+
+PayPal Invoicing (PHP)
+
+PayPal Payments Standard SDK implemented in PHP uses cURL.
+
+The previous version disabled all certiﬁcate validation checks:
+
+curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, FALSE);
+curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, FALSE);
+
+The version released on April 27, 2012, “ﬁxes” the problem:
+
+curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, TRUE);
+curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, TRUE);
+
+As in Section 7.1, this code overrides the correct default value of
+
+CURLOPT_SSL_VERIFYHOST and breaks hostname veriﬁcation.
+
+PayPal Invoicing contains similarly broken code:
+
+public function setHttpTrustAllConnection(
+
+$trustAllConnection)
+
+{
+
+}
+
+$this->curlOpt[CURLOPT_SSL_VERIFYPEER] =
+
+!$trustAllConnection;
+
+$this->curlOpt[CURLOPT_SSL_VERIFYHOST] =
+
+!$trustAllConnection;
+
+Any PHP code using these PayPal-provided SDKs to establish
+an SSL connection to PayPal’s payment processing gateway is in-
+secure against a man-in-the-middle attack.
+
+In Sections 7 through 10, we describe the vulnerabilities in spe-
+
+7.3 PayPal IPN in ZenCart
+
+ciﬁc programs, arranged by error type.
+
+7. MISUNDERSTANDING THE SSL API
+
+7.1 Amazon Flexible Payments Service (PHP)
+Amazon Flexible Payments Service (FPS) provides SDKs that
+merchants use to transmit customers’ payment details to the FPS
+gateway. The PHP version of the FPS SDK uses a wrapper around
+the libcurl library (see Section 4.2) to establish an SSL connection
+to the gateway. cURL’s options for certiﬁcate validation are set in
+src\Amazon\FOPS\Client.php as follows:
+
+curl_setopt($curlHandle, CURLOPT_SSL_VERIFYPEER, true);
+curl_setopt($curlHandle, CURLOPT_SSL_VERIFYHOST, true);
+...
+/ / E x e c u t e t h e
+$response = curl_exec($curlHandle);
+
+r e q u e s t
+
+This well-intentioned code contains a fatal mistake. cURL’s de-
+fault value of CURLOPT_SSL_VERIFYHOST is correctly set to 2. In the
+curl_setopt($curlHandle,CURLOPT_SSL_VERIFYHOST, true) call,
+true silently turns into 1, overriding the default and instructing
+cURL to check the existence of any common name in the certiﬁcate
+(Section 4.2), which may or may not match the name requested.
+
+Any PHP code using this Amazon-provided SDK to establish an
+SSL connection to the Amazon Flexible Payments Service gateway
+is insecure against a man-in-the-middle attack.
+
+ZenCart’s functionality for PayPal IPN shows a profound misun-
+derstanding of cURL’s parameters. It disables certiﬁcate validation
+entirely, yet attempts to enable hostname veriﬁcation—even though
+the latter has no effect if certiﬁcate validation is disabled.
+
+$curlOpts=array( ...
+
+CURLOPT_SSL_VERIFYPEER => FALSE,
+CURLOPT_SSL_VERIFYHOST => 2
+... );
+
+7.4 Lynx
+
+Lynx is a text-based browser, included in our study because it is
+often used programmatically by other software. It relies on GnuTLS
+to validate SSL certiﬁcates:
+
+ret = gnutls_certificate_verify_peers2(handle->gnutls_
+
+state, &tls_status);
+
+if (ret < 0) {
+
+int flag_continue = 1;
+char *msg2;
+
+if (tls_status & GNUTLS_CERT_SIGNER_NOT_FOUND) {
+
+msg2 = gettext("no issuer was found");
+
+} else if (tls_status & GNUTLS_CERT_SIGNER_NOT_CA) {
+
+msg2 = gettext("issuer is not a CA");
+
+} else if (tls_status & GNUTLS_CERT_SIGNER_NOT_FOUND)
+
+{
+
+msg2 = gettext("the certificate has no known issuer"
+
+);
+
+} else if (tls_status & GNUTLS_CERT_REVOKED) {
+
+msg2 = gettext("the certificate has been revoked");
+
+} else {
+
+44msg2 = gettext("the certificate is not trusted"); }
+
+... }
+
+This code misinterprets the semantics of gnutls_certificate_
+verify_peers2. As explained in Section 4.1, this function indeed
+sets the tls_status code if certiﬁcate validation fails, but for cer-
+tain errors—including self-signed certiﬁcates!—it returns 0. Even
+though the above code includes two identical checks for GNUTLS_
+CERT_SIGNER_NOT_FOUND, neither check is ever executed when GNU-
+TLS_CERT_SIGNER_NOT_FOUND is actually true! In this case hostname
+veriﬁcation is correct, but chain-of-trust veriﬁcation is broken.
+
+7.5 Apache HttpClient
+
+The most widely used version of Apache HttpClient is 3.1, re-
+leased in 2007. This library, as well as its earlier versions, sets
+up SSL connections using JSSE’s SSLSocketFactory without per-
+forming its own hostname veriﬁcation (see Sections 4.1 and 4.2).
+As a consequence, Apache HttpClient 3.* accepts any certiﬁcate
+with a valid chain of trust, regardless of the name. As mentioned in
+Section 4.2, the same bug occurs in Weberknecht.
+
+The hostname veriﬁcation bug in HttpClient was ﬁxed in version
+4.0-alpha1 [1]. The current version, 4.2.1, has its own hostname
+veriﬁer and delegates chain-of-trust veriﬁcation to JSSE. Unfortu-
+nately, as we show in Section 8, the existence of a correct imple-
+mentation of HttpClient has had little effect on the security of appli-
+cations that rely on HttpClient for SSL connection establishment.
+Apache HttpClient 4.* involved a major architectural re-design,
+thus much of legacy and even new software still relies on version
+3.*. The use of HttpClient is often hidden inside Web-services mid-
+dleware such as Axis 2 and XFire, which—several years after ver-
+sion 4.* became available—still ship with HttpClient 3.* and thus
+skip hostname veriﬁcation for SSL certiﬁcates.
+
+It is worth noting that the custom hostname veriﬁcation code
+added to HttpClient 4.* is incorrect and will reject valid certiﬁcates.
+The following code is from HttpClient 4.2.1:
+
+/ / The CN b e t t e r h a v e a t
+
+l e a s t
+
+tw o d o t s
+
+i f
+
+i t w a n t s
+
+w i l d c a r d
+
+[ ∗ . o r g . uk ] ,
+
+I t a l s o can ’ t be [ ∗ . co . uk ] o r
+
+/ / a c t i o n .
+/ /
+String parts[] = cn.split("\\.");
+boolean doWildcard = parts.length >= 3 &&
+
+e t c . . .
+
+[ ∗ . co . j p ] o r
+
+parts[0].endsWith("*") &&
+acceptableCountryWildcard(cn) &&
+!isIPAddress(host);
+
+if(doWildcard) {
+
+if (parts[0].length() > 1) { / /
+
+e . g .
+
+s e r v e r ∗
+
+String prefix = parts[0].substring(0, parts.length
+
+-2); / /
+
+e . g .
+
+s e r v e r
+
+String suffix = cn.substring(parts[0].length());
+
+/ /
+
+s k i p w i l d c a r d p a r t
+
+f r o m cn
+
+String hostSuffix = hostName.substring(prefix.length
+
+()); / /
+
+s k i p w i l d c a r d p a r t
+
+f r o m h o s t
+
+match = hostName.startsWith(prefix) && hostSuffix.
+
+endsWith(suffix);
+
+} else {
+
+match = hostName.endsWith(cn.substring(1));
+}
+
+if(match && strictWithSubDomains) {
+
+I f we ’ r e i n s t r i c t mode ,
+
+/ /
+/ / a l l o w e d t o match [ a . b . f o o . com ]
+match = countDots(hostName) == countDots(cn);
+}
+
+t h e n [ ∗ . f o o . com ]
+
+i s n o t
+
+} else {
+
+match = hostName.equals(cn);
+
+}
+
+example, it will reject mail.<a>.<b>.com if the name in the
+certiﬁcate is m*.<a>.<b>.com.
+
+Furthermore, the original patch, as well as its derivatives, has
+a minor bug in the regular expression for parsing IPv4 addresses,
+causing it to accept IP addresses starting with zero (this does not
+immediately result in a security vulnerability):
+
+private static final Pattern IPV4_PATTERN =
+
+Pattern.compile("^(25[0-5]|2[0-4]\\d|[0-1]?\\d
+
+?\\d)(\\.(25[0-5]|2[0-4]\\d|[0-1]?\\d?\\d))
+{3}\$");
+
+7.6 Trillian
+
+Trillian, a popular instant messenger client, relies on OpenSSL
+for SSL connection establishment. By default, OpenSSL does not
+throw a run-time exception if the certiﬁcate is self-signed or has an
+invalid chain of trust. Instead, it sets ﬂags. Furthermore, OpenSSL
+does not provide any hostname veriﬁcation.
+
+If the application has called SSL_CTX_set to set the SSL_VERIFY
+_PEER ﬂag (see Section 4.1), then SSL_connect exits and prints an
+error message when certiﬁcate validation fails. Trillian does not set
+the SSL_VERIFY_PEER ﬂag. When this ﬂag is not set, SSL_connect
+returns 1. The application is then expected to check the status of
+certiﬁcate validation by calling SSL_get_verify_result. Trillian
+does not call this function.
+
+Trillian thus accepts any SSL certiﬁcate and is insecure against a
+man-in-the-middle attack. Depending on the speciﬁc module cho-
+sen by the Trillian user, this reveals usernames, passwords, secu-
+rity tokens, etc. for Google Talk (typically compromising all of the
+user’s Google services), AIM, ICQ, Windows Live (including Sky-
+Drive), and Yahoo! Messenger (and thus all Yahoo! services).
+
+Interestingly, it was reported back in 2009 that older versions of
+Trillian do not correctly validate MSN certiﬁcates [20]. This bug
+was ostensibly ﬁxed in Trillian 4.2. Our analysis shows, however,
+that SSL certiﬁcate validation is still completely broken for all ser-
+vices, not just for MSN (Windows Live), in Trillian 5.1.0.19.
+
+7.7 Rackspace
+
+The Rackspace app for iOS (version 2.1.5) is an open-source
+application for administering Rackspace cloud services. It uses the
+OpenStack iOS cloud client framework, which in turn relies on the
+ASIHTTPRequest library to set up HTTPS connections.
+
+ASIHTTPRequest provides a conﬁguration variable Validates
+SecureCertificate, set to 1 by default.
+If reset to 0, it turns
+off both chain-of-trust and hostname veriﬁcation. OpenStack sup-
+ports multiple accounts on remote servers and lets users customize
+SSL certiﬁcate validation on per-account basis using the ignoreSSL
+Validation variable. The value of this variable depends on the GUI
+switch validateSSLSwitch, which should be shown to the user.
+
+The Rackspace app (version 2.1.5) does not present the user with
+this option.9 The GUI switch validateSSLSwitch is thus never dis-
+played or explicitly assigned. Instead, it is simply initialized to 0 by
+the Objective-C allocator. This turns on ignoreSSLValidation in
+ASIHTTPRequest, which in turn sets ValidatesSecureCertificate
+to 0 and disables certiﬁcate validation.
+
+As a consequence, SSL connections established by the Rackspace
+
+app on iOS are insecure against a man-in-the-middle attack.
+
+7.8 TextSecure
+
+This code computes the length of the preﬁx by subtracting 2
+from the number of parts (determined by the number of dots in the
+name). This logic is incorrect: validity of the ﬁrst part of a domain
+name should have nothing to do with the total number of parts. For
+
+TextSecure is an Android application for encrypting SMS and
+It was written by Moxie Marlinspike who had
+
+MMS messages.
+
+9We are informed by Mike Mayo that this was an accidental over-
+sight and will be ﬁxed in subsequent releases of the app.
+
+45previously discovered several SSL certiﬁcate validation vulnerabil-
+ities [11, 12]. This following code can be found in the application
+(however, it does not appear to be reachable from the user interface
+and may not currently lead to an exploitable vulnerability):
+
+schemeRegistry.register(new Scheme("http",
+
+PlainSocketFactory.getSocketFactory(), 80));
+
+schemeRegistry.register(new Scheme("https",
+
+SSLSocketFactory.getSocketFactory(), 443));
+
+...
+HttpHost target = new HttpHost(hostUrl.getHost(),
+
+hostUrl.getPort(), HttpHost.DEFAULT_SCHEME_NAME);
+
+...
+HttpResponse response = client.execute(target, request);
+
+Even if the port number is 443, DEFAULT_SCHEME_NAME is “http”
+
+and the connection is over HTTP, not HTTPS.
+
+8. USING INSECURE MIDDLEWARE
+
+As explained in Section 5, software based on Web services usu-
+ally relies on middleware libraries to manage network connections.
+SSL functionality inside these libraries is opaque to the applica-
+tions. If the middleware employs a broken HTTPS implementation
+that does not correctly validate SSL certiﬁcates, all applications
+based on it typically “inherit” the vulnerability.
+
+8.1 Apache Axis, Axis 2, Codehaus XFire
+
+Apache Axis is an open-source Java implementation of SOAP.
+The latest release is 1.4, discontinued in 2007 in favor of Axis 2,
+but the library is still used, for example, in PayPal’s Java SDKs.
+Apache Axis 2 is a complete redesign of Apache Axis. The lat-
+est release is 1.6.2. Codehaus XFire is another open-source Java
+implementation of SOAP. It was discontinued in 2007 in favor of
+Apache CXF, but is still used, for example, in Amazon’s EC2 Java
+SDK. The latest release of XFire is 1.2.6.
+
+Apache Axis uses its own version of HttpClient, while Axis 2
+and XFire use Apache HttpClient version 3.1. Both versions of
+HttpClient rely on SSLSocketFactory for SSL connection estab-
+lishment but mistakenly omit hostname veriﬁcation (Section 4.2).
+SSL vulnerabilities caused by bugs in Web-services middleware
+are pervasive in Amazon libraries. Affected software includes Ama-
+zon EC2 API Tools Java library, which uses XFire to set up SSL
+connections to EC2 servers, and Amazon Flexible Payments Ser-
+vice (Java) merchant SDK, which relies on an old Apache Http-
+Client. The latter library is used by merchants to transmit cus-
+tomers’ payment details to the FPS gateway. The PHP version of
+the library is broken, too, but in a very different way (Section 7.1).
+In contrast to the PHP version, however, the Java utility for verify-
+ing instant payment notiﬁcations uses JSSE’s HttpsClient instead
+of Apache HttpClient and thus checks SSL certiﬁcates correctly.
+
+Other software that relies on Axis includes Java SOAP SDKs
+for PayPal Payments Pro (Direct Payment), PayPal Transac-
+tional Information, and PayPal Mass Pay, as well as Apache
+ActiveMQ implementation of JMS (Java Message Service).
+
+8.2 Pusher
+
+Pusher is a WebSocket-based API that provides real-time mes-
+saging functionality to mobile and Web applications. Pusher’s An-
+droid libraries10 are based on Weberknecht (see Section 4.2). Any
+application using these libraries (e.g., GitHub’s Gaug.es) is thus
+insecure. It is also worth noting that Gaug.es is using an updated
+version of Weberknecht, which, in addition to incorrectly using raw
+SSLSocketFactory (see Section 4.1), disables the trust manager.
+
+10https://github.com/EmoryM/Android_Pusher
+
+In summary, any software using any of the above Web-services
+
+frameworks is insecure against a man-in-the-middle attack.
+
+Apache CXF. Apache CXF is a continuation of XFire. It supports
+SOAP, along with REST and CORBA; the latest release is 2.6.1.
+It does not rely on Apache HttpClient. Instead, SSL connections
+are established using OpenJDK’s HttpsClient. Therefore, prop-
+erly conﬁgured instances of CXF do verify hostnames.
+
+Apache CXF provides an application-controlled option to turn
+off certiﬁcate validation. Certiﬁcate validation is enabled by de-
+fault, but was disabled in the sample wsdl_first_https code sup-
+plied with CXF until we notiﬁed the developers.
+
+9. USING INSECURE SSL LIBRARIES
+
+As described in Section 4.2, PHP’s fsockopen does not validate
+SSL certiﬁcates. Nevertheless, it is often used even by applications
+that must be secure against a man-in-the-middle attack. For exam-
+ple, PayPal’s IPN utility contains this code:
+
+/ / p o s t b a c k t o P ayP al u t i l i t y
+...
+$fp = fsockopen (’ssl://www.paypal.com’, 443, $errno,
+
+t o v a l i d a t e
+
+$errstr, 30);
+
+This code is replicated in PayPal payment modules for ZenCart
+and PrestaShop shopping carts. PrestaShop uses fsockopen in its
+CanadaPost payment module, too. Other similarly vulnerable soft-
+ware includes Open Source Classiﬁeds,
+
+Python’s URL libraries do not validate certiﬁcates (Section 4.2),
+yet developers still use them for SSL connections. Examples in-
+clude Tweepy, a library for accessing Twitter API that uses httplib,
+and Mozilla’s Zamboni project, which accepts contributions for
+extension developers and uses urllib2 to connect to PayPal.
+
+10. BREAKING OR DISABLING
+CERTIFICATE VALIDATION
+
+In general, disabling proper certiﬁcate validation appears to be
+the developers’ preferred solution to any problem with SSL libraries.
+Here are a few typical quotes from developers’ forums:
+
+• “I want my client to accept any certiﬁcate (because I’m only
+ever pointing to one server) but I keep getting a javax.net.
+ssl.SSLException: Not trusted server certificate ex-
+ception”11—[note the fallacious reasoning!]
+
+• “Tutorial: Disabling Certiﬁcate Validation in an HTTPS Con-
+nection. . . Reply: Thank you very much. You solved my
+biggest problem in the project.” 12
+
+• “I have always turned off CURLOPT_SSL_VERIFYPEER
+
+in curl.”13
+
+• “I am using axis on java to consume a webservice. The web
+service is in https, and I want to avoid the the check for cer-
+tiﬁcate.”14
+
+11http://stackoverflow.com/questions/2642777/
+trusting-all-certificates-using-httpclient-
+over-https
+12http://www.exampledepot.com/egs/javax.net.
+ssl/trustall.html
+13http://stackoverflow.com/questions/
+10102225/curl-ssl-certificates
+14http://stackoverflow.com/questions/9079298/
+axis-fake-certificate
+
+46• “However, by default, SSL support in NSStream is a little
+paranoid.
+It won’t, for example, use a self-signed certiﬁ-
+cate or an expired certiﬁcate to establish a secure connec-
+tion. NSStream does a number of validity checks when es-
+tablishing the secure connection, and if they don’t all pass,
+the streams appear to be valid, but no data gets sent or re-
+ceived. This is somewhat frustrating, and it could be there’s
+a way to ﬁnd out when the secure connection failed, but I
+haven’t been able to ﬁnd it in the documentation, or using
+Google. There is an error domain declared for these errors
+(NSStreamSocketSSLErrorDomain), but in my experimenta-
+tion, no errors gets generated, the streams even accept bytes
+for transfer, but nothing happens.” 15
+
+Unfortunately, these bad development practices ﬁnd their way
+even into critical software responsible for transmitting ﬁnancial in-
+formation and sensitive data, where security against man-in-the-
+middle attacks is absolutely essential and SSL certiﬁcate valida-
+tion should be mandatory. For example, a comment in the Autho-
+rize.Net eCheck module of ZenCart says that certiﬁcate validation
+is disabled for “compatibility for SSL communications on some
+Windows servers (IIS 5.0+)”—note the fallacious reasoning!
+
+10.1 Chase mobile banking
+
+Chase is a major US bank. SSL connections established by its
+mobile banking application on Android are insecure against a man-
+in-the-middle attack. This allows a network attacker to capture cre-
+dentials, such as username and password, of any Chase customer
+using this app, along with the rest of their session.
+
+Decompilation and analysis of this app’s code show that it over-
+rides the default X509TrustManager. The replacement code simply
+returns without checking the server’s certiﬁcate. The code below
+is the result of reverse-engineering, thus variable names and other
+details may differ from the actual code:
+
+public final void checkServerTrusted(X509Certificate[]
+paramArrayOfX509Certificate, String paramString)
+
+{
+
+if ((paramArrayOfX509Certificate != null) && (
+paramArrayOfX509Certificate.length == 1))
+
+paramArrayOfX509Certificate[0].checkValidity();
+
+while (true)
+{
+
+return;
+this.a.checkServerTrusted(
+
+paramArrayOfX509Certificate, paramString);
+
+}
+
+}
+
+Note the unreachable invocation of checkServerTrusted. We
+conjecture that this was a temporary plug during development that
+somehow found its way into the production version of the app.
+
+10.2 Apache Libcloud
+
+Apache Libcloud16 is a Python library extension providing sup-
+port for 26 different cloud service providers. Libcloud relies on
+the underlying Python library to verify the chain of trust in SSL
+certiﬁcates; internally, Python uses OpenSSL. Once the chain of
+trust is veriﬁed, Libcloud veriﬁes the hostname using the _verify
+_hostname method in httplib_ssl.py. This code uses an in-
+correct regular expression for hostname veriﬁcation. For example,
+it accepts oogle.com as a match for google.com, exposing all
+Libcloud clients to a man-in-the-middle attack:
+
+def _verify_hostname(self, hostname, cert):
+
+# V e r i f y h o s t n a m e a g a i n s t p e e r
+c e r t
+# C heck b o t h commonName and e n t r i e s
+# u s i n g a r u d i m e n t a r y g l o b t o d n s
+# t o f i n d m a t c h e s
+
+i n s u b j e c t A l t N a m e ,
+
+r e g e x c h e c k
+
+common_name = self._get_common_name(cert)
+alt_names = self._get_subject_alt_names(cert)
+
+# r e p l a c e ∗ w i t h a l p h a n u m e r i c and d a s h
+# r e p l a c e . w i t h l i t e r a l
+valid_patterns = [re.compile(pattern.replace(r".", r"
+
+.
+
+\.").replace(r"*", r"[0-9A-Za-z]+"))
+
+for pattern
+
+in (set(common_name) | set(alt_names))
+
+]
+
+return any(
+
+pattern.search(hostname)
+for pattern in valid_patterns
+
+)
+
+This bug has been ﬁxed in Libcloud version 0.11.1 after we no-
+
+tiﬁed the developers.
+
+10.3 Amazon Elastic Load Balancing API Tools
+
+This library overrides JDK’s default X509TrustManager to dis-
+able hostname veriﬁcation. Even if X509TrustManager had not been
+overriden, this library employs Codehaus XFire which does not
+perform hostname veriﬁcation (see Section 8.1).
+
+10.4 Shopping carts
+
+osCommerce, ZenCart, Ubercart, and PrestaShop are open-
+source shopping carts implemented in PHP. They use cURL for
+SSL connections to payment gateways. If cURL is not available,
+they typically fall back on (insecure) fsockopen.
+
+All carts are bundled with plugin modules for speciﬁc payment
+processors. Almost without exception, these modules turn off cer-
+tiﬁcate validation. In ZenCart, vulnerable modules include Link-
+Point, Authorize.Net, and PayPal Payments Pro, as well as PayPal
+IPN functionality (see Section 7.3). The insecure LinkPoint mod-
+ule contains an amusing comment at the beginning of the ﬁle: “###
+YOU REALLY DO NOT NEED TO EDIT THIS FILE! ###”
+
+Vulnerable modules include eBay, PayPal, and Canada Post in
+PrestaShop, PayPal, Authorize.Net, and CyberSource in Ubercart,
+Sage Pay Direct, Authorize.Net, MoneyBookers, and PayPal Ex-
+press, Pro, Pro PayFlow, and Pro PayFlow EC in osCommerce.
+
+SSL connections to payment gateways from merchants using any
+
+of these carts are insecure against a man-in-the-middle attack.
+
+The only exceptions are Google modules for PrestaShop and os-
+Commerce. The Google Checkout module for osCommerce comes
+from code.google.com and is not bundled with osCommerce.
+It sets CURLOPT_SSL_VERIFYPEER to true and leaves CURLOPT_SSL_
+VERIFYHOST to its correct default value, 2. By contrast, the ofﬁcial,
+PayPal-provided PayFlow module disables certiﬁcate validation.
+
+10.5 AdMob
+
+Google’s AdMob provides sample code to mobile site owners
+that they can use on their servers to associate instances of their
+mobile apps with their developer accounts (see Section 5). This
+code uses cURL to establish an SSL connection to AdMob’s server,
+but turns off certiﬁcate validation. A man-in-the-middle attacker
+can thus gain access to all of the developers’ Google services.
+
+10.6 Android apps
+
+15http://iphonedevelopment.blogspot.com/2010/
+05/nsstream-tcp-and-ssl.html
+16http://libcloud.apache.org/
+
+Groupon Redemptions, an Android app for merchants, disables
+certiﬁcate validation twice: by allowing any hostname via the “al-
+low all” hostname veriﬁer and by binding to an empty trust man-
+
+47ager. Similarly, Breezy, an app for secure document printing, dis-
+ables hostname veriﬁcation and overrides the default trust manager.
+ACRA, an Android library for posting application crash reports
+to a Google Doc, overrides the default trust manager. Any app
+using this library is insecure against a man-in-the-middle attack.
+
+10.7 AIM
+
+AIM client version 1.0.1.2 on Windows uses Microsoft’s Cryp-
+toAPI. Runtime analysis shows that it calls CryptoAPI’s certiﬁ-
+cate validation function CertVerifyCertificateChainPolicy. To
+disable certiﬁcate validation, it passes a CERT_CHAIN_POLICY_PARA
+variable with CERT_CHAIN_POLICY_ALLOW_UNKNOWN_CA_FLAG set, in-
+structing CryptoAPI to accept certiﬁcates signed by untrusted au-
+thorities. AIM does not perform any hostname veriﬁcation, either.
+
+10.8 FilesAnywhere
+
+FilesAnywhere is an application for managing cloud storage. It
+uses CryptoAPI for SSL connections and accepts both self-signed
+and third-party certiﬁcates.
+
+FilesAnywhere has an interesting peculiarity. If presented with
+a Google certiﬁcate when it attempts to connect to a non-Google
+server, it shows a warning message “The WebDav server has a new
+address. Please specify http://google.com in the proﬁle.” If pre-
+sented with any other third-party certiﬁcate, it silently accepts it
+and sends user’s data to a wrong, potentially malicious server.
+
+11. OUR RECOMMENDATIONS
+
+Whenever application developers must deal with SSL, the con-
+ventional advice is to use standard SSL libraries. This advice is
+correct, but insufﬁcient. As this paper shows, even developers of
+high-security software often use standard SSL libraries incorrectly.
+The following recommendations are informed by our analyses of
+broken SSL certiﬁcate validation in diverse applications.
+
+11.1 For application developers
+
+DO use fuzzing (black-box, if necessary) and adversarial test-
+ing to see how the application behaves when presented with abnor-
+mal SSL certiﬁcates. Even when the vulnerabilities are subtle, the
+symptoms usually are not. In many of our case studies, it is obvious
+that the software in question has never been tested with any certiﬁ-
+cates other than those of the intended server. When presented with
+a certiﬁcate issued to AllYourSSLAreBelongTo.us instead
+of the expected Amazon or PayPal or Chase certiﬁcate, these pro-
+grams eagerly establish SSL connections and spill out their secrets.
+These vulnerabilities should have manifested during testing.
+
+DON’T modify application code and disable certiﬁcate valida-
+tion for testing with self-signed and/or untrusted certiﬁcates. We
+found in our case studies that developers forget to reverse these
+modiﬁcations even for the production version of the software. In-
+stead, create a temporary keystore with the untrusted CA’s public
+key in it. While testing your code with self-signed or untrusted
+certiﬁcates, use that keystore as your trusted keystore.
+
+DON’T depend on the library’s defaults to set up the SSL con-
+nection securely. Default settings can and do change between dif-
+ferent libraries or even different versions of the same library—for
+example, cURL prior to version 7.10 did not validate certiﬁcates
+by default, but version 7.10 and later do. Always explicitly set the
+options necessary for secure connection establishment.
+
+11.2 For SSL library developers
+
+DO make SSL libraries more explicit about the semantics of their
+APIs. In many cases, it is obvious that application developers do
+not understand the meaning of various options and parameters. For
+
+example, the PHP libraries for Amazon Flexible Payments Services
+and PayPal Payments Standard attempt to enable hostname veriﬁ-
+cation in cURL, but instead accidentally override the correct default
+value and end up disabling it (Sections 7.1 and 7.2). This shows
+that even safe defaults may be insufﬁcient. Lynx attempts to check
+for self-signed certiﬁcates, but misinterprets the meaning of return
+values of GnuTLS’s certiﬁcate validation function and the check is
+never executed (Section 7.4). Formalizing the precise semantics of
+SSL library API and rigorously verifying the “contracts” between
+the application and the library is an interesting topic for future re-
+search and may call for programming language support.
+
+DON’T delegate the responsibility for managing SSL connec-
+tions to the applications. Existing SSL libraries expose many op-
+tions to higher-level software. This is fraught with peril. Appli-
+cation developers may not realize that they must explicitly choose
+certain options in order to enable certiﬁcate validation. Therefore,
+libraries should use safe defaults as much as possible. Furthermore,
+they should not silently skip important functionality such as host-
+name veriﬁcation as JSSE does when the algorithm ﬁeld is NULL
+or an empty string (see Section 4.1). Instead, they should raise a
+runtime exception or inform the application in some other way.
+
+DO design a clean and consistent error reporting interface. Li-
+braries such as OpenSSL and GnuTLS report some errors via re-
+turn values of functions, while other errors from the same function
+are reported through a ﬂag passed as an argument. Inconsistent in-
+terfaces confuse developers who then mistakenly omit some error
+checks in their applications.
+
+These recommendations provide short-term ﬁxes. A principled
+solution to the problem must involve a complete redesign of the
+SSL libraries’ API. Instead of asking application developers to man-
+age incomprehensible options such as CURLOPT_SSL_VERIFYPEER or
+SSL_get_verify_result, they should present high-level abstrac-
+tions that explicitly express security properties of network connec-
+tions in terms that are close to application semantics: for exam-
+ple, a “conﬁdential and authenticated tunnel.” The library should
+also be explicit about the security consequences of any application-
+controlled option: for example, instead of “verify hostname?”, it
+could ask “Anyone can impersonate the server. Ok or not?”
+
+12. RELATED WORK
+
+Independently of this work, Kevin McArthur announced multi-
+ple vulnerabilities caused by improper SSL certiﬁcate validation in
+PHP software. 17 Affected programs include, among others, os-
+Commerce, Ubercart, PrestaShop, and three PayPal SDKs.
+
+Moxie Marlinspike demonstrated several vulnerabilities in cer-
+tiﬁcate validation code in browsers and SSL libraries, including the
+lack of basic constraint checking (e.g., checking the CA bit) [11]
+and incorrect parsing of NULL characters in the “CommonName”
+ﬁeld [12]. By contrast, we focus on non-browser software that uses
+(mostly) correct SSL libraries incorrectly.
+
+Kaminsky et al. [10] showed that parsing differences between
+CA software and browser certiﬁcate validation code can result in a
+CA issuing a certiﬁcate that can be used for a man-in-the-middle
+attack. By contrast, we investigate certiﬁcate validation bugs in
+non-browser clients, not in CA software.
+
+Stevens et al. showed how an attacker can leverage MD5 hash
+collisions to get a CA to issue a specially crafted certiﬁcate that is
+valid for an ordinary host but whose hash collides with that of a
+certiﬁcate for a new, rogue intermediate CA [18]. By contrast, our
+attacks do not involve certiﬁcate forgery.
+
+17http://www.unrest.ca/peerjacking
+
+48Several certiﬁcate authorities such as Comodo [5] and DigiNo-
+tar [6] were recently compromised and used by attackers to issue
+fake certiﬁcates for popular websites. By contrast, our attacks do
+not involve CA compromise.
+
+To mitigate the risks of rogue certiﬁcates, Evans et al. proposed
+certiﬁcate pinning, i.e., pre-established bindings in the browser be-
+tween well-known websites and their certiﬁcates [8]. Certiﬁcate
+pinning is not supported by any of the software we analyzed.
+
+Several large-scale studies analyzed HTTPS deployment [7, 22]
+and found many errors in SSL certiﬁcates. One of the most com-
+mon errors is a mismatch between the server’s fully qualiﬁed do-
+main name and certiﬁcate’s identiﬁers. This misconﬁguration alone
+does not enable a man-in-the-middle attack.
+
+Chen et al. showed how a malicious proxy can exploit browser
+bugs for man-in-the-middle attacks on HTTPS [3]. By contrast, our
+attacks do not depend on browser bugs.
+
+Side-channel attacks can extract information from encrypted traf-
+ﬁc even when SSL is correctly deployed [4, 19]. By contrast, we
+found vulnerabilities that enable a man-in-the-middle attacker to
+decrypt SSL trafﬁc, obviating the need for side-channel analysis.
+Other side-channel attacks include a timing attack that extracts the
+private key from OpenSSL implementations [2].
+
+13. CONCLUSION
+
+The main lesson of this paper is that using SSL in non-browser
+software is a surprisingly challenging task. We demonstrated that
+even applications that rely on standard SSL libraries such as JSSE,
+OpenSSL, GnuTLS, etc. often perform SSL certiﬁcate validation
+incorrectly or not at all. These vulnerabilities are pervasive in crit-
+ical software, such as Amazon FPS and PayPal libraries for trans-
+mitting customers’ payment details from merchants to payment
+gateways; integrated shopping carts; Amazon EC2, Rackspace, and
+other clients for remote administration of cloud storage and virtual
+cloud infrastructure; Chase mobile banking on Android; and many
+other popular programs. Their SSL connections are completely in-
+secure against a man-in-the-middle attack.
+
+We also presented our recommendations for safer use of SSL in
+non-browser software. Future research directions include (1) de-
+velopment of better black-box testing and code analysis tools for
+discovering errors in SSL connection establishment logic, (2) de-
+sign of formal veriﬁcation techniques and programming language
+support for automatically checking whether applications use SSL
+libraries correctly and not misinterpret the meaning of critical op-
+tions and parameters, and (3) design of better APIs for SSL and
+other secure networking protocols.
+
+Acknowledgments. This research was partially supported by the
+NSF grants CNS-0331640, CNS-0746888, and CNS-0905602, two
+Google research awards, Samsung, and the MURI program under
+AFOSR Grant No. FA9550-08-1-0352. Boneh also thanks iSEC
+partners for helpful conversations about this work.
+
+We acknowledge Amazon, Apache, Chase, GitHub, Lynx, Pay-
+Pal, and Rackspace developers for recognizing and promising to
+repair the vulnerabilities after they were brought to their attention.
+We thank Colm O hEigeartaigh for explaining the intended behav-
+ior of certiﬁcate validation in Apache CXF.
+
+References
+
+[1] https should check CN of x509 cert. https://issues.
+
+apache.org/jira/browse/HTTPCLIENT-613.
+
+[2] D. Brumley and D. Boneh. Remote timing attacks are
+
+practical. In USENIX Security, 2003.
+
+[3] S. Chen, Z. Mao, Y.-M. Wang, and M. Zhang.
+
+Pretty-Bad-Proxy: An overlooked adversary in browsers’
+HTTPS deployments. In S&P, 2009.
+
+[4] S. Chen, R. Wang, X. Wang, and K. Zhang. Side-channel
+
+leaks in Web applications: A reality today, a challenge
+tomorrow. In S&P, 2010.
+
+[5] Comodo report of incident.
+
+http://www.comodo.com/Comodo-Fraud-
+Incident-2011-03-23.html, 2011.
+
+[6] Diginotar issues dodgy SSL certiﬁcates for Google services
+
+after break-in.
+http://www.theinquirer.net/inquirer/
+news/2105321/diginotar-issues-dodgy-ssl-
+certificates-google-services-break, 2011.
+
+[7] P. Eckersley and J. Burns. An observatory for the SSLiverse.
+
+In DEFCON, 2010.
+
+[8] C. Evans and C. Palmer. Certiﬁcate pinning extension for
+HSTS. http://www.ietf.org/mail-archive/
+web/websec/current/pdfnSTRd9kYcY.pdf, 2011.
+
+[9] Fiddler - Web debugging proxy.
+
+http://fiddler2.com/fiddler2/.
+
+[10] D. Kaminsky, M. Patterson, and L. Sassaman. PKI layer
+
+cake: new collision attacks against the global X.509
+infrastructure. In FC, 2010.
+
+[11] Moxie Marlinspike. IE SSL vulnerability. http:
+
+//www.thoughtcrime.org/ie-ssl-chain.txt,
+2002.
+
+[12] Moxie Marlinspike. Null preﬁx attacks against SSL/TLS
+
+certiﬁcates.
+http://www.thoughtcrime.org/papers/null-
+prefix-attacks.pdf, 2009.
+
+[13] Internet X.509 public key infrastructure certiﬁcate policy and
+
+certiﬁcation practices framework.
+http://www.ietf.org/rfc/rfc2527.txt, 1999.
+
+[14] HTTP over TLS.
+
+http://www.ietf.org/rfc/rfc2818.txt, 2000.
+
+[15] Internet X.509 public key infrastructure certiﬁcate and
+
+certiﬁcate revocation list (CRL) proﬁle.
+http://tools.ietf.org/html/rfc5280, 2008.
+
+[16] The Secure Sockets Layer (SSL) protocol version 3.0.
+
+http://tools.ietf.org/html/rfc6101, 2011.
+
+[17] Representation and veriﬁcation of domain-based application
+
+service identity within Internet public key infrastructure
+using X.509 (PKIX) certiﬁcates in the context of Transport
+Layer Security (TLS).
+http://tools.ietf.org/html/rfc6125, 2011.
+
+[18] M. Stevens, A. Sotirov, J. Appelbaum, A. Lenstra,
+
+D. Molnar, D. Osvik, and B. Weger. Short chosen-preﬁx
+collisions for MD5 and the creation of a rogue CA
+certiﬁcate. In CRYPTO, 2009.
+
+[19] Q. Sun, D. Simon, Y.-M. Wang, W. Russell,
+
+V. Padmanabhan, and L. Qiu. Statistical identiﬁcation of
+encrypted Web browsing trafﬁc. In S&P, 2002.
+
+[20] CVE-2009-4831. http://cve.mitre.org/cgi-
+
+bin/cvename.cgi?name=CVE-2009-4831, 2009.
+
+[21] J. Viega and M. Messier. Secure Programming Cookbook for
+
+C and C++. O’Reilly Media, 2007.
+
+[22] N. Vratonjic, J. Freudiger, V. Bindschaedler, and J.-P.
+
+Hubaux. The inconvenient truth about Web certiﬁcates. In
+WEIS, 2011.
+
+[23] R. Wang, S. Chen, X. Wang, and S. Qadeer. How to shop for
+
+free online – Security analysis of cashier-as-a-service based
+Web stores. In S&P, 2011.
+
+49

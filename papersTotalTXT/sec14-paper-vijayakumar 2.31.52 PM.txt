@@ -1,0 +1,2481 @@
+Jigsaw: Protecting Resource Access by Inferring 
+
+Programmer Expectations
+
+Hayawardh Vijayakumar and Xinyang Ge, The Pennsylvania State University; Mathias Payer, 
+
+University of California, Berkeley; Trent Jaeger, The Pennsylvania State University
+https://www.usenix.org/conference/usenixsecurity14/technical-sessions/presentation/vijaykumar
+
+This paper is included in the Proceedings of the 23rd USENIX Security Symposium.August 20–22, 2014 • San Diego, CAISBN 978-1-931971-15-7Open access to the Proceedings of  the 23rd USENIX Security Symposium is sponsored by USENIXJIGSAW : Protecting Resource Access by Inferring
+
+Programmer Expectations
+
+Hayawardh Vijayakumar1, Xinyang Ge1, Mathias Payer2, and Trent Jaeger1
+
+1SIIS Laboratory, Department of CSE
+
+The Pennsylvania State University
+
+{hvijay,xxg113,tjaeger}@cse.psu.edu
+
+2EECS Department
+
+University of California Berkeley
+mathias.payer@nebelwelt.net
+
+Abstract
+
+Processes retrieve a variety of resources, such as ﬁles,
+from the operating system to function. However, se-
+curely accessing resources has proven to be a challenging
+task, accounting for 10-15% of vulnerabilities reported
+each year. Current defenses address only a subset of
+these vulnerabilities in ad-hoc and incomplete ways. In
+this paper, we provide a comprehensive defense against
+vulnerabilities during resource access. First, we iden-
+tify a fundamental reason that resource access vulnera-
+bilities exist – a mismatch between programmer expec-
+tations and the actual environment the program runs in.
+To address such mismatches, we propose JIGSAW, a sys-
+tem that can automatically derive programmer expecta-
+tions and enforce it on the deployment. JIGSAW con-
+structs programmer expectations as a name ﬂow graph,
+which represents the data ﬂows from the inputs used to
+construct ﬁle pathnames to the retrieval of system re-
+sources using those pathnames. We ﬁnd that whether
+a program makes any attempt to ﬁlter such ﬂows im-
+plies expectations about the threats the programmer ex-
+pects during resource retrieval, the enabling JIGSAW to
+enforce those expectations. We evaluated JIGSAW on
+widely-used programs and found that programmers have
+many implicit expectations. These mismatches led us to
+discover two previously-unknown vulnerabilities and a
+default misconﬁguration in the Apache webserver. JIG-
+SAW enforces program expectations for approximately
+5% overhead for Apache webservers, thus eliminating
+vulnerabilities due to resource access efﬁciently and in
+a principled manner.
+
+Introduction
+
+1
+Processes retrieve a variety of resources from the oper-
+ating system to function. A resource is any abstraction
+that the system call API of an operating system (OS) of-
+fers to a process (apart from a process itself). Examples
+of resources are ﬁles (conﬁguration, data, or log ﬁles),
+
+network ports, or interprocess communication channels
+(IPCs) such as sockets and shared memory. Such OS
+abstractions free the programmer from having to know
+details of the underlying hardware and allow her to write
+portable code. Conceptually, resource access is a pro-
+cedure that takes as input the name (e.g., ﬁlename) and
+namespace bindings (e.g., directories or symbolic links),
+and returns the resource (e.g., ﬁle) as output to the pro-
+cess.
+
+Securely accessing resources has proven to be a chal-
+lenging task because of adversarial control of the inputs
+to resource access. Adversaries may control the input
+name or a binding to direct victim processes to unsafe re-
+sources. In the well-known time-of-check to time-of-use
+(TOCTTOU) attack [6], an adversary exploits the non-
+atomicity between check operations (e.g., access) and
+use operations (e.g., open) to redirect the victim to re-
+sources of the adversary’s choosing. Other attacks are
+link following, untrusted search paths, Trojan-horse li-
+brary loads, and directory traversal. These attacks are
+collectively referred to as resource access attacks [40].
+10-15% of the vulnerabilities reported each year in the
+CVE database [12] are due to programs not defending
+themselves against these attacks.
+
+Current defenses against such vulnerabilities in con-
+ventional OSes are ad-hoc and fundamentally limited.
+First, traditional access control is too coarse-grained to
+prevent resource access vulnerabilities. A process may
+have legitimate access to both low-integrity adversar-
+ial ﬁles and high-integrity library ﬁles; however, the re-
+source access to load libraries should not access adver-
+sary ﬁles (and vice versa). Traditional access control
+does not differentiate between these resource accesses,
+and thus cannot protect programs. Second, defenses in
+the research literature require either system or program
+modiﬁcations. System defenses have been mainly lim-
+ited to TOCTTOU [11, 13, 25–27, 35–38, 44] and link
+following [10], or require programs to be written to new
+APIs [19,29,34,42]. However, system defenses are fund-
+
+USENIX Association  
+
+23rd USENIX Security Symposium  973
+
+mentally limited because they do not have sufﬁcient in-
+formation about programs [8], and new APIs do not pro-
+tect existing programs.
+
+This paper presents an approach to automatically pro-
+tect programs that use the current system call API from
+resource access vulnerabilities. We make the follow-
+ing observations: ﬁrst, we ﬁnd that a fundamental cause
+for resource access vulnerabilities is programmer ex-
+pectations not being satisﬁed during the program’s sys-
+tem deployment. For example, during a particular re-
+source access, a programmer might expect to fetch a re-
+source that is inaccessible to an adversary (e.g., a log ﬁle
+in /var/log) and thus not add defensive code checks,
+called ﬁlters, to protect against adversarial control of
+names and bindings. However, this expectation may not
+be consistent with the view of the OS distributors (e.g.,
+Red Hat, Ubuntu) who actually frame the access con-
+trol policy. Thus, if permissions to /var/log allow ad-
+versary access (e.g., through a world-writable directory),
+adversaries can compromise the victim program. Our
+second insight is that we can automatically infer if the
+programmer expected adversarial control at a particular
+resource access or not, without requiring any annotations
+or changes to the program. We do this by detecting the
+presence of name and binding ﬁlters that programmers
+place in the program.
+
+In this paper, we develop JIGSAW, the ﬁrst system
+to provide automated protection for programs during re-
+source access without requiring additional programmer
+effort. JIGSAW infers programmer expectations and en-
+forces these on the deployment1. JIGSAW is based on
+two conceptually simple invariants – that the system de-
+ployment’s attack surface be a subset of the program-
+mer’s expected attack surface, and that resource accesses
+not result in confused deputy attacks [16]. These in-
+variants, if correctly evaluated and enforced, can theo-
+retically provide complete program protection during re-
+source access. JIGSAW operates in two phases. In the
+ﬁrst phase, it mines programmer expectations by detect-
+ing the presence of ﬁlters in program code. Using these
+ﬁlters, JIGSAW constructs a novel representation, called
+the name ﬂow graph, from which the programmer’s ex-
+pected attack surface is derived. We show that anoma-
+lous cases in the name ﬂow graph can be used to detect
+vulnerabilities to resource access attacks. In the second
+phase, JIGSAW enforces the invariants by leveraging the
+open-source Process Firewall of Vijayakumar et al. [40],
+a Linux kernel module that (i) knows about deployment
+attack surface using the system’s adversary accessibil-
+ity, and (ii) introspects into the program to identify the
+resource access and to enforce its expectations as deter-
+mined in the ﬁrst phase.
+
+1Informally, JIGSAW enables “ﬁtting” the programmer’s expecta-
+
+tions on to its deployment.
+
+We evaluate our technique by hardening widely-used
+programs against resource access attacks. Our results
+show that in general, programmers have many implicit
+expectations during resource access. For example, in the
+Apache web server, we found 65% of all resource ac-
+cesses are implicitly expected not to be under adversary
+control. However, this is not conveyed to OS distribu-
+tors in any form, and may result in vulnerabilities. JIG-
+SAW can be use to detect such vulnerabilities, and we
+did ﬁnd two previously-unknown vulnerabilities and a
+default misconﬁguration. However, the key feature of
+JIGSAW is that it protects program vulnerabilities during
+resource access whenever there is a discrepancy between
+the programmers’ inferred expectations and the system
+conﬁguration, without the need to modify the program
+or the system’s access control policies. We also ﬁnd that
+the Process Firewall can enforce such protection to block
+resource access vulnerabilities whilst allowing legitimate
+functionality for a modest performance overhead of ap-
+proximately 5%. An automated analysis as presented in
+this paper can thus enforce efﬁcient protection for pro-
+grams during resource access at runtime.
+
+In summary, we make the following contributions.
+• We precisely deﬁne resource access vulnerabilities
+and show how they occur due to a mismatch in ex-
+pectations between the programmer, the OS distrib-
+utor, and the administrator,
+
+• We propose two invariants that, if evaluated and en-
+forced correctly, can theoretically provide complete
+program protection during resource access,
+
+• We develop JIGSAW, an automated approach that
+uses the invariants to protect programs during re-
+source access by inferring programmer expectation
+using the novel abstraction of a name ﬂow graph,
+and
+
+• We evaluate our approach on widely-used pro-
+grams, showing how programmers have many im-
+plicit expectations, as demonstrated by our discov-
+ery of two previously-unknown vulnerabilities and
+a default misconﬁguration in our deployment of the
+Apache web server. Further, we show that we can
+produce rules to enforce these implicit assumptions
+efﬁciently using the Process Firewall on any pro-
+gram deployment.
+
+2 Problem deﬁnition
+In this section, we ﬁrst give a precise deﬁnition of when
+a resource access is vulnerable. This deﬁnition classiﬁes
+vulnerabilities into two broad categories. We then iden-
+tify the fundamental cause for each of these vulnerability
+categories – mismatch between programmer expectation
+and system deployment, and difﬁculty in writing proper
+defensive code.
+
+974  23rd USENIX Security Symposium 
+
+USENIX Association
+
+01
+02
+03
+04
+05
+06
+07
+08
+09
+10
+11
+12
+
+conf = open("httpd.conf");
+log_file = read(conf);
+socket = bind(port 80);
+open(log_file, O_CREAT);
+loop {
+
+html_page = recv(socket);
+strip(html_page, "../");
+stat(html_page not symlink);
+open(html_page, O_RDONLY);
+write(client_socket, "200 OK");
+log("200 OK to client")
+
+}
+
+// File Squat
+
+// Directory Traversal
+// TOCTTOU Race
+// TOCTTOU Race, Symlink
+
+Figure 1: Motivating example of resource access vulnerabilities
+using a typical processing cycle of a web server.
+2.1 Resource Access Attacks
+A resource access occurs when a program uses a name
+to resolve a resource using namespace bindings. That is,
+the inputs to the resource access are the name and the
+bindings, and the output is the ﬁnal resource. Figure 1
+shows example webserver code that we use throughout
+the paper: the webserver starts up and accesses its conﬁg-
+uration ﬁle (line 2), from which it gets the location of its
+log ﬁle. It then binds a socket on port 80 (line 3), opens
+the log ﬁle (line 4), and waits for client requests. When
+a client connects, it receives the HTTP request (line 6),
+uses this name to fetch the HTML ﬁle (line 9). Finally, it
+writes the status code to its log ﬁle (line 11).
+
+Let us examine some possible resource access vul-
+nerabilities. Consider line 6. Here, the program re-
+ceives a HTTP request from the client, and serves the
+page to the client. The client can supply a name such
+as ../../etc/passwd, and if the server does not prop-
+erly sanitize the name (which it attempts to do in line 7),
+the client is served the password ﬁle on the server. This
+is a directory traversal vulnerability. Next, consider the
+check the server makes in line 8. Here, the server checks
+that the HTML ﬁle is not a symbolic link. The reason
+for this is that in many deployments (e.g., a university
+web server serving student web pages), the web page is
+controlled by an adversary (i.e., student). The server at-
+tempts to prevent a symbolic link vulnerability, where a
+student links her web page to the password ﬁle. How-
+ever, a race condition between the check in line 8 and
+the use in line 9, leads to a link following vulnerability
+exploiting a TOCTTOU race condition.
+
+To see how such vulnerabilities can be broadly clas-
+siﬁed, we introduce adversary accessibility to resources
+and adversarial control of resource access. We then de-
+ﬁne when resource accesses are vulnerable, and use this
+to derive a classiﬁcation for vulnerabilities.
+
+Adversary accessible resources. An adversary-
+accessible resource is one that an adversary has permis-
+sions to access (read for secrecy attacks, write for in-
+tegrity attacks) under the system’s access control policy.
+The complement set is the set of adversary-inaccessible
+resources.
+
+Expected/Safe Resource Malicious/Unsafe Resource Vulnerability Class
+Adversary-Inaccessible
+(Hi) Resource
+
+Adversary-Accessible
+(Lo) Resource
+
+Adversary-Accessible
+(Lo) Resource
+
+Adversary-Inaccessible
+(Hi) Resource
+
+Unexpected Attack Surface
+Untrusted Search Path
+File/IPC Squat
+PHP File Inclusion
+Confused Deputy
+Link Following
+Directory Traversal
+TOCTTOU races
+
+Table 1: Adversaries control resource access to direct victims
+to adversary-accessible resources when the victim expected an
+adversary inaccessible resource and vice-versa.
+
+Adversary control of resource access. An adversary
+controls the resource access by controlling its inputs (the
+name or a binding). An adversary controls a binding if
+she uses her write permissions in a directory to create a
+binding [39]. An adversary controls a name if there is an
+explicit data ﬂow2 from an adversary-accessible resource
+to the name used in resource access. The adversary needs
+write permissions to these resources to control names.
+
+The directory traversal vulnerability above relies on
+the adversary’s ability to control the name used in re-
+source access. The link following vulnerability relies on
+the adversary’s ability to control the binding (creating a
+symbolic link).
+
+Resource Access Vulnerability. A resource access
+is vulnerable, i.e., a resource access attack is success-
+ful, when an adversary uses her control of inputs to re-
+source access (the name or a binding) to direct a vic-
+tim to an adversary-accessible output resource when the
+victim expected an adversary-inaccessible resource (and
+vice versa).
+
+On the one hand, the adversary can use control to
+direct the victim to an adversary-inaccessible resource
+when the program expects an adversary-accessible re-
+source. The directory traversal and link following vul-
+nerabilities of the classical confused deputy [16] (Row
+2 in Table 1). On the other hand, the adversary can di-
+rect the victim to an adversary-accessible resource when
+the program expects an adversary-inaccessible resource.
+Trojan-horse libraries is an example vulnerability of this
+type. We call these unexpected attack surface vulnera-
+bilities (Row 1 in Table 1), as they occur because the
+programmer is not expecting adversary control at these
+resource accesses. Table 1 classiﬁes all resource access
+vulnerabilities into these two types.
+2.2 Causes for Resource Access Vulnera-
+
+bilities
+
+We identify two causes for resource access vulnerabili-
+ties – one for each category in Table 1. The ﬁrst cause is
+a mismatch in expectations of adversary control of names
+and bindings between the program and the deployment.
+
+2Attacks involving names require the adversary to inject sequences
+of ../ or unicode characters. Thus, explicit data ﬂow is necessary; just
+implicit data ﬂow is insufﬁcient.
+
+USENIX Association  
+
+23rd USENIX Security Symposium  975
+
+Consider Figure 2 that describes resource accesses from
+the web server example in Figure 1. Here, the program-
+mer expects the resource access of the HTML ﬁle to be
+under adversary control, and to combat this, adds a name
+ﬁlter 3 from the TCP socket (stripping ../) as well as
+a binding ﬁlter (check for a link). The programmer did
+not expect the log ﬁle’s resource access to be adversary-
+controlled, and therefore did not add any ﬁlters. How-
+ever, due to a misconﬁguration, this programmer expec-
+tation is not satisﬁed in the deployment conﬁguration,
+causing a resource access vulnerability.
+
+In general, resource access vulnerabilities are very
+challenging to eliminate because they involve multiple
+disconnected parties. First, programmers write code as-
+suming that a certain subset of resource accesses are un-
+der adversarial control. Resource access checks cause
+overhead, so the programmer generally tries to minimize
+the number of checks, thereby motivating fewer ﬁlters.
+Second, there are OS distributors who deﬁne access con-
+trol policies, thereby determining adversarial control of
+resource accesses. However, these OS distributors have
+little or no information about the assumptions the pro-
+grammer has made about adversarial control, resulting
+in a set of possible mismatches. Finally, there are ad-
+ministrators who deploy the program on a concrete sys-
+tem. The conﬁguration speciﬁes the location of various
+resources such as log ﬁles. Thus, the administrator’s con-
+ﬁguration too may not match the programmer’s expecta-
+tion.
+
+The second cause for resource access vulnerabilities is
+where the programmer does expect adversary-controlled
+resource access, but the ﬁlter may be insufﬁcient to pro-
+tect the program. Note that when a program encounters
+an adversary-controlled resource access, the only valid
+resource is an adversary-accessible resource; otherwise,
+the program is victim to a confused deputy vulnerabil-
+ity. Thus, the program needs to defend itself by ﬁltering
+improper requests leading to a confused deputy. How-
+ever, both name and binding ﬁlters are difﬁcult to get
+right due to difﬁculty in string parsing [4] and inherent
+race conditions in the system call API [8] (e.g., lines 8, 9
+in Figure 1).
+
+In summary, the two causes of resource access vul-
+nerabilities are:
+(a) unexpected adversarial control of
+resource access, and (b) improper ﬁltering of resource
+access when adversary control of resource access is ex-
+pected. These causes correspond to Rows 1 and 2 in Ta-
+ble 1 respectively. With these two causes in mind, we
+proceed to a model that precisely describes our solution.
+
+Webserver
+P
+
+ 
+
+Filtered Name
+
+Read 
+user 
+HTML 
+pages
+
+ra3
+
+Partially
+Filtered
+
+HTML File
+
+  Adversary
+
+Read
+Conﬁg
+File
+
+ra1
+
+Log 
+File
+
+ra2
+
+Conﬁg File
+
+S
+
+Log 
+File
+
+Controlled 
+Binding
+
+HTTP
+Socket
+
+ra4
+
+TCP
+Socket 
+
+Data
+
+(Name for 
+HTML page)
+
+Figure 2: Demonstrating a mismatch between the expected and
+deployed attack surfaces.
+3 Model and Solution Overview
+In this section, we provide two invariants that directly
+address the two causes for resource access vulnerabilities
+outlined above.
+
+Consider the set of all resource accesses RA made by a
+program4. A resource access happens when a system call
+resolves a resource using a name and namespace bind-
+ings. The program has code to ﬁlter the names and bind-
+ings used during certain resource accesses (e.g., ra3 in
+Figure 2). From this knowledge, we show in Section 5
+how to derive P, the set of resource accesses that a pro-
+grammer expects to be under adversarial control. This
+set P is the expected resource access attack surface, or
+simply, the expected attack surface.
+
+Now, assume that the program is deployed and run on
+a system. A subset of the resource accesses made by the
+program is adversary-controlled in the deployment. Let
+Y be the deployment’s access control policy. Let S be
+the set of resource accesses that are adversary-controlled
+under Y (ra2 in Figure 2). This set S deﬁnes the deploy-
+ment resource access attack surface, or simply, the de-
+ployment attack surface.
+
+Given Y , the expected attack surface P is safe for the
+deployment S if S ⊆ P, i.e., if all resource accesses in
+the deployment attack surface are part of the program’s
+expected attack surface. Intuitively, this means that the
+program has ﬁlters to protect itself whenever a resource
+access is adversary-controlled. If r is the resource access
+under consideration, then, the invariant stated in propo-
+sitional logic blocking unexpected adversary is:
+
+Invariant: Unexpected Adversary Control(r) :
+(r ∈ S) → (r ∈ P)
+
+(1)
+
+If this safety invariant is enforced, resource access vul-
+
+3A ﬁlter is a check in code that allows only a subset of names, bind-
+
+ings and resources through.
+
+4The representation used to identify a resource access
+
+is
+In our implementation, we use program
+
+implementation-dependent.
+stacks at the time of the resource access system call.
+
+976  23rd USENIX Security Symposium 
+
+USENIX Association
+
+nerabilities are eliminated where programs do not expect
+adversary control. Therefore, vulnerabilities are only
+possible where programs expect adversary control.
+
+Now that we are dealing with an adversary-controlled
+resource access (∈ S) that is also expected (∈ P), the
+only valid resource is an adversary-accessible resource;
+otherwise, the program would be victim to a confused
+deputy attack. We say that resource accesses in P are
+protected from a confused deputy vulnerability if, when
+the resource access is adversary-controlled (i.e., ∈ S), it
+does not accept adversary-inaccessible resources. Let R
+be the set of resource accesses that retrieve adversary-
+accessible resources (as deﬁned under Y ). Then, a re-
+source access r is protected from confused deputy vul-
+nerabilities if the following invariant stated in proposi-
+tion logic holds:
+
+Invariant: Confused Deputy(r) :
+(r ∈ S) → (r ∈ R)
+
+(2)
+
+Once these two rules are enforced,
+
+the only re-
+sources that are allowed are adversary-accessible re-
+sources where programs expect adversary control. Prob-
+lems occur if the program does not properly handle this
+adversary-accessible resource. For example, if it does
+not ﬁlter data read from this resource properly, memory
+corruption vulnerabilities might result. Such vulnerabil-
+ities that occur in spite of fetching the expected resource
+are not within the scope of this work.
+
+Let us examine how the rules above stop the vul-
+nerability classes in Table 1. Consider vulnerability in
+Row 2, where the victim expects an adversary inacces-
+sible resource (high integrity or secrecy), but ends up
+with an adversary-accessible (low integrity or secrecy)
+resource. The typical case is an untrusted search path
+where the program expects to load a high-integrity li-
+brary, but searches for libraries in insecure paths due
+to programmer oversight or insecure environment vari-
+ables, and ends up with a Trojan horse low-integrity li-
+brary. Here, since the programmer does not expect a
+low-integrity library, she does not place a binding (or
+name) ﬁlter. Thus, we will infer that this resource ac-
+cess is not part of the expected attack surface ((cid:29)∈ P), and
+Invariant 1 above will stop the vulnerability if this re-
+source access is controlled in any way (binding or name)
+by an adversary (∈ S). The other vulnerability classes
+in this category are blocked similarly. Next, consider
+vulnerabilities in Row 1. Here, the victim expects an
+adversary-accessible resource (low integrity or secrecy),
+but ends up with an adversary inaccessible resource (high
+integrity or secrecy). In a link following vulnerability,
+the adversary creates a symbolic link to a high-secrecy
+or high-integrity ﬁle, such as the password ﬁle. Thus, the
+adversary uses her control of bindings (∈ S) to direct the
+victim to an adversary-inaccessible resource ((cid:29)∈ R). In a
+
+PHASE 1: 
+
+FIND EXPECTED ATTACK SURFACE
+
+PHASE 2: 
+
+RUNTIME ENFORCEMENT
+
+Program
+
+Execute
+
+Deployment
+Access Control 
+Y
+
+Policy
+
+Detect 
+Binding
+Filters
+Vu, Vf
+
+1
+
+Detect 
+Name
+Filters
+Eu, Ef
+
+Calculate program's 
+
+expected attack 
+
+surface 
+
+2
+
+P
+
+Process
+
+e
+s
+n
+o
+p
+s
+e
+R
+
+Allow/
+Deny
+Enforce
+Invariants
+
+4 R
+
+e
+q
+u
+e
+s
+t
+
+accessibility to 
+
+Calculate 
+adversary 
+bindings, 
+resources
+
+3
+
+S, R
+
+Figure 3: Overview of the design of our system.
+
+directory traversal vulnerability, the adversary uses her
+control of the name to supply sequences of ../ to di-
+rect the victim to a high-secrecy or high-integrity ﬁle. In
+both cases, Invariant 2 will block the vulnerability since
+the adversary controls the resource access (∈ S) through
+the name or binding, but the resource is adversary inac-
+cessible ((cid:29)∈ R).
+
+JIGSAW Approach Overview
+
+4
+Figure 3 shows an outline of the design of JIGSAW. JIG-
+SAW has two phases. In the ﬁrst phase, JIGSAW calcu-
+lates P, the expected attack surface. Finding P requires
+inferring programmer expectations. To infer program-
+mer expectations, we propose an intuitive heuristic – if
+the programmer expects adversary control at a resource
+access, she will place ﬁlters in code to handle such con-
+trol. Given the program, we perform a black-box analy-
+sis to detect the existence of any binding and name ﬁlter-
+ing separately (Step 1 in Figure 3), and use this informa-
+tion to calculate the program’s expected attack surface
+(Step 2).
+
+In the second phase, JIGSAW enforces Invariants 1
+and 2 above by determining S, the deployment attack sur-
+face, and R, the set of adversary-accessible resources.
+The deployment’s access control policy Y determines
+which resources and bindings are adversary-accessible.
+We leverage existing techniques to calculate adversary
+accessibility given Y [10, 17, 41] (Step 3). At runtime,
+if an adversary-accessible resource is used, that resource
+access is in R. If the name is read from an adversary-
+accessible resource or the binding used in resolving that
+name is adversary accessible, then that resource access
+is in S. Finally, we need to enforce Invariants 1 and 2
+for individual resource accesses (Step 4). Any enforce-
+ment mechanism that applies distinct access control rules
+per individual resource access system call would be suit-
+able. In our prototype implementation we leverage the
+open-source Process Firewall [40] which enables us to
+support binary-only programs (i.e., our prototype imple-
+mentation does not rely on source code access).
+
+USENIX Association  
+
+23rd USENIX Security Symposium  977
+
+5 Phase 1: Find Expected Attack Surfaces
+
+The ﬁrst step is to determine the expected attack surface
+P for a program. We do this in two parts. First, we pro-
+pose a heuristic that implies the expectations of program-
+mers with respect to the adversary control of the inputs to
+resource access and introduce the abstraction of a name
+ﬂow graph to model these expectations and enable the
+detection of missing ﬁlters (Sections 5.1 to 5.3). Next,
+we outline how one can use dynamic analysis methods
+to build name ﬂow graphs by accounting for adversary
+control of names and bindings (Sections 5.4 and 5.5).
+
+5.1 Resource Access Expectations
+Determining P requires knowledge of the programmers’
+expectations – whether the programmers expected the re-
+source access to be under adversary control or not. The
+most precise solution to this problem is to ask each pro-
+grammer to specify her expectation. Unfortunately, such
+annotations do not exist currently. As an alternative, we
+use the presence of code ﬁlters to infer programmer ex-
+pectation. We use the following heuristic:
+
+Heuristic. If a programmer expects adversarial con-
+trol of a resource access, she will add code ﬁlters to pro-
+tect the program from adversarial control.
+
+Thus, the way we infer if a programmer expects an
+adversary-controlled resource access is by detecting if
+she adds any code to ﬁlter such adversarial control. An
+adversary controls a resource access by controlling either
+the name or a binding used in the resource access. Thus,
+we need to detect whether a program ﬁlters names and
+bindings separately.
+
+Before presenting exactly how we detect ﬁltering, we
+will introduce the concept of a name ﬂow graph for a
+program, which we will use to derive the expected attack
+surface P given knowledge of ﬁltered resource accesses.
+
+5.2 Name Flow Graph
+We introduce the abstraction of a name ﬂow graph, which
+represents the data ﬂow of name values among resource
+accesses in the program annotated with the knowledge
+of whether names and/or bindings are ﬁltered each in-
+dividual resource access. Using this name ﬂow graph,
+we will show that we can compute resources accesses
+that are missing ﬁlters automatically. A name ﬂow graph
+Gn = (V,E) is a graph where the resource accesses are
+nodes and each edge (a,b) ∈ E represents whether there
+exists a data ﬂow in the program between the data of any
+of the resources retrieved at the access at node a and any
+of the name variables used in an access at node b. We
+refer to these edges as name ﬂows.
+
+Further, V = Vf ∪Vu where Vf is the set of resource ac-
+cesses that ﬁlter bindings and Vu the set of vertices that do
+not. Similarly, E = E f ∪ Eu, where E f is the set of name
+ﬂows that are ﬁltered, and Eu the set that is not. That is,
+a name ﬂow graph is a data-ﬂow graph that captures the
+ﬂow of names and is annotated with information about
+ﬁlters. The meaning of ﬁltering for names and bindings
+is described in Sections 5.4 and 5.5, respectively.
+
+Name Flow Graph
+
+Line 3
+Network
+Socket
+
+Line 1
+Conﬁg
+File
+
+Line 9
+HTML 
+ﬁle
+
+ELF 
+binary 
+loader 
+
+Line 4
+Log
+File
+
+Figure 4: Name ﬂow graph for the example in Figure 1.
+
+The name ﬂow graph for our web server in Figure 1
+is shown in Figure 4.
+Its nodes are resource accesses
+and edges connect two resource accesses if the data read
+at the source resource access may affect the name used
+at the target resource access. The bold nodes are those
+that ﬁlter bindings, whereas the bold edges are those that
+ﬁlter names.
+
+The name ﬂow graph determines P, the expected at-
+tack surface. According to our heuristic in Section 5, a
+resource access is part of the expected attack surface if
+a programmer places both name and binding ﬁlters on
+the resource access to handle adversarial control. How-
+ever, not all name ﬂows need be ﬁltered – only name
+ﬂows originating from other resource accesses also un-
+der adversarial control must be. Since this deﬁnition is
+transitive, we need to start with some initial information
+about resource accesses that are part of the expected at-
+tack surface, which we do not have. However, we ﬁnd
+that we can easily deﬁne which resource accesses should
+not be in P. That is, we can use the absence of ﬁlters
+to determine resource accesses that should not be under
+adversarial control. This complement set of P is P. We
+deﬁne an approach to calculate P below. Any resource
+access not in P is then in P, the expected attack surface.
+Formally, a resource access u ∈ P if any of the follow-
+
+ing conditions are satisﬁed:
+(i) u ∈ Vu: Binding ﬁlters do not exist, or
+(ii) u e
+−→ v ∈ Vu: There exists an unﬁltered name ﬂow edge
+originating at u, or
+(iii) (u ∗−→ v) ∧ (v ∈ P): There exists a name ﬂow path
+originating at u to a resource access in P.
+Consider the example in Figure 5. Here, resource ac-
+cesses a and b ﬁlter bindings (a,b ∈ Vf ). c does not ﬁlter
+
+978  23rd USENIX Security Symposium 
+
+USENIX Association
+
+a
+
+b
+
+c
+
+Figure 5: Example about determining membership in P
+
+a, b, c 2 P
+
+Inferring P - Expected Resource Access Attack Surface
+
+u, v 2 P
+
+v 2 P
+
+u
+
+u
+
+u
+
+u
+
+u
+
+v
+
+v
+
+v
+
+v
+
+v
+
+u 2 P
+
+No Inference
+
+u
+
+u
+
+u
+
+v
+
+v
+
+v
+
+Binding Filtered
+
+Name Filtered
+
+Figure 6: Determining whether a resource access in a resource
+ﬂow graph should be in P.
+bindings (c ∈ Vu). c’s name is determined from input
+at b, and b’s name is determined from input at a. The
+name ﬂow from a to b is ﬁltered. By (i) above, c ∈ P
+since it does not ﬁlter bindings, and the programmer did
+not expect adversary control by our heuristic. Next, by
+(ii) above, b ∈ P, since it is the origin of an unﬁltered
+name ﬂow (which adversaries should not control). Fi-
+nally, by transitivity using (iii) above, a ∈ P, because it
+is the origin of a name ﬂow to a resource access that is in
+P, and thus adversaries should not control the name read
+from resource access at a. All combinations of name and
+binding ﬁlters between a pair of nodes and the inference
+of node membership in P are presented in Figure 6.
+
+Figure 7 describes the algorithm used to calculate
+membership in P, given Vf ,Vu,E f , and Eu.
+It imple-
+ments (i)-(iii) above. It starts by initially assigning any
+node that does not ﬁlter bindings to P ((i)), and the source
+of unﬁltered name ﬂows to P ((ii)). It then uses a ﬁxed
+point iteration to apply the transitive rule (iii), and adds
+the source of any name ﬂow to a target already in P to P.
+At the termination of the algorithm, any resource access
+not in P is in P.
+
+5.3 Detecting Missing Filters
+Using the name ﬂow graph, we can compute cases where
+ﬁltering is likely missing. Intuitively, a ﬁlter is missing if
+the program ﬁlters some adversarial control of resource
+access but not others. This can happen in two cases: (a)
+if an incoming name ﬂow is ﬁltered but the binding at the
+resource access is not, or (b) a binding is ﬁltered but an
+outgoing name ﬂow is not. The dotted boxes in Figure 6
+show these cases.
+
+Precisely, ﬁlters are possibly missing at a resource ac-
+
+cess r in two cases:
+∃s,e : (s e
+Case 1:
+−→ r∧ e ∈ E f ∧ r ∈ Vu). There exists
+a ﬁlter on an incoming name ﬂow (indicating adversarial
+control of name) but not a binding ﬁlter, or
+
+(cid:30) Resource accesses that can be adversary controlled
+(cid:30) Any node that does not ﬁlter bindings
+(cid:30) Cannot be adversary controlled
+
+P ← P∪ e.src
+
+(cid:30) Any edge that does not ﬁlter name
+(cid:30) Mark source as not adversary controlled
+
+Input: Set of unﬁltered names Eu and bindings Vu
+Output: P
+1: P ← /0
+2: for v ∈ Vu do
+P ← P∪ v
+3:
+4: end for
+5: for e ∈ Eu do
+6:
+7: end for
+8: c ← True
+9: while c = True do
+10:
+11:
+12:
+13:
+14:
+15:
+end for
+16:
+17: end while
+
+if e.tgt ∈ P∧ e.src (cid:24)∈ P then
+
+c ← False
+for e ∈ Eu do
+
+P ← P∪ e.src
+c ← True
+
+end if
+
+(cid:30) Propagate set - ﬁxed point iteration
+
+Figure 7: Inferring P from knowledge of ﬁltering
+
+∃s,e : (r e
+
+Case 2:
+−→ s∧ e ∈ Eu ∧ r ∈ Vf ). There exists
+a ﬁlter on a binding (indicating an adversary-accessible
+resource) but not on all outgoing name ﬂows.
+
+As an example of a missing ﬁlter indicating a vulner-
+ability, we found that in the default conﬁguration, the
+Apache web server ﬁlters the name supplied by a client
+(by stripping ../), but does not ﬁlter the binding used to
+fetch the HTML ﬁle. Therefore, an adversary can create
+a link of her web page to /etc/passwd, which will be
+served.
+
+Not all possibly missing ﬁlters indicate a vulnerabil-
+ity. Some ﬁlters perform the same checks as JIGSAW.
+As an example, we found that libc had binding ﬁlters
+when it accessed (some) resources under /etc to reject
+adversary-accessible resources, enforcing Invariant 1 it-
+self. Thus, there is no need to ﬁlter names originating
+from this resource (although Case 2 indicates a possi-
+bly missing ﬁlter). We call ﬁlters that perform the same
+checks JIGSAW, redundant.
+
+5.4 Detecting Presence of Binding Filters
+We now outline our technique for detecting the ﬁltering
+of bindings. Our objective in detecting here is to deter-
+mine resource accesses that perform any ﬁltering of bind-
+ings. Note that we do not aim to prove the correctness of
+the ﬁltering checks themselves.
+
+To deﬁne how we detect binding ﬁlters, we discuss
+how bindings are involved in resource access and how
+programs ﬁlter them. A program accesses many bindings
+(directories and symbolic links) during a single resource
+access. In theory, any one of these is controllable by the
+adversary. Filtering of directories is done by checking its
+security label, whereas link ﬁltering checks if the binding
+is a link, and optionally, the security label of the link’s
+
+USENIX Association  
+
+23rd USENIX Security Symposium  979
+
+target. Bindings are ﬁltered if, in some cases, the pro-
+gram does not accept a binding based on checks done on
+any binding used during resource access. An ideal solu-
+tion would detect the existence of any such check.
+
+Both static and dynamic approaches are possible to de-
+tect binding ﬁltering. Static analysis uses the program
+code to determine if checks exist. However, this is quite
+challenging as there are a wide variety of ways to per-
+form checks, including, for example, lowering the priv-
+ilege of the process to that of the adversary [9, 39]. In-
+stead, we opt for a dynamic analysis that detects the ef-
+fects of ﬁltering.
+
+To detect ﬁlters, we have to choose a test that will def-
+initely ﬁre the ﬁlter, if such a ﬁlter is present. Our tests
+are attacks that attempt to exploit vulnerabilities if ﬁlters
+were absent. Not all attacks corresponding to vulnerabil-
+ity classes in Table 1 are suitable as tests to detect pro-
+gram ﬁlters. Consider the subset of attacks correspond-
+ing to vulnerability classes in Table 1 where the adver-
+sary uses her control of bindings to direct the victim to
+an adversary-accessible resource (Row 1). If the program
+accepts the adversary-accessible resource, it is generally
+not possible to determine if this was due to the program
+intentionally accepting this resource or due to the pro-
+gram assuming that there would be no adversary control
+of the resource access. On the other hand, consider the
+subset of attacks corresponding to vulnerabilities where
+the adversary uses control of bindings to direct the victim
+to an adversary-inaccessible resource (e.g., link follow-
+ing). Here, if the programmer were expecting adversary-
+controlled bindings, she has to add checks to block this
+resource access as this scenario is, by deﬁnition, a con-
+fused deputy vulnerability. Thus, we can use the results
+of a link following vulnerability to determine the exis-
+tence of binding ﬁlters, and thus, the programmer’s ex-
+pectation. In Section 8, we describe a dynamic analysis
+framework that performs these tests.
+
+5.5 Detecting Presence of Name Filtering
+The other way for adversaries to control resource access
+is to control names. We aim to determine if the program
+makes any attempt to ﬁlter names, which would indicate
+that the programmer expected to receive an adversary-
+controlled name. Again, note that to determine program-
+mer expectation, we only need to determine if there is
+any ﬁltering at all, not if the ﬁltering is correct.
+
+To determine name ﬁlters in programs, we ﬁrst de-
+scribe how names originate. Names are either hard-
+coded in the program or received at runtime. First, hard-
+coded names are constants deﬁned in the program binary
+or a dynamic library. For an adversary to have control
+of hard-coded names, she needs to control the binary or
+library, in which case trivial code attacks are possible.
+Therefore, we assume hard-coded names to not be under
+
+adversarial control. Second, programs get names from
+runtime input. In Figure 1, a client is requesting a HTML
+ﬁle by supplying its name. The server reads the name
+from this request (name source) and accesses the HTML
+ﬁle resource from this client input (name sink). In gen-
+eral, a name can be computed from input using one or
+more read system calls.
+
+Next, we deﬁne the action of ﬁltering names. There
+are two ways in which programs ﬁlter names. First, pro-
+grams can directly manipulate the name. For example,
+web servers strip malicious characters (e.g., ..) from
+names. Second, it can check that the resource retrieved
+from this name is indeed accessible to the adversary. For
+example, the setuid mount program accepts a directory
+to mount from untrusted users who are potential adver-
+saries, but checks that the user indeed has write permis-
+sions to the directory before mounting. Thus, a name is
+ﬁltered between a source and a sink if, in some cases, the
+name read at a source is changed, or the resource access
+at the sink is blocked. An ideal solution would detect the
+existence of any such checks.
+
+Determining name ﬁltering is a two-step process.
+First, we should determine pairs of resource accesses
+where the name is read from one resource (source) and
+used in the other (sink). Next, we determine if the pro-
+gram places any ﬁlters between this source-sink pair.
+
+Again, we can use static or dynamic analysis to ﬁnd
+pairs and ﬁlters. To detect ﬁlters, Balzarotti et al. used
+string analysis [4], whereas techniques such as weakest
+preconditions [7] or symbolic execution [18] can also be
+used. However, static analysis techniques are tradition-
+ally sound, but may produce false positives. Therefore,
+we use dynamic analysis to detect evidence of ﬁltering.
+To determine both pairs and ﬁltering, we use a run-
+time analysis inspired by Sekar [33]. Sekar’s aim is to
+detect injection attacks in a black-box manner. The tech-
+nique is to log all reads and writes by programs, and ﬁnd
+a correlation between reads and writes using an approx-
+imate string matching algorithm. Thus, given as input
+a log of the program’s read and write buffers, the algo-
+rithm returns true if a write buffer matches a read buffer
+“approximately”.
+
+We adapt this technique to ﬁnd name ﬂows. We log
+all reads and names during resource access, and ﬁnd
+matches between names and read buffers. We ﬁrst try
+matching the full name; if no match is found, we try to
+match the directory path and ﬁnal resource separately.
+Often, parts of a name are read from data of different re-
+sources. For example, a web server’s document root is
+read from the conﬁguration ﬁle, whereas the ﬁle to be
+served is read from the client’s input. Both of these are
+combined to form the name of the resource served. As
+with the method for ﬁnding binding ﬁlters, we use the
+directory traversal attack in Row 2 to trigger ﬁltering.
+
+980  23rd USENIX Security Symposium 
+
+USENIX Association
+
+Since our analysis is a black-box approach, if a possi-
+ble name ﬂow is found, the read buffer might just coinci-
+dentally happen to have the name, but not actually ﬂow
+to it. Thus, we execute a veriﬁcation step. We run the
+test suite again, but this time change the read buffer con-
+taining the name to special characters, noting if the name
+also changes. If it does, we have found a name ﬂow.
+
+6 Phase 2: Enforce Programmer Expecta-
+
+tions
+
+Once we ﬁnd the expected attack surface P, JIGSAW en-
+forces resource access protections using Invariant 1 and
+Invariant 2 in Section 3 on program deployments. To do
+this, a reference monitor [1] has to mediate all resource
+accesses and enforce these rules. To enforce these rules
+correctly for each resource access, a reference monitor
+must determine whether this resource access is in P, and
+identify the system deployment’s attack surface S and ad-
+versary accessibility to resources R.
+6.1 Protecting Accesses in P at Runtime
+The ﬁrst challenge is to determine whether the resource
+access is in P. There are two ways to do this: (a) the
+program code can be modiﬁed to convey its expectation
+to the monitor through APIs, or (b) the monitor already
+knows the program expectation and identiﬁes each re-
+source access. Capability systems use code to convey
+their expectation during each resource access. Capabil-
+ity systems [21] present capabilities for only the expected
+resources to the OS during access. For example, decen-
+tralized information ﬂow control (DIFC) systems [19,45]
+require the programmer to choose labels for the autho-
+rized resource for each resource access. However, such
+systems require modifying program code and recompila-
+tion, which can be complex to do correctly.
+
+Another option is for the reference monitor to extract
+information necessary for it to identify the speciﬁc re-
+source access, and hence whether it is in P. Researchers
+have recently made the observation that if they only
+protect a process, they may introspect into the process
+(safely) to make protection decisions [40]. They imple-
+mented a mechanism called the Process Firewall, a Linux
+kernel module that introspects into the process to enforce
+rules to block vulnerabilities per system call invocation.
+This is similar in concept to a network ﬁrewall that pro-
+tects a host by restricting access per individual ﬁrewall
+rules. We use this option because it does not require pro-
+gram code or system access control policy changes, and
+was shown to be much faster than corresponding pro-
+gram checks in some cases.
+
+The general invariant that the Process Firewall en-
+
+forces is as follows:
+
+pf invariant(subject, entrypoint,syscall trace,
+object, resource id,adversary access, op) (cid:31)→ Y|N
+
+Here, entrypoint is the user stack at the time of the
+system call. Resource accesses in P are identiﬁed by
+their entrypoint. A single system call may access mul-
+tiple bindings (e.g., directories and links) and a resource.
+As each binding and resource is accessed at runtime, its
+adversary access is used in the decision.
+If a binding
+is adversary-accessible, then the resource access is in S.
+If the ﬁnal resource is adversary-accessible, then the re-
+source access is in R.
+If a resource access in R is the
+source of a name, this fact is recorded in syscall trace
+and the resource access using this name is in S. This
+general invariant is instantiated to enforce our invariants
+in Section 3. The invariants are converted into Process
+Firewall rules using templates (Section 8).
+
+6.2 Finding Adversary Accessibility R
+R is the set of resource accesses at runtime that use adver-
+sary accessible resources, and is required to enforce In-
+variant 2 in Section 3. Calculating R requires knowing:
+(a) who an adversary is, and (b) whether the adversary
+has permissions to access resources. We address these
+questions in turn.
+
+There have been several heuristics to determine who
+an adversary is. Gokyo [17] uses the system’s mandatory
+access control policy to determine the set of SELinux la-
+bels that are trusted for the system – the rest are adversar-
+ial. Vijayakumar et al. [41] extend this approach to iden-
+tify per-program adversaries. Chari et al. [10] and Pu et
+al. [43] use a model based on discretionary access control
+– a process running with a particular user ID (UID) has
+as its adversaries any other UID, except for the superuser
+(root). We can use any of these approaches to deﬁne an
+adversary.
+
+Second, we need to determine whether an adversary
+has permissions to resources. As discussed in Section 2,
+an adversary-accessible resource is one that the sys-
+tem’s access control policy Y allows an adversary per-
+missions to (read for secrecy vulnerabilities, write for in-
+tegrity vulnerabilities, and execute for both). This can be
+queried directly from the access control policy Y . Any
+resource access at runtime that uses adversary-accessible
+resources is in R.
+
+Some resources become adversary-accessible through
+indirect means. For example, programs log adversarial
+requests to log ﬁles. Thus, adversaries affect data in log
+ﬁles even if the access control policy does not give ad-
+versaries direct write permissions to log ﬁles. Such ex-
+ceptional resources are currently manually added to R.
+
+6.3 Finding Deployment Attack Surface S
+The deployment attack surface S is the set of resource ac-
+cesses a process performs at runtime that are adversary-
+controlled. An adversary can control resource accesses
+
+USENIX Association  
+
+23rd USENIX Security Symposium  981
+
+by controlling either the name or a binding (or both). An
+adversary controls a binding if she uses her write per-
+missions in a directory to create a binding. An adversary
+controls a name if the adversary has write permission to
+the resource the name is fetched from.
+
+To determine adversary control of names, we need to
+detect if there is a data ﬂow from adversary-supplied data
+to a name used in a resource access. Data ﬂow is most of-
+ten determined by taint tracking [5,20,22,31]. However,
+taint tracking techniques have overheads ranging from
+2× to 50× [28]. Instead, JIGSAW approximates data ﬂow
+using control ﬂow (entrypoints – process stacks at the
+time of reading names and using names). Pairs of pro-
+cess stacks during read and resource access system calls
+are initially associated by detecting explicit data ﬂow be-
+tween these calls (Section 5.5). During enforcement, if
+the Process Firewall sees the same stacks, we assume an
+explicit data ﬂow between the read and resource access
+system calls, and the resource access is in S.
+
+6.4 Finding Vulnerabilities
+We can use the rules generated to also ﬁnd vulnerabil-
+ities. Vulnerabilities are detected whenever a resource
+access is denied by our rules but is allowed by the pro-
+gram.
+
+We use the same dynamic analysis from test suites
+that we use to detect the presence of ﬁlters in Sec-
+tions 5.4 and 5.5 to also test the program for vulnera-
+bilities in our particular deployment. Instead of enforc-
+ing the rules, we compare denials by Invariant 1 or In-
+variant 2 in Section 3 with whether the program allows
+the resource access. If the rule denies resource access
+whereas the program accepts the resource, we ﬂag a vul-
+nerability. Note that this process locates vulnerabilities
+in our speciﬁc deployment; there might be other vulner-
+abilities in other deployments that we miss. In any case,
+our rules, if enforced, will protect these program vulner-
+abilities in any deployment.
+
+7 Proving Security of Resource Access
+
+In this section, we ﬁrst argue that if P, S and R are cal-
+culated perfectly, then JIGSAW eliminates resource ac-
+cess vulnerabilities. Our argument is oracle-based; that
+is, we can reason about the correctness of our approach
+assuming the correctness of certain oracles on which it
+depends. Our argument is contingent on the correctness
+of the three oracles that determine: (i) program expecta-
+tion for P, (ii) adversary accessibility of resources for R,
+and (iii) adversary control of names and bindings for S.
+We then discuss the practical limitations JIGSAW faces
+in realizing these oracles.
+
+7.1 Theoretical Argument
+Assuming ideally correct oracles for determining pro-
+grammer expectation, adversary accessibility of re-
+sources and adversary control of names and bindings, we
+argue that Invariants 1 and 2 in Section 3 protect a pro-
+gram from all resource access vulnerabilities as deﬁned
+in Section 2.1 without false positives.
+
+According to the deﬁnition in Section 2.1, a resource
+access vulnerability is caused when an adversary con-
+trols an input (name or binding) to direct a program to an
+adversary-accessible resource when the program expects
+an adversary-inaccessible resource (and vice-versa). Our
+proof hinges on two observations. First, resource access
+vulnerabilities are impossible if adversaries do not con-
+trol the input name or binding. Invariant 1 denies all ad-
+versary control of inputs where the programmer expects
+only adversary-inaccessible resources, thus eliminating
+all vulnerabilities in these cases. Thus, vulnerabilities
+are only possible where the programmer expects to ad-
+versary control of input name or binding. Second, if in-
+deed the adversary controls the input name or binding,
+the only authorized output is an adversary-accessible re-
+source; otherwise, a confused deputy vulnerability (Row
+2 in Table 1) can result. To block this, Invariant 2 allows
+retrieval of only adversary-accessible resources when in-
+put is under adversary control. Hence, we have shown
+that our rules deny resource accesses if and only if adver-
+sary control of input directs the program to unexpected
+resources, thus blocking resource access vulnerabilities
+without false positives.
+
+7.2 Practical Limitations
+In a practical setting, the determination of program ex-
+pectations, adversary accessibility to resources, and ad-
+versary control of names and bindings is imperfect. This
+may lead to false positives and false negatives. We will
+discuss limitations with determining each of these in
+turn.
+
+The ﬁrst oracle determines programmer expectation,
+for which we use the intuitive heuristic in Section 5: if a
+programmer does not place ﬁlters, then she does not ex-
+pect adversary control of resource access, i.e., she only
+expects adversary-inaccessible resources. The detection
+of ﬁlters themselves uses runtime analysis. This faces
+three issues: (i) if identiﬁed ﬁlters are actually present,
+(ii) if actual ﬁlters are missed, and (iii) incompleteness
+of runtime analysis. First, if a detected ﬁlter is not ac-
+tually present, this might result in false negatives. How-
+ever, to detect ﬁlters, we mimic an attack and detect if
+the program blocks the attack. The only way the pro-
+gram could have blocked the attack is if it had a ﬁlter.
+Second, if an actual ﬁlter is missed, this might result in
+
+982  23rd USENIX Security Symposium 
+
+USENIX Association
+
+Monitored
+Process
+
+read/write 
+
+memory/registers
+
+3
+
+STING
+daemon
+
+2
+
+History
+
+6
+
+4
+
+8
+
+system call
+involving 
+resource
+
+1
+
+STING 
+
+kernel module
+
+original 
+ﬁlesystem
+
+attack
+
+ﬁlesystem
+
+syscall 
+end
+
+syscall 
+begin
+
+OS KERNEL
+
+5
+
+n
+e
+t
+l
+i
+
+n
+k
+
+7
+
+Figure 8: Implementation of JIGSAW’s testing framework.
+
+false positives. By the same argument above, if the ﬁl-
+ter cannot defend against our mimicked attack, then it is
+not complete enough anyway. Third, runtime analysis
+is inherently incomplete and may lead to false negatives
+for those resource accesses not covered. However, even
+with the limited developer test suites currently available,
+we were able to generate rules to block many vulnerabil-
+ities and ﬁnd previously-unknown ones even in mature
+programs.
+
+Next, we have the oracle that determines adversary ac-
+cessibility to resources. The main challenge here is de-
+termining who an adversary is. If we do not have a sufﬁ-
+ciently strong adversary model, we may miss adversaries
+and hence have false negatives. While there is no univer-
+sally agreed-upon deﬁnition of who an adversary is, we
+use the intuitive DAC model5 that most programmers as-
+sume [10, 43]. However, our framework permits the use
+of different adversary models. More conservative adver-
+sary models [41] will identify more adversary-accessible
+resources, possibly exposing more vulnerabilities.
+
+The ﬁnal oracle determines adversary control of
+names and bindings. The challenge here is to determine
+if there is a data ﬂow from adversary-supplied data to a
+name used in a resource access. As described in Sec-
+tion 6.3, JIGSAW approximates data ﬂow using control
+ﬂow. However, even if control ﬂow is the same across
+two executions of the program, it does not necessarily
+imply the data ﬂow is the same, leading to false posi-
+tives and negatives. While we have not found this to be a
+problem in our experiments (Section 9.4), more precise
+data ﬂow tracking techniques [5,20,31] will address this
+challenge.
+
+Implementation
+
+8
+There are two parts to our implementation. First, we
+need to test individual program resource accesses to de-
+tect the presence of ﬁlters. This is used by the algorithm
+in Figure 7 to generate P. Second, we need to enforce
+invariants in Section 3 using the Process Firewall. This
+involves determining R and S; this is done as discussed
+in Section 6.2 and Section 6.3 respectively.
+
+8.1 Testing Programs
+To test programs, we develop a framework that can inter-
+cept system calls and pass control to a user-space com-
+ponent that performs the tests. The kernel component
+is a small module that intercepts system calls and re-
+turns, and forwards them to a user-space daemon through
+netlink sockets. The ﬂow of operations is as shown in
+Figure 8. When a monitored program makes a system
+call, it is intercepted by the framework’s kernel module,
+and forwarded to the user-space daemon. There are two
+resource namespaces available per program – a “test”
+namespace that is modiﬁed for hypothetical tests and the
+original namespace (similar in principle to [39]). This
+daemon introspects into the monitored process to iden-
+tify its resource access (using the user-space stack), and
+checks its history to see if ﬁlters have already been de-
+tected. If not, it then proceeds to modify the test ﬁlesys-
+tem (for binding ﬁlter detection). It then returns to the
+kernel module. Control passes to the process in ker-
+nel mode, which accesses the original or test ﬁlesystem
+(depending on whether binding ﬁlters are being tested).
+The system call end is also intercepted, and similarly for-
+warded to the user-space daemon to test for name ﬁlters
+(as the read buffer is now available and can be modiﬁed).
+We use test suites provided with program source code
+to drive the programs. We repeatedly run these suites
+until all resource accesses have been tested for ﬁlters.
+
+8.2 Enforcing Invariants
+As noted, JIGSAW uses the open-source Process Fire-
+wall [40] to perform enforcement. The Process Firewall
+is a kernel module that uses the Linux Security Modules
+to mediate resource accesses. In addition, it can perform
+a user stack backtrace to identify the particular resource
+access being made. Given P and the edges in the name
+ﬂow graph, we have two rule templates to instantiate in-
+variants into rules to be enforced by the Process Firewall.
+Figure 9 shows the templates. Note that the rules for con-
+fused deputy are stateful. Adversary control of name or
+binding is recorded by the ﬁrst rule, the adversary’s iden-
+tity is recorded by the second rule, and the third rule uses
+5A process with uid X has as its adversaries any uid Y (cid:31)= X (except
+
+superuser root)
+
+USENIX Association  
+
+23rd USENIX Security Symposium  983
+
+Rule Templates
+
+Unexpected Adversary Control: (r ∈ S)∧ (r ∈ P) =⇒ Deny
+For each r ∈ P:
+
+pftables -i r.ept -d LOW -o DIR SEARCH -j DROP
+
+Confused Deputy: (r ∈ P)∧ (r ∈ S)∧ (r ∈ R) =⇒ Deny
+Name:
+For each r1 ∈ P such that E(r1,r2):
+
+pftables -i r1.ept -d LOW -j STATE --set --key
+<random value> --value 1
+pftables -i r1.ept -d LOW -j STATE --set --key "adv"
+--value ADV ID
+pftables -i r2.ept -d HIGH -m STATE --key
+<random value> --cmp 1 --equal -m PERM -s --key
+"adv" --deny -j DROP
+Binding:
+pftables -d LOW -o DIR SEARCH -j STATE --set --key
+<r1.ept> --value 1
+pftables -d LOW -o DIR SEARCH -j STATE --set --key
+"adv" --value ADV ID
+pftables -d HIGH -m STATE --key <random value> --cmp
+1 --equal -m PERM -s --key "adv" --deny -j DROP
+
+Figure 9: Process Firewall rule templates.
+
+this state to block access to an adversary-inaccessible re-
+source. Thus, R is adversary-speciﬁc; in addition to pro-
+tecting programs against all its adversaries, it also pre-
+vents one adversary from using the program as a con-
+fused deputy against another adversary.
+
+9 Evaluation
+
+In this section, we evaluate our technique on several
+widely-used programs. We chose these programs
+be-
+cause: (i) resource accesses are central to their opera-
+tion, and (ii) they offer a study in contrast – OpenSSH
+and Postﬁx were explicitly architected for security [30],
+whereas the others were not. To derive expectations, we
+used developer test suites that came with the program or
+created our own. We answer: (a) how common are im-
+plicit programmer expectations during resource access,
+(b) whether the resulting expected attack surface was
+safe for our deployment and vulnerabilities where not,
+and (c) security effectiveness of hardened programs from
+resource access vulnerabilities. We ﬁnd that in all pro-
+grams except OpenSSH, more than 55% of all resource
+accesses are implicitly expected to be free from adver-
+sarial control. Moreover, we discovered two previously-
+unknown vulnerabilities and one default misconﬁgura-
+tion in the Apache webserver. Finally, we ﬁnd that pro-
+tection can be enforced with an overhead of <6% on a
+variety of programs and few false positives.
+
+Implicit Programmer Expectations
+
+9.1
+Table 2 shows a summary of the results obtained by JIG-
+SAW. We ﬁrst note the percentage of resource accesses
+
+core.c:919
+
+socket
+
+util.c:103
+mime.types
+
+core.c:3704
+index.html
+
+log.c:866
+apache2.pid
+
+log.c:349
+error_log 
+
+core.c:3704
+index.shtml
+
+util.c:919
+extra.conf
+
+util.c:103
+.htpasswd
+
+util.c:103
+.htaccess
+
+core.c:3704
+
+err.html
+
+mod_log_conﬁg.c:1446
+
+access_log
+
+util.c:919
+mime.types
+
+util_time.c:43
+localtime 
+
+mpm_common.c:523
+
+group
+
+util.c:103
+httpd.conf
+
+Binary/
+Library
+
+mpm_common.c:530
+
+nsswitch.conf
+
+util.c:2054
+resolv.conf
+
+util.c:2054
+
+hosts
+
+mpm_common.c:530
+
+passwd
+
+mpm_common.c:572
+
+group
+
+Figure 10: Resource Flow Graph for Apache. Nodes that have
+the icon of adversaries beside them are those where we found
+adversarial control of resource access in our deployment.
+
+that are implicitly expected to not be in P, due to the
+absence of name or binding ﬁlters. For all programs
+except OpenSSH, the programmer placed no ﬁlters for
+more than 55% of resource accesses. If any of these re-
+source accesses somehow come under adversarial con-
+trol, the program can be compromised. It is very easy for
+OS distributor policies or administrator conﬁgurations to
+not match with these programmer assumptions. By ex-
+plicitly identifying such resource accesses, we are able
+to protect them from any adversarial access in any de-
+ployment. OpenSSH makes fewer assumptions during
+resource access (17.6%). However, OpenSSH was re-
+architected after several years of experience with previ-
+ous vulnerabilities. Using our technique, we can protect
+all resource accesses.
+
+9.2 Case Study: Apache
+In total, we found 20 resource accesses for Apache. Of
+these, Apache code ﬁltered bindings for 7 accesses, and
+the name for 5 accesses. This led to 13 out of 20 resource
+accesses (65%) not being in P (using the algorithm in
+Figure 7). We found three resource accesses in S− P for
+the Apache web server in our deployment, violating the
+ﬁrst rule in Section 3. These corresponded to two previ-
+ously unknown vulnerabilities in the Apache web server
+and one default misconﬁguration. That such problems
+occur in even a mature program like Apache shows the
+importance of principled reasoning of resource access.
+While we found these vulnerabilities in our deployment,
+other deployments may have different vulnerabilities, but
+all will be blocked using our enforcement (Section 9.3).
+Figure 10 shows the resource ﬂow graph for Apache.
+Apache’s expected attack surface is centered around re-
+source accesses during the interaction with a client to
+serve a web page. It assumes that the location of the main
+conﬁguration ﬁle and resources speciﬁed in it are not ad-
+versary controlled. Apache’s resource ﬂow graph is rela-
+tively complex due to long chains of resource ﬂows, and
+it is difﬁcult to reason about safety without the help of au-
+tomated tools like ours. Resource accesses that had vul-
+
+984  23rd USENIX Security Symposium 
+
+USENIX Association
+
+Program
+
+Apache v2.2.22
+
+OpenSSH v5.3p1
+
+Samba3 v3.4.7
+
+Winbind v3.4.7
+
+Postﬁx v2.10.0
+
+Dev
+Tests?
+
+Yes*
+
+Yes
+
+Yes
+
+Yes
+
+No
+
+|V|
+
+20
+
+17
+
+210
+
+50
+
+181
+
+|E|
+
+|Vf |
+
+|E f |
+
+∈ P
+
+23
+
+17
+
+84
+
+38
+
+15
+
+7
+
+14
+
+78
+
+19
+
+79
+
+5
+
+0
+
+19
+
+13
+
+7
+
+7
+
+14
+
+78
+
+19
+
+79
+
+(cid:29)∈ P
+
+13
+
+3
+
+132
+
+31
+
+102
+
+Impl.
+Exp. %
+
+65%
+
+17.6%
+
+62.8%
+
+63.3%
+
+56.32%
+
+Missing
+
+Redundant
+
+Vulns.
+
+Inv. 1s
+
+Inv. 2s
+
+2
+
+0
+
+0
+
+0
+
+0
+
+0
+
+3
+
+5
+
+0
+
+9
+
+3
+
+0
+
+0
+
+0
+
+0
+
+13
+
+3
+
+132
+
+31
+
+102
+
+12
+
+2
+
+40
+
+28
+
+15
+
+Table 2: Statistics of program-wide resource accesses. Dev Tests show whether we used developer test suites or created our own.
+Impl. Exp. is the percentage of resource accesses (|P|/|V|) that are implicitly expected to be adversary-inaccessible. The last two
+columns show the number of instantiations of Invariant 1 and Invariant 2 in Section 3 for resource accesses in the program. *- We
+augmented the Apache test suite with additional tests.
+
+nerabilities in our deployment are shaded in the graph.
+
+to leak conﬁguration information about the webserver.
+
+The ﬁrst vulnerability we found was during resource
+access of a user-deﬁned .htpasswd ﬁle. Apache allows
+each user the option of enabling HTTP authentication for
+parts of their website. This includes the ability to specify
+a password ﬁle of their choice. However, the resource ac-
+cess that fetches this password ﬁle is not ﬁltered. Thus,
+users can specify any password ﬁle – even one that they
+do not have access to. One example exploit is to direct
+this password ﬁle to be the system-wide /etc/passwd.
+Traditionally, it is difﬁcult to brute-force the system-wide
+password ﬁle since prompts are rate-limited. However,
+since HTTP authentication is not rate-limited, this may
+make such brute-force attacks realistic. Such a scenario,
+though obvious after discovery, is very difﬁcult to rea-
+son about manually due to Apache’s complex resource
+accesses. Thus, it has remained hidden all these years.
+
+The second vulnerability is a default misconﬁguration.
+When serving web pages, Apache controls whether sym-
+bolic links can be followed from user web pages by the
+option FollowSymLinks, which is turned on by default
+in Ubuntu and Fedora packages. Turning this option on
+implicitly assumes trust in the user to link to only her
+own web pages. Interestingly, the name for this resource
+access is ﬁltered – only the bindings are not. One way we
+were able to take advantage of this misconﬁguration was
+through the error document on speciﬁc errors, such as
+HTTP 404, that is speciﬁable in the user-deﬁned conﬁg-
+uration .htaccess ﬁle. This allows an adversary to ac-
+cess any resource the Apache web server itself can read,
+for example, the password ﬁle and SSL private keys. We
+found that our department web server also had this option
+turned on. By simply making an error document linked
+to /etc/passwd, we were able to view the contents of
+the password ﬁle on the server. This demonstrates an-
+other typical cause of resource access attacks – adminis-
+trators misconﬁguring the program and violating safety
+of the expected attack surface.
+
+The third vulnerability is a link following attack on
+.htaccess. Apache allows .htaccess to be any ﬁle
+on the ﬁlesystem it has access to. This may be exploited
+
+Finally, we note that test suites that come with pro-
+grams are traditionally focussed towards testing func-
+tionality and not necessarily resource access. For exam-
+ple, the stock test suite for Apache only uncovered 7 re-
+source accesses in total, and after we augmented it, there
+were 20 in total. Better test suites for resource access
+would help test more resource accesses.
+
+9.3 Process Firewall Enforcement
+
+Process Firewall rules enforce the safety of the ex-
+pected attack surface under the deployment attack sur-
+face. Given the program’s expected attack surface, Pro-
+cess Firewall rules enforce that any adversary-controlled
+resource access at runtime (i.e., part of the deployment
+attack surface) is allowed only if the resource access is
+also part of the program’s expected attack surface.
+In
+addition, for those resource accesses allowed, they also
+protect the program against confused-deputy link and di-
+rectory traversal vulnerabilities. The last two columns in
+Table 2 shows the number of Process Firewall rules we
+obtained (separately due to Invariants 1 and 2).
+
+We evaluated the ability of rules to block vulnera-
+bilities. First, we veriﬁed the ability of these rules to
+block the three discovered vulnerabilities in Apache.
+Second, we tried previously-known, representative re-
+source access vulnerabilities against Apache and Samba.
+We tested an untrusted library load (CVE-2006-1564)
+against Apache. Here, a bug in the package manager
+forced Apache to search for modules in untrusted direc-
+tories. Our tool deduced that the resource access that
+loaded libraries did not have any ﬁltering, and thus, was
+not in P, blocking this vulnerability due to Invariant 1
+in Section 3. In addition, we tested a directory traversal
+vulnerability in Samba (CVE-2010-0926). This is a con-
+fused deputy vulnerability involving a sequence of ../
+in a symbolic link. This vulnerability was blocked due to
+Invariant 2.
+
+USENIX Association  
+
+23rd USENIX Security Symposium  985
+
+9.4 False Positives
+
+As discussed in Section 7.2, false positives are caused by
+improper determination of: (i) programmer expectation
+and (ii) adversary control of names.
+
+First, false positives are caused by a failure of our
+heuristic in Section 3 that determines program expecta-
+tion.
+In some cases, we found that a program had no
+ﬁlters at a resource access, but still expected adversary-
+controlled resource access. We found that this case oc-
+curs in certain small “helper” programs that perform a
+requested task on a resource without any resource ac-
+cess ﬁlters. For example, consider that the administra-
+tor (root) runs the cat utility on a ﬁle in an adversarial
+user’s home directory. Because cat does not ﬁlter the
+input bindings, the user can always launch a link fol-
+lowing attack by linking the ﬁle to the password ﬁle,
+for example. However, if there is no attempted attack,
+then our rule will block cat from accessing the user’s
+ﬁle, because the resource access has no ﬁlters and is thus
+not part of the expected attack surface (by our heuristic).
+However, we may want to allow such access, because
+cat has ﬁlters to protect itself from the input data to pre-
+vent vulnerabilities such as buffer overﬂows.
+
+To address such false positives, we propose enforcing
+protection for such helper programs specially. Our in-
+tuition is that when these programs perform adversary-
+controlled resource access, they can be considered ad-
+versarial themselves. All subsequent resources to which
+data is output by these programs are then considered
+adversary-accessible. Other programs reading these
+resources should protect themselves from input (e.g.,
+names) as if they were dealing with an adversary-
+accessible resource.
+
+To enforce this approach, we implemented two
+changes. First, we enforce only Invariant 2 (confused
+deputy) in Section 3 for these programs. Second, when-
+ever Invariant 1 would have disallowed access, we in-
+stead allow access, but “taint” all subsequent output re-
+sources by marking them with the adversary’s label (us-
+ing ﬁlesystem extended attributes).
+
+We evaluated the effect of this approach during the
+bootup sequence of our Ubuntu 10.04 LTS system.
+We manually identiﬁed 15 helper programs. During
+boot, various startup scripts invoked these helper pro-
+grams a total of 36 times.
+In our deployment, 9 of
+these invocations accessed an adversary-accessible re-
+source. Note that our original approach would have
+blocked these 9 resource accesses, disrupting the boot
+sequence, whereas our modiﬁcation allows these re-
+source accesses. These invocations subsequently tainted
+4 output resources – two log ﬁles and two ﬁles stor-
+ing runtime state. We found two programs reading
+from these tainted ﬁles – ufw (a simpliﬁed ﬁrewall), and
+
+the wpa_supplicant daemon (used to manage wireless
+connections). These programs will ﬁnd the tainted re-
+sources adversary-accessible, and will have to protect
+themselves from such input.
+
+Second, false positives are caused during enforcement
+by our implementation’s approximation of adversarial
+data ﬂow using control ﬂow. Such false positives are due
+to implementation limitations and not any fundamental
+shortcoming of our approach. To evaluate this, we used
+two separate test suites for Apache – one to build the
+name ﬂow graph and generate Process Firewall rules,
+and the other to test the produced rules. We used our
+enhanced test suite to generate rules and ApacheBench
+to test the generated rules. ApacheBench ran without
+any false positives. However, different conﬁgurations or
+variable values might result in different data ﬂows even if
+the stacks remain the same. As mentioned in Section 7.2,
+accurate data ﬂow tracking can solve this problem.
+
+9.5 Performance
+A detailed study of the Process Firewall is in [40]. In
+summary, system call microbenchmarks showed over-
+heads of up to 10.6%, whereas macrobenchmarks had
+overheads of up to 4%. The main cause for overhead is
+unrolling the process stack to identify the system call.
+To conﬁrm these results, we evaluated the performance
+overhead of a hardened Apache webserver (v2.2.22) that
+had the 25 rules from Table 2. Using ApacheBench to
+request the default Apache static webpage, we found an
+overhead of 4.33% and 5.28% for 1 and 100 concurrent
+clients respectively. However, we can compensate for
+such overhead by compiling Apache without resource
+access ﬁlters, since ﬁlters are now redundant given our
+enforced rules. Vijayakumar et al. [40] showed that re-
+moving code ﬁlters causes a throughput increase of up to
+8% in Apache.
+
+10 Related Work
+
+Inferring Expectations
+
+10.1
+Determining programmer expectations from code has
+previously been done in a variety of contexts. Engler [14]
+et al. infer programmer beliefs from code. For example,
+if a pointer p is dereferenced, the inferred belief is that p
+!= NULL. They use this to ﬁnd bugs in the Linux kernel.
+Closely related are techniques to infer invariants from
+dynamic traces [3, 15, 32]. Daikon [15] uses dynamic
+traces to infer hypothesis such as that a particular vari-
+able is less than another. Baliga et al. [3] use Linux ker-
+nel traces to propose invariants on data structures. While
+we deal with a different class of attacks, our approach is
+in the same spirit as the above works.
+
+986  23rd USENIX Security Symposium 
+
+USENIX Association
+
+10.2 Defenses During Resource Access
+
+Current defenses against resource access attacks in OSes
+are ad-hoc and fundamentally limited. Defenses can be
+classiﬁed into those that require changes to either the (i)
+system (e.g., OS, libraries), or (ii) program code.
+
+The simplest system defense is to change the access
+control policy to allow a process access to only the set of
+expected resources. Unfortunately, this defense is both
+complicated and does not entirely stop resource access
+attacks. First, ﬁxing access control policies is a com-
+plicated task. For example, even the minimal (targeted)
+SELinux MAC policy on the widely-used Fedora Linux
+distribution has 95,600 rules. Understanding and chang-
+ing such rules requires domain speciﬁc expertise that not
+all administrators have. Second, access control alone
+is insufﬁcient to stop resource access attacks because it
+treats processes as a black-box and does not differenti-
+ate between different resource access system calls.
+In
+our example in Figure 1, the web server opens both a
+log ﬁle and user HTML pages. Thus, it needs permis-
+sions to both resources. However, it should not access
+the log ﬁle when it is serving a user HTML page, and
+vice versa. Traditional access control does not make this
+difference. Other system defenses have mainly focused
+on TOCTTOU attacks [11,13,25–27,35–38,44] and link
+following [10]. However, system defenses are prone to
+cause false positives because they do not know what pro-
+grams expect [8], e.g., which pairs of system calls expect
+to access the same resource.
+
+The simplest program defense is to use program code
+ﬁlters that accept only the expected resources. How-
+ever, there are a number of challenges to writing cor-
+rect code checks. First, such checks are inefﬁcient and
+cause performance overhead. For example, the Apache
+web server documentation [2] recommends switching off
+resource access checks during web page ﬁle retrieval to
+improve performance. Second, checks are complicated.
+The system-call API that programs use for resource ac-
+cess is not atomic, leading to TOCTTOU races. There is
+no known race-free method to perform an access-open
+check in the current system call API [8]. Chari et al. [10]
+show that to defend link following attacks, program-
+mers must perform at least four additional system calls
+per path component for each resource access. Going
+back to the example in Figure 1, the checks on lines
+7 and 8 are not enough – the correct sequence to use
+is lstat-open-fstat-lstat [10]. Thirdly, program
+checks are incomplete, because adversary accessibility
+to resources is not sufﬁciently exposed to programs by
+the system-call API. Currently, programs can query ad-
+versary accessibility only for UNIX discretionary ac-
+cess control (DAC) policies (e.g., using the access
+system call), but many UNIX systems now also en-
+
+force mandatory access control (MAC) policies (e.g.,
+SELinux [24] and AppArmor [23]) that allow different
+adversary accessibility. While custom APIs have been
+proposed [19,29,34,42] to address such limitations, these
+require additional programmer effort and do not protect
+current programs.
+
+11 Conclusion
+
+In this paper, we presented JIGSAW, an automated ap-
+proach to protect programs from resource access attacks.
+We ﬁrst precisely deﬁned resource access attacks, and
+then noted the fundamental cause for them – a mismatch
+between programmer expectations and the actual deploy-
+ment the program runs in. We deﬁned two invariants that,
+if evaluated and enforced correctly, can theoretically of-
+fer complete protection against resource access attacks.
+We proposed a novel technique to evaluate programmer
+expectations based on the presence of ﬁlters, and showed
+how the invariants could practically be enforced by the
+Process Firewall.
+
+We applied this technique to harden widely-used pro-
+grams, and discovered that programmers make a lot of
+implicit assumptions.
+In this process, we discovered
+two previously-unknown exploitable vulnerabilities as
+well as a default misconﬁguration in Apache, the world’s
+most widely used web server. This shows that even ma-
+ture programs only reason about resource access in an
+ad-hoc manner. The analysis as presented in this paper
+can thus efﬁciently and automatically protect programs
+against resource attacks at runtime.
+
+Acknowledgements
+
+We thank the anonymous reviewers and our shepherd
+David Evans for their insightful comments that helped
+improve the presentation of the paper. Authors from
+Penn State acknowledge support from the Air Force
+Ofﬁce of Scientiﬁc Research (AFOSR) under grant
+AFOSR-FA9550-12-1-0166. Mathias Payer was sup-
+ported through the DARPA award HR0011-12-2-005.
+The views and conclusions contained in this document
+are those of the authors and should not be interpreted
+as representing the ofﬁcial policies, either expressed or
+implied, of the Army Research Laboratory or the U.S.
+Government. The U.S. Government is authorized to re-
+produce and distribute reprints for Government purposes
+notwithstanding any copyright notation here on.
+
+References
+[1] J. P. Anderson. Computer Security Technology Planning Study,
+Volume II. Technical Report ESD-TR-73-51, Deputy for Com-
+mand and Management Systems, HQ Electronics Systems Divi-
+sion (AFSC), L. G. Hanscom Field, Bedford, MA, October 1972.
+
+USENIX Association  
+
+23rd USENIX Security Symposium  987
+
+[2] Apache Performance Tuning. http://httpd.apache.org/
+
+docs/2.2/misc/perf-tuning.html#symlinks, 2012.
+
+[3] A. Baliga, V. Ganapathy, and L. Iftode. Automatic inference and
+enforcement of kernel data structure invariants.
+In ACSAC’08:
+Proceedings of the 24th Annual Computer Security Applications
+Conference, pages 77–86, Anaheim, California, USA, December
+2008. IEEE Computer Society Press, Los Alamitos, California,
+USA.
+
+[4] D. Balzarotti et al. Saner: Composing static and dynamic analysis
+to validate sanitization in web applications. In Proceedings of the
+IEEE Symposium on Security and Privacy, 2008.
+
+[5] E. Bertino, B. Catania, E. Ferrari, and P. Perlasca. A system to
+specify and manage multipolicy access control models. In Pro-
+ceedings of POLICY’02. IEEE Computer Society, 2002.
+
+[6] M. Bishop and M. Digler. Checking for race conditions in ﬁle
+
+accesses. Computer Systems, 9(2), Spring 1996.
+
+[7] D. Brumley, H. Wang, S. Jha, and D. Song. Creating vulnerability
+In Proceedings of the
+
+signatures using weakest preconditions.
+20th IEEE Computer Security Foundations Symposium, 2007.
+
+[8] X. Cai et al. . Exploiting Unix File-System Races via Algorithmic
+
+Complexity Attacks. In IEEE SSP ’09, 2009.
+
+[9] S. Chari and P. Cheng. Bluebox: A policy-driven, host-based
+intrusion detection system. ACM Transaction on Infomation and
+System Security, 6:173–200, May 2003.
+
+[10] S. Chari et al. Where do you want to go today? escalating privi-
+
+leges by pathname manipulation. In NDSS ’10, 2010.
+
+[11] C. Cowan, S. Beattie, C. Wright, and G. Kroah-Hartman. Race-
+guard: Kernel protection from temporary ﬁle race vulnerabilities.
+In Proceedings of the 10th USENIX Security Symposium, Berke-
+ley, CA, USA, 2001. USENIX Association.
+
+[12] Common vulnerabilities and exposures. http://cve.mitre.
+
+org/.
+
+[13] D. Dean and A. Hu. Fixing races for fun and proﬁt. In Proceed-
+
+ings of the 13th USENIX Security Symposium, 2004.
+
+[14] D. Engler, D. Y. Chen, S. Hallem, A. Chou, and B. Chelf. Bugs
+as deviant behavior: A general approach to inferring errors in
+systems code. In Proceedings of the Eighteenth ACM Symposium
+on Operating Systems Principles, SOSP ’01, pages 57–72, New
+York, NY, USA, 2001. ACM.
+
+[15] M. D. Ernst, J. Cockrell, W. G. Griswold, and D. Notkin. Dynam-
+ically discovering likely program invariants to support program
+evolution. In Proceedings of the 21st International Conference
+on Software Engineering, ICSE ’99, pages 213–224, New York,
+NY, USA, 1999. ACM.
+
+[16] N. Hardy. The confused deputy. Operating Systems Review,
+
+22(4):36–38, Oct. 1988.
+
+[17] T. Jaeger, R. Sailer, and X. Zhang. Analyzing Integrity Protection
+in the SELinux Example Policy.
+In SSYM’03: Proceedings of
+the 12th conference on USENIX Security Symposium, pages 5–5,
+Berkeley, CA, USA, 2003. USENIX Association.
+
+[18] J. C. King. Symbolic execution and program testing. Communi-
+
+cations of the ACM, 19(7):385–394, July 1976.
+
+[19] M. N. Krohn et al.
+
+Information ﬂow control for standard OS
+
+abstractions. In SOSP ’07, 2007.
+
+[20] L. C. Lam and T.-c. Chiueh. A general dynamic information ﬂow
+tracking framework for security applications. In Proceedings of
+ACSAC ’06, pages 463–472. IEEE Computer Society, 2006.
+
+[21] H. M. Levy. Capability-based Computer Systems. Digital
+Press, 1984. Available at http://www.cs.washington.edu/
+homes/levy/capabook/.
+
+[22] J. Newsome et al . Dynamic taint analysis for automatic detec-
+tion, analysis, and signaturegeneration of exploits on commodity
+software. In NDSS, 2005.
+
+[23] Novell. AppArmor Linux Application Security. http://www.
+
+novell.com/linux/security/apparmor/.
+
+[24] Selinux. http://www.nsa.gov/selinux.
+[25] OpenWall Project - Information security software for open envi-
+
+ronments. http://www.openwall.com/, 2008.
+
+[26] J. Park, G. Lee, S. Lee, and D.-K. Kim. Rps: An extension of
+reference monitor to prevent race-attacks. In PCM (1) 04, 2004.
+[27] M. Payer and T. R. Gross. Protecting applications against tocttou
+races by user-space caching of ﬁle metadata. In Proceedings of
+the 8th ACM SIGPLAN/SIGOPS Conference on Virtual Execution
+Environments, 2012.
+
+[28] M. Payer, E. Kravina, and T. R. Gross. Lightweight memory trac-
+ing. In Proceedings of the 2013 USENIX Conference on Annual
+Technical Conference, USENIX ATC’13, pages 115–126, Berke-
+ley, CA, USA, 2013. USENIX Association.
+
+[29] D. E. Porter et al. Operating system transactions. In SOSP ’09,
+
+2009.
+
+[30] N. Provos et al . Preventing privilege escalation.
+
+Security ’03, 2003.
+
+In USENIX
+
+[31] F. Qin et al . LIFT: A Low-Overhead Practical Information Flow
+Tracking System for Detecting Security Attacks. In MICRO 39,
+2006.
+
+[32] S. Savage, M. Burrows, G. Nelson, P. Sobalvarro, and T. An-
+derson. Eraser: A dynamic data race detector for multithreaded
+programs. ACM Trans. Comput. Syst., 15(4):391–411, Nov. 1997.
+[33] R. Sekar. An efﬁcient black-box technique for defeating web
+
+application attacks. In NDSS, 2009.
+
+[34] J. S. Shapiro, J. M. Smith, and D. J. Farber. EROS: A fast ca-
+pability system. In Proceedings of the 17th ACM Symposium on
+Operating System Principles, December 1999.
+
+[35] K. suk Lhee and S. J. Chapin. Detection of ﬁle-based race condi-
+
+tions. Int. J. Inf. Sec., 2005.
+
+[36] D. Tsafrir et al. Portably solving ﬁle tocttou races with hardness
+
+ampliﬁcation. In USENIX FAST, 2008.
+
+[37] E. Tsyrklevich and B. Yee. Dynamic detection and prevention
+In Proceedings of the 12th
+
+of race conditions in ﬁle accesses.
+USENIX Security Symposium, pages 243–255, 2003.
+
+[38] P. Uppuluri, U. Joshi, and A. Ray. Preventing race condition at-
+
+tacks on ﬁle-systems. In SAC-05, 2005.
+
+[39] H. Vijayakumar, J. Schiffman, and T. Jaeger. Sting: Finding name
+resolution vulnerabilities in programs. In Proceedings of the 21st
+USENIX Security Symposium (USENIX Security 2012), August
+2012.
+
+[40] H. Vijayakumar, J. Schiffman, and T. Jaeger. Process ﬁrewalls:
+Protecting processes during resource access. In Proceedings of
+the 8th ACM European Conference on Computer Systems (EU-
+ROSYS 2013), April 2013.
+
+[41] H. Vijayakumar et al.
+
+Integrity walls: Finding attack surfaces
+
+from mandatory access control policies. In ASIACCS, 2012.
+
+[42] R. Watson et al. Capsicum: practical capabilities for UNIX. In
+
+USENIX Security, 2010.
+
+[43] J. Wei et al. Tocttou vulnerabilities in unix-style ﬁle systems: an
+
+anatomical study. In USENIX FAST ’05, 2005.
+
+[44] J. Wei et al. A methodical defense against TOCTTOU attacks:
+the EDGI approach. In IEEE International Symp. on Secure Soft-
+ware Engineering (ISSSE) , 2006.
+
+[45] N. Zeldovich et al . Making information ﬂow explicit in HiStar.
+
+In OSDI ’06, 2006.
+
+988  23rd USENIX Security Symposium 
+
+USENIX Association
+
+

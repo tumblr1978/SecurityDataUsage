@@ -1,0 +1,1908 @@
+TypeSan: Practical Type Confusion Detection
+
+Istvan Haller∗†
+
+istvan.haller@gmail.com
+
+Yuseok Jeon‡
+
+jeon41@purdue.edu
+
+Hui Peng‡
+
+peng124@purdue.edu
+
+Mathias Payer‡
+
+mathias.payer@nebelwelt.net
+
+Cristiano Giuffrida∗†
+giuffrida@cs.vu.nl
+
+Herbert Bos∗†
+
+herbertb@few.vu.nl
+
+Erik van der Kouwe∗†
+vdkouwe@cs.vu.nl
+
+ABSTRACT
+The low-level C++ programming language is ubiquitously
+used for its modularity and performance. Typecasting is
+a fundamental concept in C++ (and object-oriented pro-
+gramming in general) to convert a pointer from one object
+type into another. However, downcasting (converting a base
+class pointer to a derived class pointer) has critical security
+implications due to potentially diﬀerent object memory lay-
+outs. Due to missing type safety in C++, a downcasted
+pointer can violate a programmer’s intended pointer seman-
+tics, allowing an attacker to corrupt the underlying memory
+in a type-unsafe fashion. This vulnerability class is receiving
+increasing attention and is known as type confusion (or bad-
+casting). Several existing approaches detect diﬀerent forms
+of type confusion, but these solutions are severely limited
+due to both high run-time performance overhead and low
+detection coverage.
+
+This paper presents TypeSan, a practical type-confusion
+detector which provides both low run-time overhead and
+high detection coverage. Despite improving the coverage
+of state-of-the-art techniques, TypeSan signiﬁcantly reduces
+the type-confusion detection overhead compared to other
+solutions. TypeSan relies on an eﬃcient per-object meta-
+data storage service based on a compact memory shadowing
+scheme. Our scheme treats all the memory objects (i.e.,
+globals, stack, heap) uniformly to eliminate extra checks on
+the fast path and relies on a variable compression ratio to
+minimize run-time performance and memory overhead. Our
+experimental results conﬁrm that TypeSan is practical, even
+when explicitly checking almost all the relevant typecasts in
+a given C++ program. Compared to the state of the art,
+TypeSan yields orders of magnitude higher coverage at 4–
+10 times lower performance overhead on SPEC and 2 times
+on Firefox. As a result, our solution oﬀers superior protec-
+
+∗
+†
+‡
+
+Vrije Universiteit Amsterdam
+Amsterdam Department of Informatics
+Purdue University
+
+Permission to make digital or hard copies of all or part of this work for personal or
+classroom use is granted without fee provided that copies are not made or distributed
+for proﬁt or commercial advantage and that copies bear this notice and the full citation
+on the ﬁrst page. Copyrights for components of this work owned by others than the
+author(s) must be honored. Abstracting with credit is permitted. To copy otherwise, or
+republish, to post on servers or to redistribute to lists, requires prior speciﬁc permission
+and/or a fee. Request permissions from permissions@acm.org.
+CCS’16, October 24 - 28, 2016, Vienna, Austria
+© 2016 Copyright held by the owner/author(s). Publication rights licensed to ACM.
+ISBN 978-1-4503-4139-4/16/10. . . $15.00
+DOI: http://dx.doi.org/10.1145/2976749.2978405
+
+tion and is suitable for deployment in production software.
+Moreover, our highly eﬃcient metadata storage back-end is
+potentially useful for other defenses that require memory
+object tracking.
+
+CCS Concepts
+•Security and privacy → Systems security; Software
+and application security;
+
+Keywords
+Type safety; Typecasting; Type confusion; Downcasting
+
+1.
+
+INTRODUCTION
+
+Type confusion bugs are emerging as one of the most im-
+portant attack vectors to compromise C++ applications.
+C++ is popular in large software projects that require both
+the modularity of object-oriented programming and the high
+eﬃciency oﬀered by low-level access to memory and system
+intrinsics. Examples of large C++ programs are Google
+Chrome, large parts of Microsoft Windows and Firefox, and
+the Oracle Java Virtual Machine. Unfortunately, C++ en-
+forces neither type nor memory safety. This lack of safety
+leads to type confusion vulnerabilities that can be abused to
+attack certain programs. Type confusion bugs are an inter-
+esting mix between lack of type safety and lack of memory
+safety. Generally, type confusion arises when the program
+interprets an object of one type as an object of a diﬀerent
+type due to unsafe typecasting—leading to reinterpretation
+of memory areas in diﬀerent contexts. For instance, it is not
+uncommon for a program to cast an instance of a parent class
+to a descendant class, even though this is not safe if the par-
+ent class lacks some of the ﬁelds or virtual functions of the
+descendant class. When the program subsequently uses the
+ﬁelds or functions of the descendant class that do not exist
+for the given object, it may use data, say, as a regular ﬁeld in
+one context and as a virtual function table (vtable) pointer
+in another. Exploitable type confusion bugs have been found
+in a wide range of software products, such as Adobe Flash
+(CVE-2015-3077), Microsoft Internet Explorer (CVE-2015-
+6184), PHP (CVE-2016-3185), and Google Chrome (CVE-
+2013-0912). This paper shows how to detect type confusion
+with higher detection coverage and better performance than
+existing solutions.
+
+TypeSan: always-on type checking Current defenses
+against type confusion [20, 17] are impractical for production
+systems, because they are too slow, suﬀer from low coverage,
+
+517Checker
+CaVer
+TypeSan
+
+xalancbmk
+24 thousand
+
+soplex
+
+omnetpp
+
+dealII
+
+0
+
+0
+
+0
+
+254 mln
+
+209 thousand
+
+2.0 bln
+
+3.6 bln
+
+Checker
+CaVer
+TypeSan
+
+xalancbmk
+
+29.6%
+7.1%
+
+soplex
+20.0%
+1.8%
+
+Table 1: Coverage achieved by the type checkers on
+SPEC. The numbers represent the number of downcasts
+veriﬁed by each of these systems while executing the
+reference workloads. The CaVer numbers are from the
+original paper to ensure a fair comparison.
+
+Table 2: Performance overhead achieved by the type
+checkers on SPEC. The CaVer numbers are taken from
+the original paper to ensure a fair comparison. The com-
+parison only uses the applications CaVer has been eval-
+uated on by its authors.
+
+and/or only support non-polymorphic classes. The greatest
+challenge in building an always-on type checker is the need
+for per-object metadata tracking which quickly becomes a
+bottleneck if the program allocates, frees, casts, and uses
+objects at high frequency (e.g., on the stack).
+
+To address the high overhead and the low coverage of ex-
+isting solutions, we present TypeSan, an explicit type check-
+ing mechanism that uses LLVM-based instrumentation to
+enforce explicit type checks. Compared to previous work,
+TypeSan provides extended coverage and massively reduced
+performance overhead. Our back-end uses a highly eﬃcient
+metadata storage service (based on a shadowing scheme with
+a variable compression ratio) to look up types from pointers.
+This limits the amount of data written for large allocations
+(such as arrays of objects) while at the same time supporting
+eﬃcient and scalable lookups, requiring only 3 memory reads
+to look up a type. We envision this new type of metadata
+storage to be also useful for other sanitizers, e.g., to verify
+memory safety, and we plan to explore further applications
+in future work.
+
+We primarily envision TypeSan as an always-on solution,
+making explicit type checks practical for commodity soft-
+ware. Used in attack prevention mode, TypeSan-hardened
+binaries are shipped to end users and terminate the pro-
+gram on bad casts, thereby preventing zero-day type con-
+fusion exploits. Combined with liveness reports for modern
+software (like the Google Chrome and Mozilla Firefox crash
+reporters), such a deployment signals the developers about
+potentially missing type checks. In addition, TypeSan can
+be used in software testing where TypeSan identiﬁes po-
+tential bad casting in the source code.
+In relaxed mode,
+TypeSan simply logs all bad casts to scan for underlying
+vulnerabilities, e.g., when running a test suite.
+
+We have implemented a prototype of TypeSan for Linux
+on top of LLVM 3.9. Our prototype implementation is com-
+patible with large source code bases. We have evaluated
+TypeSan with the SPEC CPU2006 C++ programs and the
+Firefox browser. Compared to CaVer [17], the current state-
+of-the-art type confusion detector, we decrease overhead by a
+factor 3–6 for the SPEC benchmarks they reported on while
+simultaneously increasing the number of typecasts covered
+by checks by several orders of magnitude (see Table 1 and
+Table 2 for more details).
+
+Contributions We make the following contributions:
+
+• A design for high-performance, high-coverage typecast
+veriﬁcation on legacy C++ code that is 3–6 times faster
+than the state-of-the-art detector with lower memory
+overhead and orders of magnitude more typecasts.
+
+• A thorough evaluation that shows how our design de-
+livers both nearly complete coverage and performance
+that is suitable for production usage.
+
+• An automatically generated test suite for typecasting
+veriﬁcation to ensure that all diﬀerent combinations of
+C++ types are properly handled.
+
+• An open-source implementation of our TypeSan de-
+sign, available at https://github.com/vusec/typesan.
+
+2. BACKGROUND
+
+In this section, we ﬁrst explain typecasting in C++ and
+how doing so incorrectly can lead to vulnerabilities. After-
+wards, we discuss existing defenses against type confusion.
+2.1 Type confusion
+
+Object-oriented programming languages such as C++ al-
+low object pointers to be converted from one type into an-
+other type, for example by treating an instance of a derived
+class as if it were an instance of one of its ancestor classes.
+Doing so allows code to be reused more easily and is valid
+because the data layout is such that an object from a de-
+rived class contains the ﬁelds of its parent classes at the same
+relative oﬀsets from each other.
+
+In our discussion on the safety of type conversions (or
+typecasts), we will use the following terminology: the run-
+time type refers to the type of the constructor used to create
+the object, the source type is the type of the pointer that is
+converted, and the target type is the type of the pointer after
+the type conversion. Since the program may treat objects
+as if they are instances of their ancestor types, an object
+pointer should always refer to an object with a run-time type
+that is either equal to or a descendant of the pointer type.
+Therefore, a type conversion is always permissible when the
+target type is an ancestor of the source type. A compiler
+can verify such casts statically, because if the source type is
+a descendant of the target type it implies that the run-time
+type is also a descendant. We refer to this type of conversion
+as an upcast.
+
+If, on the other hand, the target type is a descendant of the
+source type, the conversion may or may not be permissible
+depending on whether the run-time type is either equal to or
+a descendant of the target type. This is impossible to verify
+in the general case at compile time because the run-time type
+is not known to the compiler, due to inter-procedural/inter-
+component data ﬂows. We refer to this type of conversion
+as a downcast. Downcasts require run-time veriﬁcation to
+ensure type safety. Incorrect downcasts may allow attackers
+to exploit diﬀerences in the memory layout or semantics of
+the ﬁelds between the target type and run-time type.
+
+The C++ programming language permits both upcasts
+and downcasts and allows the programmer to specify whether
+downcasts should be checked at run time. Speciﬁcally, the
+language provides three fundamental types of casts: rein-
+terpret_cast, dynamic_cast, and static_cast. Dynamic
+casts are enforced at run time with an explicit type check
+
+518and are therefore a safe but expensive way to ensure type
+safety. Static casts on the other hand only verify whether
+the conversion could be a valid upcast or downcast based
+on the source and target types. This lack of an online check
+can easily lead to type confusion when the underlying type
+observed at run time diﬀers from the expected type in the
+source code.
+
+As an example, in V8Clipboard in Chrome 26.0.1410.64,
+
+we ﬁnd the following static cast:
+
+static_cast<HTMLImageElement*>(node)->cachedImage()
+
+Here, the program explicitly casts an image node to an
+HTMLImageElement without properly checking that it is of
+the right type. Unfortunately, node could be an SVG im-
+age, which is of a sibling class and has a much smaller
+vtable than HTMLImageElement. Note that the program im-
+mediately calls cachedImage() on the invalid object which
+leads to a virtual function call that erroneously interprets
+the memory adjacent to the SVG image’s vtable as code
+pointers.
+
+If the program would check all static casts dynamically,
+we would not run into the type confusion problem (except
+for explicitly forced “problems” through reinterpreted casts).
+However, casting is such a common operation that the over-
+head of checking all static casts dynamically is signiﬁcant
+and therefore, C++ allows the programmer to choose an
+explicit run-time cast only where “needed” (according to the
+programmer).
+
+For completeness, we mention that the last form of cast-
+ing, reinterpret_cast, forces a reinterpretation of a mem-
+ory area into a diﬀerent type.
+It allows a programmer to
+explicitly break underlying type assumptions.
+2.2 Defenses against type confusion
+
+In recent years, several projects have tried to address the
+type confusion problem. There are two main types of ap-
+proaches: those based on vtable pointers embedded in the
+objects and those based on disjoint metadata. Solutions
+based on vtable pointers have the advantage that they do
+not need to track active objects but they have the fundamen-
+tal limitation that they cannot support non-polymorphic
+classes, which do not have vtables, without breaking binary
+compatibility.
+
+Examples of vtable-based solutions are UBSan [20] and
+Clang Control-Flow Integrity [4] (CFI). UBSan instruments
+static casts to execute an explicit run-time check, eﬀectively
+turning them into dynamic casts. UBSan requires manual
+blacklisting to prevent failure on non-polymorphic classes.
+Unfortunately, the existing type check infrastructure that
+is available in C++ compilers is inherently slow (as it was
+designed under the assumption that only few dynamic checks
+would be executed with the majority of checks being static).
+This is another reason why type-safety solutions did not see
+wide adoption. Therefore, UBSan is intended as a testing
+tool and not as an always-on solution due to its prohibitive
+overhead. Clang CFI is designed to be faster but has not
+published performance numbers. Moreover, like all solutions
+in this group, it cannot support non-polymorphic classes.
+
+CaVer [17], on the other hand, uses disjoint metadata to
+support non-polymorphic classes without blacklisting. Un-
+fortunately, the overhead is still prohibitively high due to
+ineﬃcient metadata tracking (especially on the stack) and
+slower checks, reaching up to 100% for some browser bench-
+marks. Because CaVer cannot rely on vtables (present only
+
+Checker Poly Non-poly No blacklist Tracking Threads
+(cid:88)
+UBSan
+Clang CFI (cid:88)
+(cid:88)
+CaVer
+(cid:88)
+TypeSan
+
+limited
+
+(cid:88)
+(cid:88)
+(cid:88)
+
+(cid:88)
+(cid:88)
+
+(cid:88)
+(cid:88)
+
+(cid:88)
+
+(cid:88)
+(cid:88)
+
+Table 3: High-level feature overview of checkers.
+
+Checker stack
+CaVer
+TypeSan
+
+NO PARTIAL
+(cid:88)
+
+(cid:88)
+
+global
+
+new/new[] malloc family
+
+(cid:88)
+(cid:88)
+
+NO
+(cid:88)
+
+Table 4: Allocation types tracked by checkers, see
+Section 5.1 for a detailed discussion.
+
+in polymorphic objects), it must track all live objects. In
+particular, CaVer uses red-black trees to track stack-allocated
+objects and a direct mapping scheme based on a custom
+memory allocator for heap-based objects. As a consequence,
+it has to determine the correct memory region for each pointer
+to be checked and it cannot handle stack objects shared be-
+tween threads even if proper synchronization is used in the
+application. In addition, as shown in Section 9.2, CaVer has
+poor object allocation coverage in practice, ultimately lead-
+ing to reduced type-confusion detection coverage. For ex-
+ample, CaVer reports only 24k veriﬁed casts on xalancbmk
+and none on all other SPEC CPU2006 C++ benchmarks,
+while we show that four benchmarks actually have a large
+amount of relevant casts with their total numbers is in the
+billions. As such, TypeSan is the ﬁrst solution that provides
+eﬃcient and comprehensive protection against type confu-
+sion attacks in the ﬁeld, protecting users from vulnerabilities
+not found during testing.
+
+In this paper we introduce TypeSan, a generic solution for
+typecast veriﬁcation based on object tracking, that supports
+all types of classes with no need for blacklisting. Moreover,
+we cover a very large percentage of all relevant casts at an
+acceptable overhead. Table 3 gives a high-level comparison
+of the typecast veriﬁcation solutions presented here. UBSan
+and Clang CFI are restricted to polymorphic types, with
+UBSan requiring further blacklisting to handle certain code
+bases. CaVer and TypeSan also support non-polymorphic
+types, but this comes at the cost of needing to track the
+type for each object. CaVer further comes with the limita-
+tion that threads cannot share stack objects safely even with
+proper synchronization. Table 3 and Table 4 show which al-
+location types are tracked in practice by tracking solutions.
+See Section 5.1 for a more in-depth discussion of the various
+allocation types. CaVer oﬃcially supports stack and global
+data, but missed such bad casts in our coverage tests (see
+Section 9.2).
+
+3. THREAT MODEL
+
+We assume that the attacker can exploit any type confu-
+sion vulnerability but is unable to perform arbitrary memory
+writes otherwise. Our type safety defense mechanism exclu-
+sively focuses on type confusion. Other types of vulnerabil-
+ities such as integer overﬂows or memory safety vulnerabili-
+ties are out of scope and we assume that orthogonal defense
+mechanisms protect against such vulnerabilities. Our de-
+fense mechanism tolerates arbitrary reads as we do not rely
+on secret information that is hidden from the attacker.
+
+5194. OVERVIEW
+
+TypeSan is an extension to the Clang/LLVM compiler [15]
+that detects invalid static_casts (i.e., all instances in the
+program where an object is cast into a diﬀerent type without
+using an explicit run-time check through dynamic_cast or an
+explicit override through reinterpret_cast) in legacy C++
+programs. Upon detection of an invalid cast, the program is
+terminated, optionally reporting the cause of the bad type-
+cast. TypeSan is a compiler-based solution and any C/C++
+source code can be hardened, without modiﬁcation, by re-
+compiling it with our modiﬁed clang++ compiler with the
+-fsanitize=type option and linking against the tcmalloc
+memory allocator [7] using the -ltcmalloc linker ﬂag. As
+we show in Section 9, TypeSan has reasonable performance
+for usage in production software.
+
+Figure 1 presents an overview of TypeSan. The instru-
+mentation layer consists of hooks inserted by the compiler
+to monitor object allocations and potentially unsafe casts,
+as well as a static library containing the implementations of
+those hooks. To perform its task, this layer makes use of two
+services. The type management service encodes type infor-
+mation and performs the actual typecast veriﬁcation. It in-
+cludes type information for all the types that may be used at
+run time. The instrumentation layer uses it to look up type
+information for new allocations and informs it whenever a
+cast needs to be checked. Finally, the metadata storage ser-
+vice stores a pointer-to-type mapping and can look up the
+type information of an object about to be typecast. This
+service allocates a memory area to store the mapping at run
+time. It provides an operation to bind type information to
+a pointer and to lookup a previous binding for a pointer.
+
+All mechanisms that explicitly protect from type confu-
+sion will incur two forms of run-time overhead: overhead
+for maintaining metadata (allocating and deallocating ob-
+jects) and overhead for explicit type checks at cast locations.
+We designed TypeSan to minimize the allocation/dealloca-
+tion time overhead. C++ programs are heavily aﬀected
+by allocator performance, as implicitly shown by how large
+projects tend to replace the standard memory allocator with
+high-performance allocators (tcmalloc and other allocators
+in Chrome, jealloc in Firefox). Many of the objects being
+allocated may also never be subject to downcasts, making it
+even more important to minimize the impact of type track-
+ing on such objects.
+
+In order to meet these requirements, TypeSan relies on
+a clean, uniform front-end design that ﬂags allocations and
+casts to the back-end system but introduces a completely
+diﬀerent mechanism to track type information, called the
+metadata storage service in our design. Our metadata stor-
+age service builds on the memory layout and structure in-
+herently provided by the allocator and uses this structure
+
+Figure 1: Overview of TypeSan components.
+
+to reduce the access overhead (“aligning” objects with their
+metadata). Compared to existing disjoint metadata stor-
+age layers that use diﬀerent forms of lookup functions from
+red-black trees to hashing for pointer range queries, our ap-
+proach oﬀers fast constant-time updates and lookups.
+
+For the type checking instrumentation and related data
+structures, we use a design focused on simplicity and cache-
+eﬃcient traversal. This design is eﬀective even for workloads
+with an extremely high number of casting operations. Fur-
+thermore, for performance-sensitive applications, safe oper-
+ations can be blacklisted or an approach like ASAP [24] can
+trade oﬀ security against acceptable overhead. This is an-
+other key motivation to minimize allocation-time overhead,
+as it does not scale with the number of instrumented casts
+in a program, acting as residual overhead instead.
+
+Lastly, the instrumentation layer and the metadata stor-
+age service are connected by the instrumentation layer, which
+uses the Clang/LLVM compiler framework [15] to track al-
+locations, instrument cast operations and extract type in-
+formation. The instrumentation was designed with com-
+pleteness in mind, following code patterns discovered in real-
+world programs as well as basic C/C++ constructs expected
+to be supported. Our instrumentation also allows full C-
+C++ inter-operability, a novelty compared to state-of-the-
+art solutions. This is important as some SPEC programs
+mix C-style allocation with C++ classes and browsers also
+use a mixture of C and C++ code.
+
+5.
+
+INSTRUMENTATION LAYER
+
+In this section we discuss the design of TypeSan’s instru-
+mentation layer. The instrumentation layer interacts with
+the TypeSan-hardened program by inserting hooks at rel-
+evant locations. We ﬁrst consider the instrumentation of
+allocations, including the types of allocations we support to
+be able to track run-time object types with high coverage.
+Then, we discuss the instrumentation of typecasts to be able
+to introduce type checks.
+5.1 Instrumenting allocations
+
+TypeSan adds a compiler pass to LLVM [15] to detect
+object allocations and insert instrumentation to store the
+corresponding pointer-to-type mapping. For each allocated
+object we store a pointer corresponding to the type layout
+of the object as a whole. However, keep in mind that down-
+casts in C++ might be applied not just to the allocated
+object pointer, but also to pointers internal to a given al-
+location range, speciﬁcally in the case of composite types
+(arrays, multiple inheritance, nested structs/classes). For
+example, an object of class A containing objects of classes B
+and C can be cast to B* using the original pointer while a
+cast to C* requires an oﬀset to reference the correct member
+of class A. In this scenario, the type of the internal pointer
+diﬀers from the type associated at the allocation time, which
+we need to account for in the design. For performance rea-
+sons, we chose to keep the instrumentation of the allocations
+as simple as possible and to defer handling composite types
+to the check operation itself (discussed in Section 6). This
+approach still introduces two additional requirements to our
+design. First, the metadata storage service must be able to
+retrieve the mapping for internal pointers (discussed in Sec-
+tion 7). Second, the checker needs access to the oﬀset within
+the class deﬁnition corresponding to the internal pointer. To
+support the latter, we also track the base pointer of the al-
+
+instrumentationprogramtype managementtype informationgettypeinfocheckcastmetadata storagepointer mappingbindlookup520location besides the type mapping. This design results in
+simple and low-impact instrumentation, using the metadata
+storage service to only store two pointers for each allocation
+in the program. In the following, we describe the allocation
+types we support as well as their motivation.
+
+In C++, objects may reside in global memory, stack mem-
+ory, or on the heap. These three kinds of objects have diﬀer-
+ent lifetimes and we therefore instrument them diﬀerently.
+However, other than the location where we insert the hooks
+to instrument the allocation, the single uniform metadata
+storage service allows us to to treat objects in diﬀerent mem-
+ory areas equally. This simpliﬁes our solution and improves
+performance because TypeSan must not determine where a
+pointer lives before looking it up.
+
+The initialization and reuse of the mappings in object
+metadata depend on the object’s memory area. For instance,
+we can initialize the mappings for global objects once using
+global constructors. However, for stack and heap objects,
+we need a dynamic approach.
+
+In the case of stack objects, we need to notify the metadata
+storage service to take control over the object. These ob-
+jects are not put on the regular stack but are instead moved
+to a speciﬁc memory area where metadata tracking is en-
+abled (see Section 7 for details on this operation). With this
+change, we can use the metadata storage service to create
+a mapping from the new object pointer to its metadata at
+allocation time. This design decision of moving the objects
+of interest to a separate location brings additional beneﬁts
+from a tracking perspective, since the memory location occu-
+pied by a previously tracked stack object will only be reused
+for another tracked object. During allocation, the new ob-
+ject will overwrite the old metadata, removing it from the
+system permanently. This allows us to persist the metadata
+mapping after the lifetime of a stack object, removing the
+need for explicit cleanup.
+
+A special class of stack objects (often ignored in existing
+solutions) arises when the program passes classes or structs
+by value as function arguments. To address this special case,
+TypeSan uses the same approach applied by the current
+SafeStack implementation in LLVM, moving such objects
+to a separate stack1.
+
+Not all stack objects need tracking and we optimize our so-
+lution by omitting allocation instrumentation wherever we
+can prove that the program will never cast the allocated
+stack objects. To be conservative, we verify whether the
+function itself or the functions it may call perform any rele-
+vant casts. We assume that any indirect (including virtual)
+or cross-module function calls may perform downcasts, be-
+cause for these cases we cannot statically determine that
+they do not. Using this approach, we reduce overhead with-
+out missing any checks. It is worth noting that our approach
+is more conservative than CaVer’s, which optimistically con-
+siders that such callees never attempt casts within their re-
+spective call-graphs2.
+
+For heap objects, we add instrumentation after calls to the
+new and new[] operators as well as the traditional malloc
+family of allocation functions. Although C++ structs and
+classes are expected to be allocated using new (to ensure
+calls to the appropriate constructors), we observed that one
+of the four SPEC benchmarks with downcasts, uses mal-
+
+1http://reviews.llvm.org/D14972
+2We reported this issue to the authors of CaVer.
+
+loc/realloc for allocating its C++ objects. Speciﬁcally,
+the soplex benchmark uses malloc/realloc to handle al-
+locations within its core DataSet class, which acts like an
+object pool. Other classes, such as SVSet, maintain point-
+ers to objects managed by a particular DataSet. As these
+pointers are also subject to downcasting, it is critical to track
+malloc/realloc in order to have type information available
+for checking. Tracking heap deallocation is not necessary
+as we built the metadata storage service to be robust and to
+clean stale metadata. This ensures that such metadata can-
+not inﬂuence type checks in case of an accidentally missed
+deallocation. More details can be found in Section 7.
+
+While inferring the allocation type and array size is trivial
+for new and new[] (as it is part of the syntax), this is more
+complicated for the malloc family of functions. We traverse
+the intermediate representation code to look for cast opera-
+tions applied to the resulting pointer to ﬁnd the allocation
+type. This method might fail for type-agnostic allocation
+wrappers, but such wrappers can easily be added to the set
+of allocation functions which we track. Array allocations can
+be tricky when trying to infer the element count from a mal-
+loc-like call-site, but our tracking scheme was designed to be
+agnostic to array sizes, thus mitigating potential issues. In
+practice we found no coverage issues when evaluating Type-
+San against SPEC, showcasing our ability to track relevant
+heap objects with our solution.
+
+An interesting point in heap allocations is support for al-
+locations within the standard template library (STL), which
+countless applications use for their core data structures. Luck-
+ily, STL’s template-based design means that all the code re-
+lated to data structures is located within headers included
+into every source ﬁle. This includes all their allocation wrap-
+pers, which are also templated and instantiated on a per-
+type basis. We conﬁrmed that our instrumentation correctly
+picks up the allocations within the STL data structures and
+we successfully check the downcasting operations applied to
+the individual elements.
+
+5.2 Instrumenting typecasts
+
+Whenever TypeSan encounters a downcast operation (from
+a base class to a derived class), it inserts a call to our type-
+casting veriﬁcation function. Such a cast is present in the
+code either when performing a static_cast operation be-
+tween appropriate type or when using an equivalent con-
+struct such as static C-style casts.
+In practice, downcast-
+ing can exhibit two types of behavior and we optimize our
+checker to support each one speciﬁcally. In the general case,
+the result of the static cast is the source pointer itself (with
+no added oﬀset), but with a new source-level type. This
+happens when the source base type is the primary base class
+of the derived type, which is always the case when casting
+without multiple inheritance. In this case, the TypeSan in-
+strumentation calls the checker with the value of the pointer
+and an identiﬁer corresponding to the destination type. If
+classes use multiple inheritance it can happen that a cast
+operation occurs from a secondary base class to a derived
+type.
+In this scenario, a negative oﬀset is added to the
+source pointer as transformation from an internal pointer
+(to the secondary base) to the base pointer of the object.
+The checker needs information about the resulting pointer
+to infer the appropriate oﬀset within the structure layout,
+but in case of type confusion the negative oﬀsets might make
+a valid pointer go out of bounds, making it impossible to in-
+
+521fer the appropriate type information for the object pointed
+to. For this reason, TypeSan calls a second version of the
+checker in this instance, which takes both the source and
+destination pointers as well as the type identiﬁer for the re-
+sulting type.
+
+6. TYPE MANAGEMENT SERVICE
+
+TypeSan manages metadata on a per-allocation basis. Ev-
+ery block allocated by a single malloc call, new operator,
+global variable, or stack variable is associated with at most
+a single pointer to a type information data structure. This
+data structure therefore encodes all permissible casts using
+pointers pointing into the allocated block. Any object can
+be cast back to itself using the original pointer, but com-
+position and inheritance create additional opportunities for
+casts. For example, a pointer to an object can be cast to
+any of its base classes and a pointer to a ﬁeld of an object
+can be cast to the type of the ﬁeld (and transitively to any
+type on the inheritance chain). In this section, we discuss
+the data structures used to encode this information.
+
+The type management service is responsible for associat-
+ing type layouts with allocation sites and using these layouts
+to validate downcast operations. Type checking at its core
+can be divided into two steps. The ﬁrst one is the ability
+to infer the allocation-time type associated with the pointer
+resulting from the typecast. This is the most derived type
+associated with the particular oﬀset (from the pointer to
+the allocation base) within the original allocation. Once
+this information is known, the second part of the type check
+involves the comparison of the allocation-time type with the
+type speciﬁed in the cast. The layout of the latter must be
+compatible with the former for the cast to be valid. The data
+structures employed by this service share the same purpose
+as the THTable structure in CaVer, but we further optimize
+the type checks by dividing it in in two phases.
+
+In the following sections, we describe the data structures
+
+TypeSan uses to perform these operations.
+6.1 Type layout tables
+
+Type layout tables describe each relevant oﬀset within an
+allocation to enable fast lookups of the oﬀset-speciﬁc type
+information during a check. Speciﬁcally, a type layout table
+is a list of mappings of unique oﬀsets to data ﬁelds corre-
+sponding to nested types. The list (array) starts with an
+entry for oﬀset 0 containing the unique hash corresponding
+to the type as a data ﬁeld. The layout tables incorporate
+nested types in one of two ways. As a ﬁrst option, the nested
+types can be ﬂattened into a type layout for good cache eﬃ-
+ciency during traversal. Alternatively, they can be separated
+via an indirection for better space eﬃciency. Flattening a
+nested type involves injecting an oﬀset-adjusted copy of its
+type layout into the containing type, where its type layout is
+copied and adjusted into the layout of the containing type.
+An avid reader may notice that ﬂattening can invalidate
+the property mentioned earlier that oﬀsets in the type layout
+table are unique. After all, a nested class might occur at oﬀ-
+set 0 (for example with primary base classes). This is where
+the second part of our type check, the layout compatibility
+check, comes into play. A class which includes a nested class
+at oﬀset 0 is practically layout compatible with the latter.
+Intuitively, if the next type class has another class at oﬀset
+0 of object, then we can always use the object as representa-
+tive for both types. TypeSan tracks this relationship in type
+
+relationship tables (see Section 6.2). Thus, the type layout
+table only needs to track the (unique) ”derived-most” type
+for matching oﬀsets.
+
+As mentioned earlier, ﬂattening is not compulsory, since
+the type layout table also supports indirection. In this mode,
+the data element of a particular entry includes a pointer to
+the type layout table corresponding to the nested type. In
+addition, TypeSan adds a sentinel element to the type table
+to mark the end of the nested type. This allows the traversal
+code to infer quickly whether or not it should follow the
+indirection. It skips the sentinel element if its oﬀset overlaps
+with an existing entry in the table to maintain uniqueness.
+Flattening generally improves performance at the cost of
+space. While TypeSan mostly uses the ﬂattened mode, it
+uses the non-ﬂattened mode to generate an eﬃcient array
+abstraction as the array length may be dynamic (in the lack
+of a way to optimize for performance we optimize for space).
+In particular, it replaces each nested array with a single
+indirect entry to the type layout table of the array element
+type, allowing TypeSan to support nested arrays of any size,
+without degrading checking speed.
+
+The property of enforcing unique oﬀsets in the type layout
+table allows us to implement eﬃcient traversal by ordering
+the entries by oﬀset. During indirection, the type manage-
+ment service updates the oﬀset that is being searched to
+match the follow-up type layout table (which is just a subset
+of the original type). In the case of a nested array, it updates
+the oﬀset to represent the oﬀset into the corresponding array
+element, instead of the array itself—using the array-stride
+as input. This is supported, by including the overall size of
+the type (including requested alignment) as part of the type
+layout table.
+
+When the instrumentation adds metadata at an allocation
+site, it simply requests a type layout table that corresponds
+to the type that is allocated. Type layout tables are gener-
+ated once for each type, by recursively traversing the type
+information in LLVM to ﬁnd all nested elements. For poten-
+tial array allocations, it marks the pointer to the type lay-
+out table to signal additional processing of the oﬀset. This
+processing is identical to how we deal with nested arrays.
+Accidentally marking an allocation as being of type array
+does not aﬀect correctness, it just involves a couple of extra
+instructions being executed during type lookup. As such our
+static analysis does not have to be complete as long as it is
+conservative in identifying allocations of single elements.
+
+6.2 Type relationship tables
+
+In the second stage of the type check we check for raw
+pointer compatibility between the type identiﬁed for the
+pointer and the type deﬁned in the cast. Such compati-
+bility typically happens between derived classes and their
+primary base class. As mentioned earlier, another case of
+compatibility happens between unrelated types if one of the
+types is nested in the other at oﬀset 0.
+
+Furthermore, CaVer deﬁned the concept of phantom classes:
+
+derived classes with no additional members compared to
+their base class. Sometimes the program downcasts base
+classes to such phantom classes, resulting in benign bad
+casts. Thus we also include phantom classes in our compat-
+ibility model. Using the compatibility model, we generate
+a set of type hashes corresponding to the compatible types
+for each class in the program and refer to it as a type rela-
+tionship table. Once TypeSan has extracted the type of a
+
+522pointer from the type layout table, it checks the correspond-
+ing type relationship table for the membership of the type
+deﬁned in the cast. The operation needs to ﬁnd an exact
+match to verify a cast. If it ﬁnds no match, it reports an
+error of a mismatched type.
+
+Currently we implement sets as simple vectors, with hashes
+ordered according to the type hierarchy. We found this so-
+lution to be adequate in terms of speed, but we can easily
+replace it with alternative set implementations, such as the
+fast LLVM bitset variant. Doing so is easy as the type re-
+lationships table is conceptually nothing more than a set as
+a result of the split of the type information into separate
+layout and relationship tables.
+
+By having the phantom classes be ﬁrst-class members of
+the type relationship tables, we ensure uniform support for
+them without performance degradation.
+In contrast, the
+publicly released CaVer code requires a type check restart
+for every phantom class if normal inheritance fails to ﬁnd a
+match.
+6.3 Merging type information across source ﬁles
+
+Generating large amounts of type information may ne-
+cessitate merging across diﬀerent source ﬁles—an expensive
+and potentially diﬃcult operation. We rely on the One Def-
+inition Rule (ODR) in C++ to minimize the need to merge
+information across the project. ODR states that every class
+deﬁnition across all source ﬁles linked together needs to be
+identical. C++ also requires nested and base types to be
+fully deﬁned in the source ﬁles that use them. As a result,
+the type layout information for the same type within dif-
+ferent source ﬁles is always identical. The same is true for
+the type relationship tables—except their phantom class en-
+tries. Since the phantom classes represent derived classes,
+the set of phantom classes can easily change from one source
+ﬁle to another, and merging may be necessary. TypeSan
+uses a strategy where it only needs to merge these entries in
+the type relationship tables to minimizing the merging cost.
+Any program violating the ODR would trigger error reports
+in TypeSan. This would be correct, since violating the ODR
+is type confusion in itself.
+
+7. METADATA STORAGE SERVICE
+
+In this section, we discuss the metadata storage service,
+which handles storage of metadata at run time. This service
+allows us to map from object base addresses to type lay-
+out tables at run time. Key requirements for our metadata
+storage service are (i) fast update operations and (ii) range-
+based lookups (to support interior pointers due to compo-
+sition). Related work [17, 2] has used alignment-based di-
+rect mapping schemes to track complex metadata, relying
+on dedicated custom memory allocators. Such systems often
+run into problems for stack-based memory allocations [17]
+where the allocator has no detailed knowledge of allocations.
+As a result we designed METAlloc [12], a novel object track-
+ing scheme, based on variable compression ratio memory
+shadowing, which solves these issues and allows us to have
+an eﬃcient and uniform metadata storage service for all al-
+location types.
+
+Variable compression ratio memory shadowing relies on
+the assumption that all objects on a certain memory page
+share the same alignment. A uniform alignment guarantees
+that every alignment-sized slot within the page corresponds
+to a single object, enabling the tracking of metadata at the
+
+level of slots instead of objects, while preserving correctness.
+Each page can thus be associated with an alignment and a
+metadata range, including as many entries as the number of
+alignment-sized slots in the page. Such a mapping simpliﬁes
+storage of metadata and allows us to assume a certain lay-
+out for objects on a per-page basis. Given a page table-like
+infrastructure, the mapping allows ﬁnding metadata corre-
+sponding to any particular pointer in constant time, by us-
+ing the alignment to look up the slot index and to retrieve
+the metadata stored for the appropriate slot. This mapping
+also mirrors traditional page tables as the alignment and the
+base address of the metadata range can be compressed into
+a single 64-bit value (since pointers only require 48 bits).
+We call this data-structure the metadata directory. Figure 2
+shows the mapping operation from any pointer to the cor-
+responding object metadata.
+
+An update operation with this metadata results in ﬁnding
+the metadata for the base address of the object and then up-
+dating all entries which correspond to the object range. The
+number of entries which need to be updated is the number
+of alignment-size slots that the object spans across, making
+it critical to select the largest possible alignment to improve
+update performance. This is where the variable compres-
+sion ratio comes into play, with large objects having larger
+alignments, thus their metadata is compressed relative to
+their size. The system also works with the default 8-byte
+alignment of objects in existing systems, but the update op-
+eration would end up too costly for stack and heap objects.
+Using alignments which are too large can also generate in-
+creased memory fragmentation resulting in unnecessary per-
+formance overhead, making it critical to select the most ap-
+propriate alignments.
+
+In the case of global memory, the overhead introduced
+by the update operations rarely aﬀects the performance of a
+running program, thus we decided to leverage the existing 8-
+byte alignment applicable for global objects. We update the
+metadata directory entries to track all loaded sections when-
+ever we detect that a new shared object has been loaded into
+the address space of the program.
+
+For heap allocations, tcmalloc [7] (the allocator used by
+the Chrome browser and other Google products) already
+ensures that every memory page under its control contains
+only objects of the same size-class and alignment. It enforces
+this property to eﬃciently generate free lists, thus ensuring
+our assumptions for free, without needing to perform any
+changes to the allocation logic. We only extended tcmalloc
+to track the metadata directory entries whenever a memory
+page is associated with a certain size-class, which happens
+rarely in practice.
+
+Stack allocations are challenging, as they can be subject
+to ABI restrictions. We mitigate this limitation by mov-
+ing relevant objects to a secondary stack similar to the op-
+erating principles of SafeStack [14]. SafeStack is eﬀective
+at moving dangerous stack allocations to a secondary stack
+with practically no overhead and minimal impact on ap-
+plication compatibility. We use the instrumentation layer,
+as mentioned earlier, to tell the metadata storage service
+about stack objects, which are then moved to a secondary
+stack tracked by the metadata directory, where we enforce
+a 64-byte alignment for each object. ABI restrictions are
+not applicable, since all tracked stack objects are local vari-
+ables, whose location can be freely chosen by the compiler.
+The 64-byte alignment is reasonable as we only move a small
+
+523Figure 2: Mapping from a pointer to a metadata
+entry. The page component is used to look up the
+start address of the metadata region and the align-
+ment. While the latter together with the page oﬀset
+is used to compute the oﬀset within the metadata
+region.
+
+subset of stack objects, thus overall memory fragmentation
+of the program is limited.
+
+As mentioned earlier in Section 5, deallocation of heap
+objects is handed internally by the metadata storage service
+and no extra instrumentation is needed. While the stack
+contains only tracked objects, thus metadata will always be
+up to date with allocations, tcmalloc does manage all heap
+objects, including untracked ones. As such, we extended tc-
+malloc to conservatively assume that every new allocation
+is untracked and to clear stale metadata associated with
+any new allocation if it detects such. This approach mini-
+mizes the overhead when metadata is used sparingly, while
+ensuring that stale metadata can never aﬀect untracked al-
+locations.
+
+Moreover, our solution is not aﬀected by thread concur-
+rency. The metadata directory is only updated when mem-
+ory is mapped in from the system. At this point all the
+entries read/written during this operation are the ones cor-
+responding to the allocation range, which is still in sole con-
+trol of the running thread. The metadata entries are also
+updated only during object allocation and the entries writ-
+ten are unique to the allocation range, thus they do not
+interfere with concurrent lookups. The update operation de-
+pends only on the metadata directory entry corresponding
+to the pointer itself, which cannot be subject to a concurrent
+write.
+
+8. LIMITATIONS
+
+Our approach is based on an LLVM-instrumentation pass
+that reasons on the clang and LLVM IR level, therefore
+source code in either C or C++ is required. Any alloca-
+tions or casts in assembly are not supported.
+
+As stated in our treat model (and similar to related work),
+we assume that the attacker has no unrestricted write primi-
+tive at their disposal. We therefore do not protect our meta-
+data against malicious writes. Any metadata protection
+mechanism is orthogonal to this work and equally applies
+to other protection systems which complement TypeSan.
+
+To support combined protections, TypeSan deliberately
+imposes as few restrictions and changes in the memory lay-
+out as possible.
+It already integrates with SafeStack, a
+fast stack protection solution oﬀered by compilers today.
+Similarly, while TypeSan makes a design assumption about
+the heap allocator, it is compatible with arguably the two
+most commonly used custom memory allocators: tcmalloc
+(Chromium) and jemalloc (Firefox and Facebook). When
+
+combined with other memory safety solutions, TypeSan can
+preserve metadata integrity by construction. When deployed
+standalone, our design is amenable to existing low-overhead
+metadata protection techniques, such as APM [8] or write-
+side SFI (e.g., pointer masking). The overhead of such tech-
+niques is amortized across all defense solutions. For exam-
+ple, if we employ SafeStack and we expect SafeStack (already
+in clang) to be adequately protected moving forward due to
+recent attacks [8, 19], TypeSan can beneﬁt from the same
+metadata protection guarantees at no additional cost. Note
+that TypeSan tolerates arbitrary reads as we do not rely on
+secret information hidden from the attacker.
+
+Custom memory allocators (CMAs) can prohibit Type-
+San from appropriately tracking heap allocations. Unfortu-
+nately, this is a fundamental limitation for instrumentation
+systems which rely on object information tracking. TypeSan
+uses tcmalloc as the back-end allocator. This is a suitable
+replacement for other general purpose allocators, but objects
+allocated within CMAs (such as pool or SLAB allocators)
+will not be tracked by our system.
+
+9. EVALUATION
+
+To show that TypeSan achieves higher coverage and lower
+overhead than previous solutions, we evaluated our proto-
+type using a number of demanding CPU-intensive (and cast-
+intensive) workloads. We test Firefox because browsers
+are a common target for attackers of type confusion vul-
+nerabilities, given the fact that they are usually written in
+C++ for performance reasons and have a large attack sur-
+face because of the fact that they provide a substantial API
+to foreign Javascript code. We benchmarked Firefox us-
+ing the Octane [9], SunSpider [10], and Dromaeo [6] bench-
+marks. Octane and SunSpider focus on Javascript perfor-
+mance, while Dromaeo has subtests for both Javascript and
+the DOM. Moreover, we implemented our own microbench-
+marks to isolate the overhead and report worst-case ﬁgures
+for TypeSan and existing solutions. In addition, we run the
+SPEC CPU2006 C++ benchmarks, which all heavily stress
+our allocator instrumentation and some (e.g., dealII and om-
+netpp) our typecast instrumentation.
+
+In our evaluation, we consider a number of diﬀerent sys-
+tem conﬁgurations. Our baseline conﬁguration compiles with
+Clang 3.9 [15] at the default optimization levels. The base-
+line is not instrumented but does use the tcmalloc [7] alloca-
+tor to report unbiased results, given that tcmalloc generally
+introduces a speedup that should not be attributed to Type-
+San. In addition to the baseline, we have the TypeSan and
+TypeSan-res conﬁgurations. The former instruments every
+possible cast while the latter does not instrument any casts.
+The TypeSan-res conﬁguration shows to what extent a sys-
+tem like ASAP [24] can reduce the performance impact of
+our instrumentation (trading oﬀ security) when only a small
+performance budget is available. We ran our benchmarks on
+an Intel Core i7-4790 CPU with 16 GB of RAM, using the
+Ubuntu 15.10 Linux distribution.
+9.1 Performance
+9.1.1 Microbenchmarks
+To verify that TypeSan provides low allocation-time and
+typecast-time overhead, we created microbenchmarks that
+measure how long these operations take, both on the stack
+and on the heap. To compare our results against state-of-
+
+524Figure 3: Allocation performance as a function of
+allocated object size.
+
+Figure 4: Allocation performance as a function of
+allocated object count.
+
+the-art solutions, we compiled CaVer [17] from source [16]
+and conﬁgured in the same way as TypeSan—except that
+we do not use tcmalloc since CaVer ships with its own cus-
+tom allocator. To prevent the target operations from being
+removed by optimizations, we switched to the -O1 optimiza-
+tion level for this experiment. To isolate the overhead, we
+measured the impact of (i) the number of allocated stack
+objects and (ii) the object size. The former is important
+since CaVer tracks stack objects with red-black trees, whose
+performance degrades with the number of objects. The lat-
+ter is important since TypeSan needs to initialize multiple
+metadata entries for large objects, incurring more overhead.
+Figure 3 depicts the impact of the object size on alloca-
+tion performance when no other stack objects are present.
+Allocating an object on the stack is almost instantaneous for
+the baseline and takes a ﬁxed but long time for CaVer. For
+TypeSan, allocation time on the stack is proportional to the
+object size as multiple metadata entries need to be initial-
+ized for large objects. However, even for objects as large as
+8KB, TypeSan is still faster than CaVer. Small objects up
+to 128 bytes take only 0.5ns extra to allocate with TypeSan,
+while CaVer adds at least 48.8ns even for these small (and
+common) allocations. On the heap, allocation time grows
+linearly with the allocation size in all cases. Overall, Type-
+San is close in performance to the baseline while CaVer adds
+considerable overhead. For heap allocations up to 128 bytes,
+TypeSan adds at most 7.0ns overhead while CaVer adds at
+least 26.7ns.
+
+We believe that it is unlikely for programs to frequently
+allocate large, bloated classes without using them and thus
+hiding the allocation overhead. As further mitigation to the
+scaling based on the stack object size, it is possible to extend
+TypeSan to use additional secondary stacks with increased
+alignments for such large classes. These results support our
+claims that TypeSan is particularly suitable for applications
+that allocate many objects, especially on the stack.
+
+Figure 4 and Figure 5 show the impact of the number of
+allocated stack objects on allocation and typecast perfor-
+mance (respectively), using an object size of 16 bytes. The
+overhead patterns are in the same region for both scenarios.
+CaVer’s overhead on the stack increases with the logarithm
+of the number of objects (due to the use of red-black trees)
+
+Figure 5: Typecast performance as a function of al-
+located object count.
+
+while TypeSan’s does not depend on the number of allocated
+objects. Even at relatively low allocation counts, CaVer’s
+stack allocations are much more expensive than TypeSan’s.
+For every typecast, in turn, TypeSan adds an overhead of
+only 3.8ns, regardless of whether the object is allocated on
+the stack or on the heap and regardless of the number of
+allocated objects. CaVer’s typecast overhead is higher in all
+cases. In particular, the heap overhead is a constant 13.6ns,
+while the stack overhead starts at 11.0ns and increases with
+the number of allocated objects.
+
+9.1.2 Performance overhead
+Table 5 reports our performance on the SPEC CPU2006
+C++ benchmarks [13] and Firefox. The ﬁrst four SPEC
+benchmarks perform static typecasts while the others do
+not. In the latter case, the overhead stems from TypeSan
+having to still track objects that cannot be statically and
+conservatively proven not be typecast during the execution.
+In the default conﬁguration, overheads range from negligi-
+ble to moderate and the overheads on the benchmarks re-
+ported by CaVer [17] are much lower. In particular, CaVer
+
+525dealII
+soplex
+omnetpp
+xalancbmk
+namd
+povray
+astar
+geomean
+geomean
+ﬀ-sunspider
+ﬀ-octane
+ﬀ-drom-js
+ﬀ-drom-dom
+geomean
+
+casts TypeSan
+yes
+yes
+yes
+yes
+no
+no
+no
+yes
+both
+
+(0.2)
+(0.7)
+(1.7)
+(0.4)
+(0.1)
+(0.3)
+(0.5)
+
+30.8
+1.8
+27.2
+7.1
+-0.6
+23.9
+-0.2
+13.2
+12.1
+40.6
+18.6
+12.4
+71.2
+33.9
+
+(1.4)
+(5.1)
+(1.5)
+(1.5)
+
+TypeSan-res
+(0.1)
+(0.8)
+(3.0)
+(0.3)
+(0.1)
+(0.2)
+(0.5)
+
+3.6
+1.5
+2.4
+4.4
+-0.5
+22.6
+0.1
+6.4
+4.6
+11.4
+2.8
+4.0
+43.5
+14.3
+
+(1.1)
+(0.9)
+(1.7)
+(0.6)
+
+Table 5: Performance overhead on the SPEC
+CPU2006 C++ benchmarks and Firefox (%), stdev
+in parentheses.
+
+reported four times our overhead (29.6%) on xalancbmk and
+20.0% on soplex while ours is negligible. Povray stands out
+for having high overhead despite its lack of casts. This is
+mostly due to the many stack objects allocated in a recur-
+sion between the functions Ray_In_Bounds and Intersec-
+tion. Other than this special case, overheads are lowered
+by reducing the number of checks (a la ASAP [24]). The
+negative overhead for namd may be explained by variations
+in memory layout [18]. For example, in all but one case, our
+TypeSan-res conﬁguration can greatly bring down the over-
+head. The overhead for Firefox is unfortunately somewhat
+higher, especially for the Dromaeo DOM workload. The high
+overload is most likely due to the fact that Firefox performs
+many object allocations, especially on the stack. On aver-
+age, however, our overhead is close to half of the overhead
+reported by CaVer (64.6%). The results for the TypeSan-res
+conﬁguration show that this overhead can be reduced even
+further by selectively instrumenting casts. Note that our
+coverage on Firefox is considerably lower than on the other
+benchmarks mostly due to the use of CMAs (though still
+much higher than the competition, see Table 8), so extend-
+ing our solution to cover the remaining casts could increase
+the overheads reported here.
+
+9.1.3 Memory overhead
+Table 6 reports our memory usage on the SPEC CPU2006
+C++ benchmarks and Firefox, measured in terms of binary
+size (static) and the maximum resident set size (dynamic).
+While TypeSan generally introduces nontrivial memory over-
+head, we believe this is worthwhile (and acceptable in prac-
+tice), given the security it oﬀers with negligible performance
+overhead. Moreover, compared to CaVer [17], our relative
+run-time memory overhead is much lower for the two SPEC
+benchmarks they considered (9% vs. 56% on xalancbmk and
+1% vs. 150% on soplex).
+It is unfortunately impossible to
+compare our memory overhead on Firefox as we measured
+a diﬀerent version than the one reported by CaVer. The
+negative memory overhead for Dromaeo-DOM may be ex-
+plained by the fact that this benchmark runs for a ﬁxed
+amount of time, completing fewer runs when the browser
+is slowed down through our instrumentation. Our memory
+overhead is mostly due to the metadata storage service it-
+
+binary size
+base
+ts
+0.3
+3.1
+0.4
+1.0
+0.6
+0.0
+4.1
+
+0.6
+5.2
+0.8
+1.4
+1.2
+0.3
+7.6
+
+namd
+dealII
+soplex
+povray
+omnetpp
+astar
+xalancbmk
+geomean
+159.1
+ﬀ-sunspider
+159.1
+ﬀ-octane
+ﬀ-drom-js
+159.1
+ﬀ-drom-dom 159.1
+geomean
+
+318.6
+318.6
+318.6
+318.6
+
+inc% base
+
+resident set
+ts
+
+81.6
+69.3
+112.7
+45.2
+90.4
+597.1
+85.8
+118.0
+100.2
+100.2
+100.2
+100.2
+100.2
+
+50.9
+818.6
+560.9
+8.7
+157.8
+310.4
+451.3
+
+491.1
+844.4
+572.2
+4232.0
+
+56.9
+1453.1
+568.4
+18.8
+224.5
+314.4
+492.7
+
+928.2
+1534.4
+1005.8
+4015.7
+
+inc%
+11.7
+77.5
+1.3
+117.4
+42.3
+1.3
+9.2
+31.7
+89.0
+81.7
+75.8
+-5.1
+19.9
+
+Table 6: Memory usage for the SPEC CPU2006
+C++ benchmarks and Firefox (MB), ts=TypeSan.
+
+self. As future work, it is possible to share this infrastructure
+and its memory overhead with other defenses that maintain
+per-object metadata (e.g., bounds checking), reducing the
+memory usage of the combined system.
+9.2 Coverage
+9.2.1 Typecast coverage test suite
+To test the correctness of TypeSan and future type-confusion
+
+detection systems, we developed a test suite for a wide range
+of diﬀerent code constructs that might aﬀect typecast saniti-
+zation. The test cases covered by the test suite are inspired
+by our extensive experience with real-world C++ programs.
+Our test suite is available as part of the open source repos-
+itory of TypeSan to help future researchers in testing their
+systems. The test suite veriﬁes correctness using three diﬀer-
+ent dimensions: allocation type, composition type, and cast
+type. The test suite allows diﬀerent conﬁgurations from each
+dimension to be combined and tested simultaneously.
+
+Every test allocates an object of type AllocationType
+using the desired conﬁguration. It then sends a pointer to
+the allocated object to a function, which derives a pointer
+to a member of type BaseType nested into AllocationType
+with the desired composition type conﬁguration. Finally,
+we downcast the pointer to a type derived from BaseType,
+called DerivedType. We implement the functions in diﬀerent
+source ﬁles to uncover any potential bugs in interprocedural
+cross-module static analysis in the checker. Other than false
+negatives, the test suite also checks for false positives, by
+replacing the BaseType with a derived type of DerivedType
+in AllocationType.
+
+Our test suite considers the following allocation types:
+stack object, stack array, struct argument passed by value,
+global object, global array, new / new[] (including over-
+loaded operator), and malloc/calloc/realloc (including ar-
+rays). For array types, we also consider multidimensional
+arrays where possible. We consider the following composi-
+tion types (the relationship of BaseType with respect to Al-
+locationType): equivalence, nested, nested array element,
+and inheritance (primary, secondary, and virtual). Finally,
+we support the following cast types: from primary base to
+derived type, from secondary base to derived type, and from
+primary base to a phantom class of the real type.
+
+TypeSan successfully passes all combinations of these con-
+ﬁgurations, showcasing our coverage on a wide range of
+
+526stack
+
+allocations
+heap
+322
+40
+441
+414
+10
+36
+13
+2,458
+
+5,231
+447
+85
+3,216
+18
+255
+11
+185,908
+
+global
+1,125
+161
+623
+2,263
+4
+200
+7
+42,710
+
+casts
+
+types
+
+716
+2
+449
+2,688
+0
+0
+0
+68,369
+
+1,238
+311
+568
+1,768
+16
+257
+18
+38,764
+
+dealII
+soplex
+omnetpp
+xalancbmk
+namd
+povray
+astar
+ﬁrefox
+
+Table 7: Instrumentations.
+
+code constructs. For comparison, we also tested CaVer [16]
+and found that it only passes the following allocation types:
+global object and new / new[] (including overloaded opera-
+tor). CaVer also reported false positives when nested arrays
+were used for the composition. We contacted the authors
+about all the tests that failed, but we have not received an
+explanation or a ﬁx for these issues.
+
+9.2.2 Coverage on benchmarks
+Table 7 shows the number of code locations where we in-
+sert instrumentation. Note that the information about al-
+locations is based on the source code because it cannot be
+easily recognized in the binary due to inlining. The num-
+ber of cast checks and types are based on the ﬁnal binary
+to make them comparable to CaVer [17]. The number of
+checks in the source code is considerably lower (for example
+19,578 for Firefox), presumably due to optimizations that
+cause code to be duplicated. Compared to CaVer, we insert
+slightly fewer checks in Firefox, more in Xalanc and the same
+number in Soplex. This may be due to diﬀerences in versions
+or compiler (settings). We generate more type information
+than CaVer on Firefox and Soplex, but less on Xalanc. This
+may be due to diﬀerences in representation of type infor-
+mation. In all cases, we insert more instrumentation than
+UBSan does [17].
+
+Table 8 shows the typecast coverage of TypeSan compared
+to state-of-the-art solutions, CaVer [17] in particular. Cov-
+erage percentages are computed as the fraction of non-null
+casts correctly checked by the system—missing checks are
+due to inability to correctly track the corresponding ob-
+ject. As such, it is an indication of the security provided
+by the system. TypeSan reports over 89% coverage on each
+of the relevant SPEC benchmarks, and 100.0% on all but
+one. Unfortunately, coverage is not as high on Firefox. We
+have found that this is due to the widespread use of pool al-
+locators, which violate the assumption made by our system
+(as well as other object tracking systems) that objects are
+allocated individually. This issue could be solved by modi-
+fying Firefox to allocate objects directly. This may be viable
+performance-wise due to the allocation performance oﬀered
+by tcmalloc. While CaVer does not report per-benchmark
+results, they report a total of 1,077k veriﬁed casts. As such,
+our coverage is approximately more than 300,000 times as
+high. For both SPEC and Firefox, Table 8 shows that we
+track many more allocated objects than CaVer. This ex-
+plains that we are able to check more casts despite a similar
+number of instrumentation sites—casts can only be checked
+if type information metadata was stored at allocation time.
+As shown in Table 8, we provide security far superior to the
+
+allocations
+TypeSan CaVer
+
+casts
+non-null TypeSan %
+
+597m
+dealII
+21m
+soplex
+264m
+omnetpp
+4,538m
+xalancbmk
+463m
+ﬀ-sunspider
+967m
+ﬀ-octane
+ﬀ-drom-js
+15,824m
+ﬀ-drom-dom 301,540m
+ﬀ-total
+
+318,793m 15,530k
+
+1,058
+
+278k
+
+209k
+
+3,596m
+3,596m 100.00
+100.00
+209k
+2,014m 100.00
+2,014m
+254m 89.52
+284m
+92m 31.43
+293m
+122m 12.35
+991m
+12,976m
+3,032m 23.37
+46,961m 21,253m 45.26
+61,222m 24,500m 40.02
+
+CaVer %
+
+0
+0
+0
+24k
+
+0.00
+0.00
+0.00
+0.01
+
+1,077k
+
+0.00
+
+Table 8: Typecast coverage.
+
+current state of the art while improving performance at the
+same time.
+
+10. RELATED WORK
+
+To the best of our knowledge, UBSan [20] and CaVer [17]
+are the only other systems that perform veriﬁcation at cast
+time like TypeSan. Our system is inspired by CaVer and has
+considerable similarities with it. In particular, it shares the
+same beneﬁts with regard to UBSan: we do not rely on run-
+time type information (RTTI) and therefore we can handle
+non-polymorphic classes and protect binaries without the
+need for manually maintained blacklists. Moreover, as we
+have shown in our evaluation, we introduce less overhead
+than CaVer, which in turn has shown by its authors to be
+more eﬃcient than UBSan.
+
+Compared to CaVer, we have a similar instrumentation
+layer based on an LLVM instrumentation pass, but we have
+completely redesigned the metadata storage mechanism. In
+particular, we use a uniform variable compression ratio mem-
+ory shading scheme with oﬀ-the-shelf allocation strategies,
+rather than a purpose built custom memory allocator of the
+heap and the red-black trees used for the stack in CaVer.
+Our approach is more eﬃcient for both insertions (object
+allocations) and lookups (typecast checks) because it does
+not require identifying the type of the allocation (due to
+its uniform nature) and it does not incur the signiﬁcant and
+non-linear overhead that red-black trees bring to trivial stack
+allocations. Moreover, our solution is not aﬀected by thread
+concurrency. This is a major simpliﬁcation compared to
+CaVer, which uses per-thread red-black trees.
+
+Another solution that achieves similar goals as ours is pre-
+venting calls through incorrect virtual method tables (vta-
+bles). For example, Bounov et al. [3] present an approach
+that can eﬃciently verify for each virtual call that the vtable
+is valid for the static type through which the call is per-
+formed. This mitigates some type confusion vulnerabilities,
+but such solutions cannot protect non-polymorphic classes
+because they do not have vtables. Moreover, this solution
+only detects type confusion when the object is subjected
+to a virtual call, thus missing potential memory corruption
+from a mismatched layout in other parts of the code. Clang
+CFI [4] uses such a system to check cast operations involv-
+ing polymorphic classes, but there is no publicly available
+evaluation of the system and it is still restricted to a subset
+of downcast operations.
+
+On binaries without source code, Dewey and Giﬃn [5]
+show how data ﬂow (reaching deﬁnition) analysis may help
+to determine bounds on vtables and detect type confusion
+statically by ensuring that a virtual function call does not
+stray beyond the bounds of the vtable. As noted by the
+authors, their analysis is prone to false positives and false
+
+527negatives and therefore more suited to reducing the number
+of type confusion bugs prior to deployment.
+
+Finally, CFI [1] and other advanced protection mecha-
+nisms for forward edges in C++ programs [21, 23, 22, 14]
+limit the wiggle room that attackers have to divert control
+via indirect control transfers. However, as type confusion is
+mostly a data problem, such solutions only address it partly.
+Similarly, VTable protection schemes [25, 11], may check the
+types of virtual calls or the sanity of vtable pointers, but do
+not prevent the misuse of type confusion in general.
+
+11. CONCLUSION
+
+Type confusion vulnerabilities play an important role in
+modern exploits as shown in recent attacks against Google
+Chrome or Mozilla Firefox. Existing solutions that detect
+type confusion exploits are (i) incomplete, missing a large
+number of typecasts and (ii) prohibitively slow, thereby hin-
+dering general adoption.
+
+We presented TypeSan, an LLVM-based type-confusion
+detector that leverages an optimized allocator to store meta-
+data in an eﬃcient way to reduce the overhead for updating
+metadata. Building on several optimizations for both the
+underlying type checks and the metadata handling, we re-
+duce the performance overhead by a factor 3–6 compared to
+the state of the art. Our performance ﬁgures suggest Type-
+San can be used as an always-on solution in practical set-
+tings. In addition, TypeSan is complete and no longer misses
+typecasts on either the stack or between C and C++ object
+interactions. As we show in the SPEC CPU2006 bench-
+marks, such interoperability issues between programming
+languages cause prior work to miss a large number of casts.
+
+12. ACKNOWLEDGMENTS
+
+We thank the anonymous reviewers for their feedback.
+This work was supported, in part, by NSF CNS-1464155 and
+CNS-1513783, the European Commission through project
+H2020 ICT-32-2014 “SHARCS” under Grant Agreement No.
+64457, and the Netherlands Organisation for Scientiﬁc Re-
+search through the grant NWO 639.023.309 VICI “Dowsing”.
+
+13. REFERENCES
+[1] M. Abadi, M. Budiu, U. Erlingsson, and J. Ligatti.
+
+Control-ﬂow integrity. In CCS, 2005.
+
+[2] P. Akritidis, M. Costa, M. Castro, and S. Hand.
+
+Baggy bounds checking: An eﬃcient and
+backwards-compatible defense against out-of-bounds
+errors. In USENIX Security, 2009.
+
+[3] D. Bounov, R. G. Kıcı, and S. Lerner. Protecting c++
+
+dynamic dispatch through vtable interleaving. In
+NDSS, 2016.
+
+[4] Clang. Clang 3.9 documentation - control ﬂow
+
+integrity.
+http://clang.llvm.org/docs/ControlFlowIntegrity.html.
+[5] D. Dewey and J. Giﬃn. Static detection of c++ vtable
+
+escape vulnerabilities in binary code. In NDSS, 2012.
+[6] T. M. Foundation. Dromaeo, javascript performance
+
+testing. https:
+//www.webkit.org/perf/sunspider/sunspider.html.
+
+[7] S. Ghemawat and P. Menage. Tcmalloc:
+
+Thread-caching malloc. http:
+//goog-perftools.sourceforge.net/doc/tcmalloc.html,
+2009.
+
+[8] E. Goktas, R. Gawlik, B. Kollenda,
+
+E. Athanasopoulos, G. Portokalidis, C. Giuﬀrida, and
+H. Bos. Undermining information hiding (and what to
+do about it). In USENIX Security, 2016.
+
+[9] Google. Octane benchmark.
+
+https://code.google.com/p/octane-benchmark.
+
+[10] Google. Sunspider benchmark. https:
+
+//www.webkit.org/perf/sunspider/sunspider.html.
+
+[11] I. Haller, E. Goktas, E. Athanasopoulos,
+
+G. Portokalidis, and H. Bos. Shrinkwrap: Vtable
+protection without loose ends. In ACSAC, 2015.
+
+[12] I. Haller, E. van der Kouwe, C. Giuﬀrida, and H. Bos.
+
+METAlloc: Eﬃcient and comprehensive metadata
+management for software security hardening. In
+EuroSec, 2016.
+
+[13] J. L. Henning. Spec cpu2006 benchmark descriptions.
+
+ACM SIGARCH Computer Architecture News,
+34(4):1–17, 2006.
+
+[14] V. Kuznetsov, L. Szekeres, M. Payer, G. Candea,
+R. Sekar, and D. Song. Code-pointer integrity. In
+OSDI, 2014.
+
+[15] C. Lattner and V. Adve. Llvm: A compilation
+
+framework for lifelong program analysis &
+transformation. In CGO, pages 75–86. IEEE, 2004.
+[16] B. Lee, C. Song, T. Kim, and W. Lee. Caver source
+
+code. https://github.com/sslab-gatech/caver.
+
+[17] B. Lee, C. Song, T. Kim, and W. Lee. Type casting
+veriﬁcation: Stopping an emerging attack vector. In
+USENIX Security, 2015.
+
+[18] T. Mytkowicz, A. Diwan, M. Hauswirth, and P. F.
+
+Sweeney. Producing wrong data without doing
+anything obviously wrong! ACM Sigplan Notices,
+44(3):265–276, 2009.
+
+[19] A. Oikonomopoulos, E. Athanasopoulos, H. Bos, and
+
+C. Giuﬀrida. Poking holes in information hiding. In
+USENIX Security, 2016.
+
+[20] G. C. Project. Undeﬁned behavior sanitizer.
+
+https://www.chromium.org/developers/testing/
+undeﬁnedbehaviorsanitizer.
+
+[21] C. Tice, T. Roeder, P. Collingbourne, S. Checkoway,
+
+U. Erlingsson, L. Lozano, and G. Pike. Enforcing
+forward-edge control-ﬂow integrity in gcc & llvm. In
+USENIX Security, 2014.
+
+[22] V. van der Veen, D. Andriesse, E. G¨okta¸s, B. Gras,
+L. Sambuc, A. Slowinska, H. Bos, and C. Giuﬀrida.
+Practical Context-Sensitive CFI. In CCS, 2015.
+
+[23] V. van der Veen, E. Goktas, M. Contag,
+
+A. Pawlowski, X. Chen, S. Rawat, H. Bos, T. Holz,
+E. Athanasopoulos, and C. Giuﬀrida. A tough call:
+Mitigating advanced code-reuse attacks at the binary
+level. In IEEE S&P, 2016.
+
+[24] J. Wagner, V. Kuznetsov, G. Candea, and J. Kinder.
+
+High system-code security with low overhead. In IEEE
+S&P, 2015.
+
+[25] C. Zhang, S. A. Carr, T. Li, Y. Ding, C. Song,
+
+M. Payer, and D. Song. Vtrust: Regaining trust on
+virtual calls. In NDSS, 2016.
+
+528

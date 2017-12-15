@@ -1,0 +1,1342 @@
+Too LeJIT to Quit:
+
+Extending JIT Spraying to ARM
+
+Wilson Lian
+UC San Diego
+
+wlian@cs.ucsd.edu
+
+Hovav Shacham
+UC San Diego
+
+hovav@cs.ucsd.edu
+
+Stefan Savage
+UC San Diego
+
+savage@cs.ucsd.edu
+
+Abstract—In the face of widespread DEP and ASLR deploy-
+ment, JIT spraying brings together the best of code injection and
+code reuse attacks to defeat both defenses. However, to date, JIT
+spraying has been an x86-only attack thanks to its reliance on
+variable-length, unaligned instructions. In this paper, we ﬁnally
+extend JIT spraying to a RISC architecture by introducing a
+novel technique called gadget chaining, whereby high level code
+invokes short sequences of unintended and intended instructions
+called gadgets just like a function call. We demonstrate gadget
+chaining in an end-to-end JIT spraying attack against WebKit’s
+JavaScriptCore JS engine on ARM and found that existing JIT
+spray mitigations that were sufﬁcient against the x86 version of
+the JIT spraying attack fall short in the face of gadget chaining.
+
+I.
+
+INTRODUCTION
+
+It is no secret that programs are replete with bugs. Some of
+these bugs allow an attacker to subvert control of the program
+counter and divert execution away from its intended path;
+these are called control ﬂow vulnerabilities. Unfortunately
+for a would-be attacker, a control ﬂow vulnerability is not
+enough to execute arbitrary code on a remote machine. Defense
+mechanisms such as DEP and ASLR prevent attackers from
+writing code into a process’s address space and decrease the
+likelihood that triggering a control ﬂow vulnerability will cause
+an attacker’s target code to execute.
+
+JIT spraying is an attack which defeats both DEP and
+ASLR by enabling an attacker to predictably inﬂuence large
+swaths of the victim process’s executable memory. The attack
+exploits Just-in-Time compilers built into many recent lan-
+guage runtimes for the purpose of speeding up the performance
+of frequently-executed code, but it has only been demonstrated
+for the x86 architecture. More and more handheld devices,
+which are predominantly powered by ARM processors, are
+connecting to the Internet and running web browsers, making
+themselves candidates for remote exploitation. Since most
+modern web browsers implement a JavaScript runtime environ-
+ment with a fully-functioning JIT compiler, JIT spraying is a
+fantastic vector for attacking a browser. However, JIT spraying
+
+Permission to freely reproduce all or part of this paper for noncommercial
+purposes is granted provided that copies bear this notice and the full citation
+on the ﬁrst page. Reproduction for commercial purposes is strictly prohibited
+without the prior written consent of the Internet Society, the ﬁrst-named author
+(for reproduction of an entire paper only), and the author’s employer if the
+paper was prepared within the scope of employment.
+NDSS ’15, 8-11 February 2015, San Diego, CA, USA
+Copyright 2015 Internet Society, ISBN 1-891562-38-X
+http://dx.doi.org/10.14722/ndss.2015.23288
+
+has historically been limited to the x86 architecture. In this
+paper, we challenge this trend and show that JIT spraying is
+indeed a viable attack against ARM.
+
+A. Related Work
+
+History holds no shortage of techniques for remotely exe-
+cuting arbitrary code. They can be broken down into roughly
+two categories, code injection attacks and code reuse attacks.
+Code injection attacks such as Aleph One’s famous stack
+smashing attack [1] and SkyLined’s heap spraying attack [19]
+introduce new executable code into a vulnerable process’s
+address space and exploit a control ﬂow vulnerability to
+divert execution to it. Data Execution Prevention (a.k.a. DEP,
+W ⊕ X, etc.) [2] has become the standard defense against
+code injection. DEP is a defense mechanism that allows
+processes to mark certain pages of memory as non-executable
+to prevent attackers from writing their own executable code.
+Usual candidates for DEP are the process’s stack and heap,
+where an attacker can most easily inject bytes of her choosing.
+Enter code reuse attacks, which circumvent DEP by re-
+purposing instructions found within the vulnerable process’s
+own executable memory as the building blocks for malicious
+computation. Canonical examples of code reuse attacks are
+the return-to-libc attack [21] and return-oriented programming
+(ROP) [16]. The most widely deployed defense against code
+reuse attacks is known as Address Space Layout Randomiza-
+tion (ASLR). Code reuse attacks require the attacker to pin-
+point the addresses of the instructions they intend to repurpose
+for their malicious computation. ASLR makes that task more
+difﬁcult by randomizing the locations of objects in a process’s
+virtual address space. Typically these objects are the stack, the
+heap, shared libraries, and the process’s memory image.
+
+JIT spraying brings together code injection and code reuse
+in a hybrid that defeats both DEP and ASLR. In [7], Blazakis
+demonstrated JIT spraying by exploiting the insight that JIT
+compilers give attackers a tremendous amount of control over
+the contents of executable memory due to the predictable way
+immediate operands are handled. For example, consider the
+following ActionScript statement:
+
+var x = 0x3c909090 ˆ 0x3c909090 ˆ 0x3c909090;
+
+When it is compiled by the ActionScript JIT compiler, the
+following instructions are produced:
+
+b89090903c
+359090903c
+359090903c
+
+mov eax, 3c909090h
+xor eax, 3c909090h
+xor eax, 3c909090h
+
+Observe that the immediate values in the ActionScript source
+code appear directly in the code in little endian byte order.
+Remember that since they were produced by a JIT compiler,
+they are meant to be executed and therefore reside in memory
+marked executable. When executed from the second byte, the
+instruction stream instead becomes the following:
+
+90
+90
+90
+3c35
+90
+90
+90
+3c35
+...
+
+nop
+nop
+nop
+cmp al, 35h
+nop
+nop
+nop
+cmp al, 35h
+
+This “hidden” unintended instruction stream is a NOP sled.
+If execution begins at an any of the unintended instruction
+boundaries (which occur at 4 out of 5 addresses), the NOP
+sled will execute. Notice that the 0x3c bytes, which were once
+interpreted as part of the immediate operands, are now acting
+as the opcodes for cmp al instructions, which are semantic
+NOPs that consume the original xor eax opcodes—the
+0x35 bytes—as immediate operands. The chain of XORed
+immediates in the original source code can be extended, and
+as long as the most signiﬁcant byte of each immediate is 0x3c,
+the xor eax opcode will continue to be masked, preventing
+resynchronization to the intended instruction stream. Later
+down the chain, the 0x90 bytes can be replaced with the
+encodings for shellcode instructions up to 3 bytes in length.
+
+The fact that JIT spraying allows the attacker to control
+4 out of every 5 bytes in executable memory makes it a
+code injection attack that defeats DEP. Since the attacker can
+spray numerous copies of each XOR chain, each with its
+own long NOP sled and shellcode payload, JIT spraying also
+gives an attacker a high probability of defeating ASLR through
+random address guessing. Once several hundreds of megabytes
+of memory are ﬁlled with JIT spray payloads, a random jump
+has a non-negligible chance of landing in a NOP sled at the
+correct offset to execute the unintended instruction stream.
+
+Since [7], Sintsov explored the art of writing ActionScript
+JIT spray payloads for the x86 in greater depth, demonstrating
+the construction of a stage-0 JIT spray shellcode [18]. JIT
+spraying has been extended beyond the ActionScript JIT to
+other x86 JITs. In [17], Sintsov demonstrated the construction
+of an x86 JIT spraying payload with the JavaScriptCore Base-
+line JIT; and Rohlf and Ivnitskiy demonstrated JIT spraying
+on x86 against Mozilla’s JaegerMonkey and TraceMonkey
+JavaScript engines as well as unlocking the idea of ROP
+gaJITs, short instruction sequences ending in a return that can
+be sprayed multiple times into memory and cobbled together
+into a ROP attack [15].
+
+In 2011, Pete Beck [6] proposed an idea for JIT spraying
+on the ARM platform using constant pools to encode malicious
+instructions. We do not employ Beck’s idea, but in this paper,
+we exend JIT spraying to a JavaScript JIT running on the ARM
+architecture. In doing so, we make use of a concept similar to
+Rohlf and Ivnitskiy’s ROP gaJITs, but our attack is ultimately
+something quite different from ROP.
+
+B. Assumptions and Adversary Model
+
+The goal of this paper is not to highlight a particular bug
+in a piece of software, but rather to demonstrate techniques
+that may be used to construct a working end-to-end attack
+once such a vulnerability is identiﬁed. Therefore, one of the
+fundamental assumptions in this paper is that an attacker is
+able to trigger a bug in a program that causes control ﬂow to
+branch to an arbitrary address of her choosing.
+
+This control ﬂow vulnerability alone may not necessarily
+be sufﬁcient for an attacker to induce the vulnerable process to
+execute arbitrary code. We assume that the vulnerable process
+may be protected by security mechanisms such as DEP and
+ASLR, which complicate the task of launching traditional code
+injection and code reuse attacks.
+
+C. Our Contributions
+
+There is a pattern in security research whereby new attacks
+are initially designed to target
+the x86 platform. This is
+not without good reason. The x86 is undoubtedly the most
+prevalent architecture on the market. Eventually, however,
+researchers discover that the architectural features that were
+thought
+to be lynchpins of an attack are in fact merely
+implementation details. For example, Shacham’s seminal work
+on return-oriented programming was thought
+to hinge on
+speciﬁc properties of the x86 architecture such as its variable-
+length, unaligned instructions and small register ﬁle. However,
+since then, there has been an explosion of work extending
+ROP to architectures very different from the x86 such as
+SPARC [8], ARM [13], and the Zilog Z80 [9]. In this paper,
+we continue the tradition of extending attacks from the x86 to
+new architectures in the following ways:
+
+1) We show for the ﬁrst time that RISC architectures are not
+immune to JIT spraying attacks and highlight features
+in the ARM architecture that can enable an attacker to
+use a JIT compiler to inject unintended instructions into
+executable memory.
+
+2) We present a new model for JIT spraying in which
+unintended instruction execution is interweaved with ex-
+ecution of a high level language and describe a proof of
+concept attack following this model.
+
+3) We show that the state of JIT spraying defense deploy-
+ment on ARM is insufﬁcient and highlight its particular
+weaknesses and areas for improvement.
+
+JIT spraying does not constitute a vulnerability in the
+absence of some way to redirect control ﬂow. Nevertheless,
+we have shared our ﬁndings with WebKit’s security team.
+
+II. THE ARM ARCHITECTURE
+
+The ARM architecture is a reduced instruction set computer
+(RISC) architecture that has enjoyed widespread deployment
+in computing environments where low power draw is important
+such as smartphones,
+tablets, and laptops. ARM Holdings
+estimates that in 2010, ARM-based processors had seized 90%
+of the market share in both smart phones and feature phones
+as well as 70% of the portable media player market share [3].
+Most modern ARM processors support a 32-bit ad-
+dress space with 32-bit arithmetic. Chips implementing the
+
+2
+
+newer 64-bit ARMv8-A architecture, introduced in 2011, are
+still rare, even in new devices; accordingly, we focus on
+ARMv8-A’s predecessor, ARMv7-A, in this paper.
+
+A. Instruction sets
+
+Prior to ARMv4T, the ARM architecture supported a single
+instruction set known simply as “ARM.” ARM instructions are
+stored as ﬁxed-width 32-bit words aligned to 4-byte bound-
+aries. Whereas the x86 instruction set supports conditional
+execution only of branch instructions, most ARM instructions
+can be predicated through a 4-bit condition code.
+
+In 1994, ARM Holdings released the ARM7TDMI core
+implementing the ARMv4T architecture, which introduced the
+“Thumb” instruction set, composed of 16-bit ﬁxed-width in-
+structions stored as halfwords. Like ARM instructions, Thumb
+instructions must be aligned, but rather than being 4-byte
+aligned, Thumb instructions must be 2-byte aligned. The
+Thumb instruction provides the advantage of improved code
+density over ARM, in part due to the removal of condition
+codes from nearly all instructions.
+
+In 2003, the Thumb instruction set was enhanced with
+Thumb-2 technology, which added 32-bit instructions (separate
+from those found in the ARM instruction set) that can be
+intermixed with 16-bit Thumb instructions. Unlike ARM in-
+structions, which are encoded as 32-bit words, 32-bit Thumb-2
+instructions are encoded as two consecutive 16-bit halfwords.
+Thumb-2 support was introduced in the ARMv6T2 architecture
+and is mandatory in all cores implementing ARMv7 and above.
+For the remainder of this paper, the names Thumb and Thumb-2
+are used interchangeably to refer to the Thumb-2 instruction
+set containing mixed 16- and 32-bit instructions.
+
+The ARM architecture includes support for two other
+instruction set modes, Jazelle and Thumb Execution Environ-
+ment (ThumbEE). Jazelle was intended to allow Java bytecode
+to be executed directly on hardware but
+is almost never
+implemented, and ThumbEE has been deprecated. Therefore,
+both Jazelle and ThumbEE are outside the scope of this paper.
+Whether an instruction stream is interpreted as ARM,
+Thumb, ThumbEE, or JVM bytecode is determined by the
+instruction set state register (ISETSTATE), which can be
+modiﬁed through the use of interworking instructions. Since
+the ThumbEE and Jazelle execution modes are rarely used,
+we constrain our discussion of instruction set interworking to
+ARM-Thumb interworking.
+
+ARM processors allow ARM code to call into and return
+from Thumb code and vice versa. Interworking is implemented
+through a handful of instructions that always change the
+instruction set as well as the least signiﬁcant bit of branch
+target addresses. When branching to an address using an
+instruction allowing for instruction set interchange (i.e., bx
+and blx), the processor inspects the least signiﬁcant bit of
+the branch target address. If it is set, the processor clears the
+least signiﬁcant bit and branches execution to the resulting
+address in Thumb mode; if it is not set, the processor branches
+execution to the target address in ARM mode. This clever use
+of the least signiﬁcant bit is made possible by the fact that
+ARM and Thumb instructions are aligned to 4- and 2-byte
+boundaries, respectively. Consequently, the least signiﬁcant bit
+
+TABLE I.
+
+ARM GENERAL-PURPOSE REGISTERS
+
+Register
+
+Argument
+
+Return value
+
+Scratch
+
+Local Var.
+
+Platform-speciﬁc
+
+R0
+
+R1
+
+R2
+
+R3
+
+R4
+
+R5
+
+R6
+
+R7
+
+R8
+
+R9
+
+R10
+
+R11
+
+R12
+
+of every instruction’s address is never needed to identify the
+branch target and is free to be repurposed for interworking.
+
+B. Core registers
+
+The ARM architecture has 13 32-bit general purpose
+registers (R0-R12) and three 32-bit special-purpose registers
+(R13-R15). The usage convention for the general purpose core
+registers is deﬁned by the Procedure Call Standard for the
+ARM Architecture (AAPCS) [4] and is summarized in Table I.
+
+The special-purpose registers have roles deﬁned by the
+instruction set and implemented in hardware. The stack pointer
+register (SP/R13) is used to hold a pointer to the top of the
+current execution stack. Special variants of the add and sub
+instructions are hardwired to use SP as an operand in order to
+accelerate stack operations.
+
+The link register (LR/R14) is used to hold subroutine
+return addresses. The ARM analogs of x86’s call instruction
+are the branch with link (bl) and branch with link and
+exchange (blx) instructions. When either of these instructions
+is executed, it not only causes execution to branch to the
+provided branch target, but also saves the address of the
+instruction following the branch instruction into LR. To support
+ARM-Thumb interworking, the saved return address has its
+least signiﬁcant bit set if and only if the branch was executed
+in Thumb mode. Whether the callee is ARM code or Thumb
+code,
+it will be able to return to its caller in the proper
+execution mode because the return address’s least signiﬁcant
+bit encodes the return mode. If the callee makes any subroutine
+calls of its own, it must save LR before it gets overwritten by
+the call. For this reason, it is common practice to store all
+callee-saved registers along with LR onto the call stack at the
+beginning of each function and restore them prior to returning.
+
+The program counter register (PC/R15) holds the address
+of the currently-executing instruction plus 8 while in ARM
+mode or the address of the currently-executing instruction
+plus 4 while in Thumb mode. Certain data processing and
+memory instructions can write their results into the PC. The
+PC overwrite has the effect of branching to the address written
+to the register and, in certain circumstances, can cause the
+processor to switch from ARM to Thumb mode or vice versa.
+A common convention at subroutine return sites is to restore
+the callee-saved registers from the stack, and then to restore
+
+3
+
+the saved LR value (which held the return address) directly into
+the PC, effectively causing the subroutine to return to its caller.
+
+C. Endianness
+
+ARM is a bi-endian architecture, meaning that
+
+it can
+interpret words and halfwords as either big or little endian.
+The ENDIANSTATE execution state register stores a bit deter-
+mining data memory endianness, and the ARM ISA provides
+the setend instruction to modify its value. Prior to ARMv7,
+ARM supported both big and little endian instruction memory,
+but big endian instruction support was dropped in ARMv7.
+
+D. Security considerations
+
+Several features of the ARM architecture could result
+in an ARM processor’s interpreting instruction bytes differ-
+ently than intended by the assembler that produced them,
+something we call “instruction confusion.” First, the ARM-
+Thumb interworking feature can lead to instruction confusion
+because execution beginning at a particular address could result
+in multiple different instruction streams, depending on the
+contents of the ISETSTATE register. Second, the ability to
+change the endianness of instruction memory can affect the
+instruction decoding. Third, the addition of 32-bit Thumb-
+2 instructions to the Thumb instruction set effectively gives
+Thumb-2 variable-length instruction encodings since 16- and
+32-bit Thumb instructions may be intermixed. Variable-length
+instructions were the cornerstone of Blazakis’ original JIT
+spraying attack.
+
+We analyze ARM-Thumb interworking and variable-length
+instructions as possible vectors for creating instruction confu-
+sion in § IV. We exclude instruction endianness switching from
+our analysis because it is not present in recent processors.
+
+III.
+
+JAVASCRIPTCORE: WEBKIT’S JAVASCRIPT ENGINE
+We used a recent version of WebKit’s JavaScript engine
+JavaScriptCore (JSC)1 compiled for ARMv7-A as a test plat-
+form for generating JITed payloads. We chose WebKit for a
+number of reasons. First, JSC is open source, reducing the
+reverse engineering burden required to understand how its JIT
+compiler works. Second, WebKit and JSC are used by Apple
+for the Safari browser built-in to iOS. The iOS platform is
+popular (iOS devices made up 32.6% of the smartphone market
+in the US, according to Kantar Worldpanel2) and strictly locked
+down. All executable code pages on iOS are cryptographically
+signed, with one exception: code emitted by the Safari JIT
+compiler. This policy complicates traditional code injection
+attacks, making a JSC JIT exploit an attractive attack path.
+
+JSC is a multi-tier JavaScript engine, meaning it applies
+increasing levels of optimization to code the more times it is
+executed. When JSC is given a piece of JavaScript source code,
+it is ﬁrst compiled down to bytecode. Initially, the bytcode is
+interpreted, but once it has been executed several times (6 times
+for functions or 100 times for loops), the bytecode is compiled
+down to unoptimized native code3 by the Baseline JIT. Once
+
+1We used WebKitGTK version 2.2.2-1 for Debian.
+2Online:
+
+http://www.kantarworldpanel.com/smartphone-os-market-share/.
+
+Accessed 18 November 2014.
+
+3On ARMv7-A, all JSC JIT tiers produce Thumb-2 code.
+
+the Baseline JIT’s code has executed many times (60 times for
+functions or 1000 times for loops), the DFG JIT kicks in and
+emits optimized Thumb-2 code. An adversary can induce JSC
+into compiling a piece of JavaScript with any tier by simply
+varying the number of times the script is invoked.
+
+Code memory pages emitted by both the Baseline JIT and
+the DFG JIT are marked readable-writable-executable (RWX).
+The write ﬂag remains throughout the lifetime of the JIT code
+because JSC occassionally modiﬁes the native code in situ.
+
+A. Low Level Interpreter
+
+At the bottom tier lies the Low Level Interpreter (LLInt),
+which interprets bytecode. Bytecode consists of 32-bit opcodes
+followed by as many 32-bit operands as are required by that
+opcode. Bytecode opcodes are pointers to pre-compiled code
+snippets in the interpreter’s text section implementing the byte-
+code operations. During bytecode execution, a virtual program
+counter (vPC) register points to the currently-executing opcode
+in the bytecode while the real PC is in the code snippet pointed
+to by the opcode. The snippet accesses the opcode’s operands
+via vPC-relative memory loads, performs the desired computa-
+tion (optionally storing results onto a special JavaScript stack),
+advances the vPC, and ﬁnally branches to the next opcode’s
+snippet via a register-indirect jump through the vPC.
+
+B. Baseline JIT
+
+Cold code that has become “warm” gets compiled to native
+code by the non-optimizing Baseline JIT. The instruction
+stream produced by the Baseline JIT differs slightly from the
+one executed by the LLInt since it does not need to manage
+the vPC; but they are functionally equivalent. Baseline JIT
+code has clear boundaries where the execution of one bytecode
+instruction ends and the next begins, and it does not ﬂow
+scratch values in registers across those boundaries. Instead,
+scratch values are stored onto the JavaScript stack and read
+back out by subsequent bytecode operations.
+
+C. Data Flow Graph (DFG) JIT
+
+During execution in the LLInt and Baseline JIT, JSC
+collects type proﬁling information in order to try to predict
+the types of operands found in the code. The DFG JIT uses
+this type proﬁling information to aggressively optimize “hot”
+code for what it perceives to be the common case. When
+a piece of DFG JITed code is executed, and the runtime
+data types match those predicted by the DFG JIT, execution
+continues on the fast path through the optimized DFG JITed
+code. Otherwise, execution will fall back to the Baseline JIT
+code via a process known as an on-stack-replacement (OSR)
+exit. Among the DFG JIT’s features are dead code elimination
+analysis, function inlining, and a basic register allocator.
+
+D. Fourth Tier LLVM (FTL) JIT
+
+In May 2014,
+
+the WebKit developers enabled what
+
+is
+known as the Fourth Tier LLVM (FTL) JIT as an additional
+compilation tier. The FTL JIT utilizes the LLVM compiler
+infrastructure to provide a higher-performance alternative to
+the DFG JIT [14]. As the FTL JIT has only recently been
+taken out of the experimental development phase and was
+not enabled in the version of WebKit that we studied, its
+functionality is out of the scope of this paper.
+
+4
+
+function (R0, R2, R8, R10) {
+
+var R1 = R0 ˆ 0x1234;
+var R4 = R2 ˆ 0x2345;
+var R9 = R8 ˆ 0x3456;
+var R11 = R10 ˆ 0x4567;
+// At this point all registers have been populated
+return (R1ˆR2) | (R4ˆR8) | (R10ˆR9) | (R11ˆR0);
+
+4051
+ea84 0408
+4321
+ea8a 0a09
+ea41 010a
+ea8b 0b00
+ea41 010b
+
+eors
+eor.w
+orrs
+eor.w
+orr.w
+eor.w
+orr.w
+
+r1, r2
+r4, r4, r8
+r1, r4
+r10, r10, r9
+r1, r1, r10
+r11, r11, r0
+r1, r1, r11
+
+}
+
+Listing 1. Variables in this function are named for the registers storing the
+variables’ values at the point in execution just prior to the return statement.
+
+on the order of the operands. The result of (R4 ˆ R8) is
+stored into R4 because R4 was written to the left of the XOR
+operator. Likewise, the result of (R10 ˆ R9) is saved into
+R10, which was written to the left. This is in contrast with a
+JIT that might choose the accumulator register based on some
+other criteria such as whichever has a lower number.
+
+Inﬂuence over what registers are used as operands trans-
+lates to inﬂuence over the length of instruction encodings
+emitted by the DFG JIT. Three-bit register ﬁelds limit many
+16-bit Thumb instructions to operating on the lower 8 registers.
+Using R8–R15 as an operand usually requires the use of a 32-
+bit instruction. This can be observed in the ﬁrst two lines of
+Listing 2 which shows that the DFG JIT chooses to use the
+16-bit XOR encoding to XOR R0 with R1, but it must use the
+32-bit encoding to XOR R4 with R8 since the 16-bit encoding
+only provides 3-bit register ﬁelds which cannot encode R8.
+
+Instead of chaining bitwise operations to induce the JIT
+to emit densely-packed attacker-controlled instructions, one
+might consider other types of arithmetic operations such as
+addition, subtraction, multiplication, or division. However,
+JSC injects runtime checks with these operations to test for
+overﬂows and underﬂows. These checks introduce several
+consecutive instructions that do not contain attacker controlled
+bytes and should therefore be avoided. For this reason, we
+consider chained bitwise operations to be the best method
+for generating long runs of tightly-packed instructions with
+a relatively high concentration of attacker-controlled bits.
+
+In the remainder of this paper, we evaluate various tech-
+niques for JIT spraying against ARM with respect
+to the
+behavior of a particular version of JSC. However, we believe
+that the techniques presented are applicable in general against
+ARM, and we describe both techniques whose constraints are
+met by JSC and those that do not work against our version of
+JSC but may work against other versions or even other JITs.
+
+IV. ARM JIT SPRAY PAYLOADS FOR JSC
+
+In JIT spraying, as in return-to-libc or ROP, the attacker
+repurposes existing benign code for malicious purposes. What
+distinguishes JIT spraying from other code reuse attacks is
+that the reused instructions in a JIT spraying attack are the
+result of compiling attacker-provided code. The instructions
+executed during the attack may be either the instructions
+intended by the compiler that produced them or an entirely
+different sequence of unintended instructions “hidden” among
+the intended instructions’ encodings.
+
+In this section, we describe three types of JIT spraying
+payloads making use of unintended instructions that are made
+possible by features in the ARM architecture. First, we discuss
+the original, self-sustaining JIT spray payload which strings
+
+Listing 2. Raw bytes and disassembly of the computation of the return value
+in Listing 1.
+
+together long sequences of unintended instructions that do not
+resynchronize to the intended instruction stream due to archi-
+tectural support for variable-length, partially-aligned instruc-
+tion encodings (§ IV-A). We were unable to ﬁnd a method that
+makes it feasible to generate useful payloads of this type with
+either JSC’s Baseline or DFG JITs. The second type of payload
+takes advantage of recent ARM chips’ ability to interpret a
+region of memory as either ARM or Thumb instructions, de-
+pending on the state of the ISETSTATE register (§ IV-B). The
+basic idea is to generate JIT code intended to be executed in
+Thumb mode that encodes a malicious unintended instruction
+stream when executed in ARM mode. We found that certain
+incompatibilities between the Thumb and ARM instruction
+set encodings make it infeasible to create a useful Thumb-
+ARM reinterpretation payload. Although we were unable to
+generate self-sustaining and Thumb-ARM reinterpretation JIT
+spray payloads, we include our ﬁndings on them to serve as a
+reference for future work, should certain conditions change.
+
+Finally, we describe a third payload style which, unlike
+self-sustaining JIT spray and Thumb-ARM reinterpretation
+payloads, does not attempt to construct a Turing-complete
+shellcode from long sequences of unintended instructions.
+Instead, the payloads consist of unintended instructions that
+are allowed to resynchronize to the intended instructions that
+follow them. Rather than expressing Turing-complete com-
+putation in the JIT sprayed payloads (which we refer to as
+“gadgets”), the JavaScript that triggers the control ﬂow vul-
+nerability provides Turing-complete computation and chains
+together calls to the gadgets. We call this technique gadget
+chaining and describe it in greater depth in § IV-C.
+
+A. Self-sustaining JIT spraying payloads
+
+Blazakis’ original JIT spraying attack on x86 abused the
+architecture’s support for variable-width instruction encodings,
+which allows any byte to be decoded as the ﬁrst byte of an
+instruction. Consequently, once control ﬂow is diverted into
+the middle of an instruction in a cleverly-designed JIT spray
+payload, it is possible to prevent execution from ever resyn-
+chronizing to the intended instruction stream. The encoding
+of an unintended instruction stream in an intended instruction
+stream is also possible on ARM, with some caveats.
+
+The execution of unintended instructions brought about by
+branching into the middle of an intended instruction is limited
+to Thumb mode execution. Speciﬁcally, the CPU under attack
+must support the extended 32-bit Thumb-2 instruction set.
+The reason for this is quite self-evident. In ARM mode, the
+processor ensures that instruction fetching and decoding occurs
+along 4-byte aligned boundaries; it is simply impossible to
+divert control ﬂow into the middle of an instruction. Likewise,
+in 16-bit-only Thumb mode, all 2-byte aligned branch targets
+are intended instructions.
+
+6
+
+holding the JavaScript call frame pointer be preserved by the
+prototype function, a property which is not guaranteed and in
+fact does not hold for setRangeText’s prototype function.
+Moreover, even if the call frame pointer were preserved,
+returning back to the JavaScript controller from the gadget
+will leave certain registers unrestored and the native call stack
+in an inconsistent state due to the saved registers pushed onto
+it by the prototype function. Any subsequent computations that
+rely on the contents of the saved registers or the native call
+stack are likely to crash the process if the saved registers are
+not popped off the stack.
+
+In order to decouple our attack from JSC’s choice of call
+frame register and ensure the integrity of registers and the
+native call stack, the ﬁrst invocation of the store gadget must
+overwrite its own return sequence with a bx lr instruction
+(Figure 5b), which will cause execution to return to the
+prototype function, where the saved registers will be popped
+off of the stack before control is returned to the JavaScript
+controller. Since the prototype function calls the host function
+using a linking branch, we can expect LR to hold the correct
+return address so long as the new bx lr instruction precedes
+any instructions in the gadget which would overwrite it.
+Fortunately, the only such instruction in the gadget is the
+instruction in the gadget’s original return sequence which loads
+the return address from the JavaScript call frame.
+
+A ﬁnal concern for returning from a gadget is ensuring
+that the newly-written bx lr instruction does not reside on
+the same i-cache line as the unintended store instruction. If
+they were to be on the same i-cache line, the overwritten
+instruction would exist only in the data cache and/or main
+memory. The intended instruction that we wanted to overwrite
+would remain intact in the i-cache and would be executed,
+leading to the crash we were trying to avoid. In order to prevent
+this scenario, we pad the store gadget function with code that
+will yield at least 64 bytes (the size of an i-cache line on many
+recent ARMv7-A implementations) of instructions between the
+unintended store and the return sequence.6 With the padding in
+place, the newly-written return sequence will only be loaded
+into the i-cache after the unintended store has executed. In
+order to ensure that the cache line containing the instructions
+to be overwritten is not in the cache prior to executing the
+gadget, the attacker should use JavaScript to induce JSC to
+execute many non-sprayed functions after spraying and before
+invoking the gadget.
+
+B. Analysis of the proof of concept attack
+
+One of the most
+
+important metrics when evaluating a
+spraying attack is its success rate. The success rate of a JIT
+spraying attack Psuccess is expressed by the following equation:
+
+Psuccess = Pvuln × Ppage × Poffset × P bytes
+
+where Pvuln, Ppage, Poffset, and P bytes are deﬁned as follows:
+
+6This is another reason it is important to generate the gadget with the DFG
+JIT. Baseline JIT code loads and saves operands onto the call stack for each
+bytecode instruction, whereas the DFG JIT can allocate scratch registers to
+avoid memory accesses. We do not know of a method to generate 64 bytes
+of padding code with the Baseline JIT that does not invoke a memory access
+through the call frame pointer. Since we would like to avoid relying on the
+integrity of the call frame pointer register, DFG JIT code is ideal.
+
+•
+
+•
+
+•
+
+•
+
+Pvuln: the probability that the attacker’s control ﬂow
+vulnerability results in populating the gadget’s input
+registers with the appropriate values and branching
+execution to an attacker-chosen address. We assume
+a best-case value of 1.
+Ppage: the probability of correctly guessing a page
+containing sprayed instructions. The attacker can max-
+imize this probability by spraying more gadgets and
+using an address disclosure vulnerability. We estimate
+this quantity via an empirical measurement. In a 32-
+bit address space, there are 220 ≈ 1M pages. We
+were able to spray about 200,000 pages (19.1% of
+the virtual address space) of JIT code on a machine
+with 4 GB of memory before the browser process
+crashed. The fraction of pages that can be JIT sprayed
+is limited by the presence of LLInt bytecode and other
+heap objects that are allocated for every instance of
+the sprayed function (63 pages for every 37 pages
+of JIT code). The blocks of pages containing this
+support data are interleaved with regions of JIT code
+pages. Therefore a perfect pair of address disclosures
+which tightly bounds the memory region containing
+all JIT code and support data cannot improve Ppage
+beyond 37%, and without
+the address disclosure,
+Ppage = 19.1%.
+Poffset: the probability that the function containing the
+sprayed gadget on the guessed page begins at the
+expected page offset. A sprayed function can begin
+at an unexpected page offset
+if the memory hole
+into which it was sprayed was misaligned as a result
+of several low-probability events causing the size of
+Baseline JIT code to vary unpredictably. Fortunately
+for the attacker, the allocation offsets for Baseline
+JIT code have an opportunity to resynchronize for
+every new 16 KB region that is allocated, so misalign-
+ments do not cascade. We measured the alignment of
+100,000 consecutively-allocated memory store gadgets
+and found that 97,826 of them were correctly aligned,
+giving us an empirical estimate for Poffset of 97.826%.
+P bytes: the probability that the intended instruction that
+encodes the gadget is the instruction expected by the
+attacker. JSC randomly applies the constant blinding
+JIT spraying defense, which scrambles constants in the
+instruction stream, leading to unexpected instructions.
+However, only 1 out of 64 constants are scrambled at
+random, giving us P bytes = 63/64.
+
+The success rate of our proof of concept attack is 35.6% if
+it makes use of address disclosures that perfectly bound the
+sprayed pages or 18.4% without them (randomly guessing for
+200,000 sprayed pages). Without our techniques for placing
+JIT code at known page offsets, Blazakis’ x86 JIT spraying
+attack, which relies on an 80% probability NOP sled (Poffset =
+80%), would succeed under JSC’s memory layout constraints
+with probability at most 29.1% and 15.0% with and without
+perfect bounding address disclosures, respectively.
+
+C. Other gadget chaining applications
+
+The details of our proof of concept attack are tailored
+to the version of WebKit under study. For example, our
+
+12
+
+decision to use a hijacked host function pointer inﬂuenced
+our attack, as we were forced to use self-modifying code
+to deal with constraints imposed by WebKit’s host function
+calling convention. Nevertheless, our core new technique,
+gadget chaining, is robust against JIT compiler implementation
+choices and applicable in scenarios other than Turing-complete
+JIT spraying, as we explain below.
+
+1) Just-In-Time code reuse: Snow et al. demonstrated an
+attack dubbed Just-In-Time code reuse [20], which allows an
+attacker to harvest the addresses of useful code sequences from
+the address space of a process protected by ﬁne-grained ASLR.
+The code sequences could subsequently be used to launch a
+code reuse attack such as ROP.
+
+One of the requirements for Snow et al.’s Just-In-Time code
+reuse attack is an existing memory disclosure vulnerability: a
+ReadByte(address) function. The read gadget example
+we gave in § IV-C provides exactly this functionality.
+
+Let us assume that it is not possible to create a self-
+modifying gadget as we did in the proof of concept attack,
+motivating us to pursue the Just-In-Time code reuse attack as a
+means for arbitrary code execution. In order for the read gadget
+to return without crashing, it needs to be called from JavaScript
+code rather than a host function’s prototype function. For-
+tunately, JIT-compiled functions can be called directly from
+within another JIT-compiled function. If an attacker were to
+exploit a bug allowing her to trick JSC into writing a gadget’s
+address in place of a function entry point, the read gadget
+could be called with the call frame register intact and without
+growing the native call stack. Consequently, the return from the
+gadget to the controller depicted in Figure 4 would succeed.
+Even the gadget’s return value would be passed correctly to
+the controller and interpreted as the wrapper function’s return
+value. Such a bug is plausible since a reference to each JIT
+code block’s entry point is held in an object which could
+potentially be corrupted by the attacker.
+
+The task of loading a register with the memory address
+from which to load can be handled by making the wrapper
+function a DFG-compiled function, which we showed in
+§ III-G enables an attacker to control the contents of several
+registers at certain points in the execution of the code. The
+version of WebKit we studied preserves register R2 in the code
+used to prepare for a function call. Thus, the attacker has ev-
+erything she needs to implement the ReadByte(address)
+needed by the Just-In-Time code reuse attack.
+
+2) Address/Register disclosure: JavaScriptCore’s tag-pay-
+load value structure makes it possible for a register-move
+gadget to disclose the value of any register (even the stack
+pointer or link register) into a JavaScript integer value. Since
+an attacker can inﬂuence the contents of one or more registers
+at the time a gadget is invoked, it is also possible to disclose the
+address of a JavaScript object by “casting” it to a 32-bit integer.
+The JavaScript statement return arg0 ˆ 0x10; pro-
+that can be used to cast
+duces an R2-disclosure gadget
+a JavaScript object
+to an integer. The gadget begins with
+an unintended movs r0, r2 followed by mov.w r1,
+#4294967295 (i.e., 0xffffffff, the tag for 32-bit integers) and
+a return sequence. If the gadget is invoked with a JavaScript
+object’s payload ﬁeld in R2, the object’s payload, which is
+a pointer to the object itself, will be returned as a 32-bit
+
+integer. When used in conjunction with subsequent read gadget
+calls, the disclosure of an object’s address could lead to the
+disclosure of a non-JIT code pointer. A non-JIT code pointer
+is desirable as a seed for code sequence harvesting in a code
+reuse attack; JITed code tends to branch directly only to other
+JITed code.
+
+Similar register-move gadgets can be devised to disclose
+
+the value of other registers in the manner described above.
+
+VI. MITIGATIONS
+
+Many JIT spraying defenses were proposed [5], [10],
+[11], [22] in the aftermath of Blazakis’ seminal work on JIT
+spraying. Two of them, random NOP insertion and constant
+blinding, are included in JSC, but their implementations fall
+short due to a mis-estimation of how JIT spraying can manifest
+itself on the ARM architecture. In this section, we review the
+shortcomings of JSC’s JIT spraying defenses and identify ad-
+ditional mitigations that would greatly increase the complexity
+of launching a JIT spraying attack using gadget chaining.
+
+A. Shortcomings of JSC’s JIT spraying defenses
+
+1) Random NOP insertion: Generally speaking, the idea
+behind random NOP insertion is to intersperse semantic NOP
+instructions at unpredictable locations among the intended
+instructions. Since Blazakis’ original JIT spraying attack re-
+lies on creating long, predictable sequences of unintended
+instructions that are executed sequentially from start to ﬁnish,
+the inserted NOP instructions would derail the unintended
+instruction stream and cause the attack to fail.
+
+JSC’s Baseline JIT provides a rudimentary form of random
+NOP insertion. Instead of inserting various semantic NOP
+instructions randomly throughout the emitted code, it emits
+a single NOP instruction at the beginning of each compiled
+piece of code with 50% probability. The semantic NOP used
+is always the 16-bit NOP instruction. The DFG JIT does not
+perform random NOP insertion.
+
+Since the NOP inserted is always only 2 bytes long, if
+the attacker guesses incorrectly regarding the presence of the
+randomly-inserted NOP, execution in the gadget will begin
+at an intended instruction boundary. Supposing the resulting
+intended instruction sequence does not crash the process, exe-
+cution will fall through into the return sequence. If the attacker
+was exploiting a vulnerability that allows her to return with the
+intended return sequence (instead of needing self-modifying
+gadgets), the return sequence will correctly return control to
+the attacker’s JavaScript controller. It
+is even possible for
+the attacker to inspect the gadget’s return value to determine
+whether or not the unintended instruction in the gadget exe-
+cuted and to adjust her gadget address guess accordingly.
+
+The read gadget is an example of a gadget that reveals
+whether or not the unintended instruction was successfully
+executed. To test whether or not her gadget address guess is
+correct, the attacker should try to read the word at the gadget’s
+start address. If the returned value matches the expected ﬁrst
+word of the gadget, then there is a high probability that the
+attacker’s guess was correct. The attacker can add conﬁdence
+to this ﬁnding by adding 1 to the memory address to be read
+and observing whether or not the returned word matches the
+
+13
+
+TABLE III.
+
+CONDITIONS UNDER WHICH JSC WILL NEVER BLIND A
+
+CONSTANT VALUE V.
+
+Condition
+V == 0xffff
+V == 0xffffff
+V ≤ 0xff
+V ≥ 0xffffff00
+
+previously-returned word, except with one byte shifted out and
+a new byte shifted in on the other end. The read gadget can be
+used to detect random NOP insertion for the sake of another
+gadget by placing both the read gadget and the “real” gadget
+in the same function. Once the read gadget has revealed the
+presence or absence of a randomly-inserted NOP, the other
+gadget’s address can be adjusted accordingly.
+
+Random NOP insertion cannot disrupt gadgets which aim
+to execute only one unintended 16-bit instruction since it is im-
+possible to insert an instruction into the middle of a halfword.
+Even if random NOPs were inserted by both the Baseline and
+DFG JITs at less predictable locations, we showed above that
+an attacker could simply probe for the gadget. One way to
+improve random NOP insertion is to use semantic NOPs that
+do not allow execution to fall through to the return sequence if
+execution branches into the middle of the NOP. Wei et al. [22]
+gave one example of such a semantic NOP in the form of a
+PC-relative branch followed by software interrupt instructions
+which trap into a security auditing routine. When executed
+from the branch instruction, execution will
+jump over the
+interrupt instructions, but a jump that is probing for a gadget
+and lands in the middle of the so-called “trapping snippet”
+will not fall through to the return sequence. These trapping
+snippets should be sprinkled throughout the JIT code instead
+of being placed only at the beginning of code blocks.
+
+2) Constant blinding: Constant blinding seeks to eliminate
+an attacker’s ability to predict the value of immediate ﬁelds
+in JIT-produced instructions. A canonical example is that
+of protecting the loading of a register with an untrusted
+immediate value. Rather than moving the immediate directly
+into the register, the XOR of the immediate and a random
+blinding value is moved into it. The register is then XORed
+against the blinding value, leaving the value of the immediate
+in the register since (imm ⊕ blind) ⊕ blind = imm. As a
+result, any immediate bits that the attacker had hoped to use as
+part of an unintended instruction sequence will be scrambled.
+
+JSC performs constant blinding for many operations, but it
+does not blind all constants. Certain constants are considered
+“safe”; Table III lists the conditions under which a constant
+value V will never be blinded; if any one of the conditions is
+met, the constant will not be blinded. Furthermore, JSC ran-
+domly decides whether or not to blind a constant that does not
+meet a do-not-blind criterion, only blinding with a 1/64 proba-
+bility. Avoiding increased i-cache pressure may be a motivating
+factor for not blinding every constant, as the blinding operation
+can quadruple the size of a 4-byte operation by adding up to
+two mov instructions as well as the XOR instruction.
+
+Occasional constant blinding is perhaps suitable for pre-
+venting JIT spraying on x86, since the canonical attack was to
+chain together long sequences of immediate-operand instruc-
+tions. Randomly disrupting 1 in 64 of these operands might
+
+be enough to prevent the attack from succeeding at minimal
+expense to performance. Using gadget chaining, however,
+very few immediates are needed to form the desired gadgets.
+Therefore, a higher constant blinding rate is needed. Moreover,
+the “safe” values that JSC does not blind are not as safe on
+ARM. The R2-disclosure gadget we presented in § V-C2 uses
+16 as a constant, which is considered “safe” by JSC. In order
+to defend against gadget chaining, every constant needs to be
+blinded.
+
+B. Suggested hardening
+
+Below, we suggest defensive techniques that add to the
+complexity of successfully expoiting a program vulnerability
+with a gadget chaining attack. None of these mitigations
+can nullify the threat of JIT spraying on their own. Instead,
+they should be combined with each other and improved
+implementations of the defenses already provided by JSC.
+
+1) Register randomization: Register randomization is the
+practice of allocating scratch registers in an unpredictable man-
+ner. The 32-bit immediate-operand instructions from which we
+are easily able to form 16-bit unintended instructions use a 4-
+bit Rd ﬁeld, allowing the attacker to control 25% of the bits
+of the unintended instruction by manipulating the register into
+which results will be stored. If both register randomization
+and constant blinding are implemented for all instructions, the
+attacker will no longer be able to create 16-bit unintended
+instructions in the manner described in this paper.
+
+Unlike constant blinding, register randomization does not
+increase the number of instructions. However, it may slightly
+increase i-cache pressure by allocating registers in such a way
+that a 32-bit instruction is required where previously a 16-bit
+instruction would sufﬁce (due to the width of register ﬁelds
+in the instruction encodings). For example, the 16-bit XOR
+instruction with register operands may only operate on R0-
+R7; to use R8-15, the 32-bit encoding is required.
+
+2) JIT allocation randomization: In § V-A1, we stressed
+the importance of identifying the addresses at which gadgets
+reside and described our technique for placing JITed functions
+at known offsets on every sprayed page. Eliminating the
+viability of this technique adds 12 bits of entropy to the
+location of each JITed function. At
+the cost of increased
+fragmentation and potentially more committed memory pages,
+an allocation policy that randomizes the base address of JITed
+code blocks would prevent the attacker from manipulating the
+allocator into placing her gadgets at known offsets.
+
+Although it is indeed theoretically possible to probe the
+address space in search of a gadget using the method described
+in § VI-A1, the added 12 bits of entropy increase the search
+space by a factor of 2048 compared to the 2 possible locations
+offered by the Baseline JIT’s random NOP insertion. Addition-
+ally, there are many places in the JIT code where a random
+branch will not immediately fall through into the intended
+return sequence. Slow path code which handles unusual type
+combinations is written at the end of each generated JIT code
+block. Branching randomly into slow path code may lead
+to unpredictable behavior or a crash. Finally, requiring the
+attacker to probe for gadgets constrains the class of exploitable
+control ﬂow vulnerabilities to those that can take advantage of
+the intended function return sequence.
+
+14
+
+VII. FUTURE WORK AND CONCLUSION
+
+In this paper we demonstrate the viability of JIT spraying
+as a vector for exploiting an existing control ﬂow vulnerability
+on an ARM system implementing both DEP and ASLR. To
+accomplish this, we leverage a novel JIT spray style called
+gadget chaining, which enables an attacker to augment the
+safe execution of code in a high level language with unsafe
+unintended insruction sequences that can be invoked just like
+subroutines. We presented an end-to-end proof of concept
+attack that uses gadget chaining and propose other potential
+uses for it. We believe our work demonstrates that RISC
+architectures are not de facto immune to JIT spraying as was
+previously thought.
+
+Although we were unsuccessful
+
+in generating self-
+sustaining and Thumb-ARM reinterpretation-style JIT spray
+payloads on ARM with JSC’s Baseline and DFG JITs, we can-
+not rule out the possibility that different JITs—future versions
+of these JITs, JSC’s recently-released FTL JIT, or even JITs
+belonging to another language runtime entirely—will make
+these payload types a possibility on ARM. More importantly,
+however, more work is needed to determine if working analogs
+to the JIT spraying techniques described in this paper even
+exist and can be generated on other RISC architectures.
+
+The discovery and exploration of the various JIT spraying
+payload types was accomplished through painstaking manual
+trial and error. Future work should prioritize developing the
+right tools for analyzing the output of of a JIT compiler and
+probing its capabilities. An abstraction such as REIL [12]
+could even be used to help automate the analysis of data ﬂow
+through unintended instructions in order to generate a self-
+sustaining JIT spraying payload on ARM.
+
+The extension of JIT spraying to the ARM architecture
+challenges the assumptions made by JSC’s JIT implementation,
+and there are very likely other JITs that fail to protect them-
+selves against gadget chaining. JIT spray mitigation implemen-
+tations should be revisited and, should the security beneﬁts be
+found to outweigh the performance costs, revamped to defend
+against this new threat.
+
+ACKNOWLEDGMENT
+
+This material is based upon work supported by the National
+
+Science Foundation under Grant No. CNS-1228967.
+
+REFERENCES
+
+[1] Aleph One, “Smashing the stack for fun and proﬁt,” Phrack, vol. 7,
+
+no. 49, p. 365, 1996.
+
+[3] ARM Holdings,
+
+“Annual
+
+report
+
+and
+
+accounts
+
+2010,”
+
+http://media.corporate-ir.net/media ﬁles/irol/19/197211/626-1 ARM
+AR 040311.pdf, 2010.
+
+[4] ARM Holdings, “Procedure Call Standard for
+
+the ARM Ar-
+chitecture,” http://infocenter.arm.com/help/topic/com.arm.doc.ihi0042e/
+IHI0042E aapcs.pdf, Nov. 2013.
+
+[5] P. Bania,
+
+“JIT spraying
+
+arXiv:1009.1038, 2010.
+
+and mitigations,”
+
+arXiv
+
+preprint
+
+[6] P. Beck, “JIT Spraying on ARM,” https://prezi.com/ih3ypﬁvoeeq/
+
+jit-spraying-on-arm/, 2011.
+
+[7] D. Blazakis, “Interpreter exploitation: Pointer inference and JIT spray-
+
+ing,” Presented at BlackHat DC 2010, Feb. 2010.
+
+[8] E. Buchanan, R. Roemer, H. Shacham, and S. Savage, “When good in-
+structions go bad: Generalizing return-oriented programming to RISC,”
+in Proceedings of CCS 2008. ACM Press, Oct. 2008, pp. 27–38.
+
+[9] S. Checkoway, A. J. Feldman, B. Kantor, J. A. Halderman, E. W. Felten,
+and H. Shacham, “Can DREs provide long-lasting security? The case of
+return-oriented programming and the AVC Advantage,” in Proceedings
+of EVT/WOTE 2009. USENIX/ACCURATE/IAVoSS, Aug. 2009.
+
+[10] P. Chen, Y. Fang, B. Mao, and L. Xie, “JITDefender: A defense against
+JIT spraying attacks,” in Future Challenges in Security and Privacy for
+Academia and Industry. Springer, 2011, pp. 142–153.
+
+[11] W. De Groef, N. Nikiforakis, Y. Younan, and F. Piessens, “JITSec: Just-
+In-Time security for code injection attacks,” in Proceedings of WISSEC
+2010, Nov. 2010, pp. 1–15.
+
+[12] T. Dullien and S. Porst, “REIL: A platform-independent intermediate
+representation of disassembled code for static code analysis,” Presented
+at CanSecWest 2009. Online: http://www.zynamics.com/downloads/
+csw09.pdf, Mar. 2009.
+
+[13] T. Kornau, “Return oriented programming for the ARM architecture,”
+
+Master’s thesis, Ruhr-Universitat Bochum, 2010.
+
+[14] F. Pizlo, “Introducing the WebKit FTL JIT,” https://www.webkit.org/
+
+blog/3362/introducing-the-webkit-ftl-jit/, May 2014.
+
+[15] C. Rohlf
+
+and Y.
+
+JIT Com-
+pilers,” http://www.matasano.com/research/Attacking Clientside JIT
+Compilers Paper.pdf, 2011.
+
+“Attacking Clientside
+
+Ivnitskiy,
+
+[16] H. Shacham, “The geometry of innocent ﬂesh on the bone: Return-into-
+libc without function calls (on the x86),” in Proceedings of CCS 2007.
+ACM Press, Oct. 2007, pp. 552–61.
+
+[17] A.
+
+Sintsov,
+
+“JIT-Spray Attacks & Advanced
+
+Shellcode,”
+Presented
+Online:
+http://dsecrg.com/ﬁles/pub/pdf/HITB%20-%20JIT-Spray%20Attacks%
+20and%20Advanced%20Shellcode.pdf, Jul. 2010.
+
+HITBSecConf
+
+Amsterdam
+
+2010.
+
+at
+
+[18] A. Sintsov, “Writing JIT Shellcode for
+
+fun and proﬁt,” Online:
+
+http://dsecrg.com/ﬁles/pub/pdf/Writing%20JIT-Spray%20Shellcode%
+20for%20fun%20and%20proﬁt.pdf, Mar. 2010.
+
+[19] SkyLined, “Internet Explorer
+
+IFRAME src&name parameter BoF
+remote compromise,” http://skypher.com/wiki/index.php?title=Www.
+edup.tudelft.nl/∼bjwever/advisory iframe.html.php, 2004.
+
+[20] K. Z. Snow, F. Monrose, L. Davi, A. Dmitrienko, C. Liebchen, and
+A.-R. Sadeghi, “Just-in-time code reuse: On the effectiveness of ﬁne-
+grained address space layout randomization,” in Proceedings of IEEE
+Security and Privacy (“Oakland”) 2013.
+IEEE Computer Society,
+2013, pp. 574–88.
+
+[21] Solar Designer, “Getting around non-executable stack (and ﬁx),” http:
+
+//seclists.org/bugtraq/1997/Aug/63, Aug. 1997.
+
+[2] S. Andersen and V. Abella, “Data Execution Prevention. Changes to
+Functionality in Microsoft Windows XP Service Pack 2, Part 3: Memory
+Protection Technologies,” MSDN online library, 2004.
+
+[22] T. Wei, T. Wang, L. Duan, and J. Luo, “Secure dynamic code generation
+the 17th ACM conference on
+
+against spraying,” in Proceedings of
+Computer and communications security. ACM, 2010, pp. 738–740.
+
+15
+
+

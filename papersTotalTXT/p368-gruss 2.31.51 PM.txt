@@ -1,0 +1,2010 @@
+Prefetch Side-Channel Attacks:
+
+Bypassing SMAP and Kernel ASLR
+
+Daniel Gruss∗
+
+Clémentine Maurice∗
+
+Anders Fogh†
+
+Moritz Lipp∗
+
+Stefan Mangard∗
+
+∗ Graz University of Technology † G DATA Advanced Analytics
+
+ABSTRACT
+Modern operating systems use hardware support to protect
+against control-ﬂow hijacking attacks such as code-injection
+attacks. Typically, write access to executable pages is pre-
+vented and kernel mode execution is restricted to kernel code
+pages only. However, current CPUs provide no protection
+against code-reuse attacks like ROP. ASLR is used to pre-
+vent these attacks by making all addresses unpredictable for
+an attacker. Hence, the kernel security relies fundamentally
+on preventing access to address information.
+
+We introduce Prefetch Side-Channel Attacks, a new class
+of generic attacks exploiting major weaknesses in prefetch
+instructions. This allows unprivileged attackers to obtain
+address information and thus compromise the entire system
+by defeating SMAP, SMEP, and kernel ASLR. Prefetch can
+fetch inaccessible privileged memory into various caches on
+Intel x86. It also leaks the translation-level for virtual ad-
+dresses on both Intel x86 and ARMv8-A. We build three at-
+tacks exploiting these properties. Our ﬁrst attack retrieves
+an exact image of the full paging hierarchy of a process,
+defeating both user space and kernel space ASLR. Our sec-
+ond attack resolves virtual to physical addresses to bypass
+SMAP on 64-bit Linux systems, enabling ret2dir attacks.
+We demonstrate this from unprivileged user programs on
+Linux and inside Amazon EC2 virtual machines. Finally,
+we demonstrate how to defeat kernel ASLR on Windows 10,
+enabling ROP attacks on kernel and driver binary code. We
+propose a new form of strong kernel isolation to protect com-
+modity systems incuring an overhead of only 0.06–5.09%.
+
+CCS Concepts
+•Security and privacy → Side-channel analysis and
+countermeasures; Systems security; Operating sys-
+tems security;
+
+Keywords
+ASLR; Kernel Vulnerabilities; Timing Attacks
+
+Permission to make digital or hard copies of all or part of this work for personal or
+classroom use is granted without fee provided that copies are not made or distributed
+for proﬁt or commercial advantage and that copies bear this notice and the full citation
+on the ﬁrst page. Copyrights for components of this work owned by others than the
+author(s) must be honored. Abstracting with credit is permitted. To copy otherwise, or
+republish, to post on servers or to redistribute to lists, requires prior speciﬁc permission
+and/or a fee. Request permissions from permissions@acm.org.
+CCS’16, October 24 - 28, 2016, Vienna, Austria
+c(cid:13) 2016 Copyright held by the owner/author(s). Publication rights licensed to ACM.
+ISBN 978-1-4503-4139-4/16/10. . . $15.00
+DOI: http://dx.doi.org/10.1145/2976749.2978356
+
+1.
+
+INTRODUCTION
+
+The exploitation of software bugs imperils the security of
+modern computer systems fundamentally. Especially, buﬀer
+overﬂows can allow an attacker to overwrite data structures
+that are used in the control ﬂow of the program. These
+attacks are not limited to user space software but are also
+possible on operating system kernels [16]. Modern computer
+hardware provides various features to prevent exploitation
+of software bugs. To protect against control-ﬂow hijacking
+attacks, the operating system conﬁgures the hardware such
+that write access to executable pages is prevented. Fur-
+thermore, the hardware is conﬁgured such that in kernel
+mode, the instruction pointer may not point into the user
+space, using a mechanism called supervisor mode execu-
+tion prevention (SMEP). Data accesses from kernel mode
+to user space virtual addresses are prevented by operating
+system and hardware, using a mechanism called supervi-
+sor mode access prevention (SMAP). To close remaining at-
+tack vectors, address-space layout randomization (ASLR) is
+used to make all addresses unpredictable for an attacker and
+thus make return-oriented-programming (ROP) attacks in-
+feasible. All major operating systems employ kernel ASLR
+(KASLR) [32, 39, 43]. Information on where objects are lo-
+cated in the kernel address space is generally not available
+to user programs.
+
+Knowledge of virtual address information can be exploited
+by an attacker to defeat ASLR [17, 46]. Knowledge of phys-
+ical address information can be exploited to bypass SMEP
+and SMAP [27], as well as in side-channel attacks [11,22,34,
+35,42] and Rowhammer attacks [10,29,30,45]. Thus, the se-
+curity of user programs and the kernel itself relies fundamen-
+tally on preventing access to address information. Address
+information is often leaked directly through system inter-
+faces such as procfs [27] or indirectly through side chan-
+nels such as double page faults [17]. However, operating
+system developers close these information leaks through se-
+curity patches [30]. In this paper, we show that even if the
+operating system itself does not leak address information,
+recent Intel and ARM systems leak this information on the
+microarchitectural level.
+
+We introduce Prefetch Side-Channel Attacks, a new class
+of generic attacks that allow an unprivileged local attacker
+to completely bypass access control on address information.
+This information can be used to compromise the entire phys-
+ical system by bypassing SMAP and SMEP in ret2dir at-
+tacks or defeating KASLR and performing ROP attacks in
+the kernel address space. Our attacks are based on weak-
+nesses in the hardware design of prefetch instructions. In-
+
+368deed, prefetch instructions leak timing information on the
+exact translation level for every virtual address. More severely,
+they lack a privilege check and thus allow fetching inacces-
+sible privileged memory into various CPU caches. Using
+these two properties, we build two attack primitives: the
+translation-level oracle and the address-translation oracle.
+Building upon these primitives, we then present three dif-
+ferent attacks. Our ﬁrst attack infers the translation level for
+every virtual address, eﬀectively defeating ASLR. Our sec-
+ond attack resolves virtual addresses to physical addresses on
+64-bit Linux systems and on Amazon EC2 PVM instances in
+less than one minute per gigabyte of system memory. This
+allows an attacker to perform ret2dir-like attacks. On mod-
+ern systems, this mapping can only be accessed with root
+or kernel privileges to prevent attacks that rely on knowl-
+edge of physical addresses. Prefetch Side-Channel Attacks
+thus render existing approaches to KASLR ineﬀective. Our
+third attack is a practical KASLR exploit. We provide
+a proof-of-concept on a Windows 10 system that enables
+return-oriented programming on Windows drivers in mem-
+ory. We demonstrate our attacks on recent Intel x86 and
+ARM Cortex-A CPUs, on Windows and Linux operating
+systems, and on Amazon EC2 virtual machines.
+
+We present a countermeasure against Prefetch Side-Channel
+
+Attacks on commodity systems, that involves reorganizing
+the user and kernel address space to protect KASLR. Our
+countermeasure requires only a small number of changes to
+operating system kernels and comes with a performance im-
+pact of 0.06–5.09%.
+
+Our key contributions are:
+1. We present two generic attack primitives leveraging
+the prefetch instructions: the translation-level oracle
+and the address-translation oracle. We then use these
+primitives in three diﬀerent attacks.
+
+2. We present a generic attack to infer the translation
+
+level for every virtual address to defeat ASLR.
+
+3. We demonstrate generic unprivileged virtual-to-physical
+
+address translation attack in the presence of a physical
+direct map in kernel or hypervisor, on Linux and in a
+PVM on Amazon EC2. This allows bypassing SMAP
+and SMEP, enabling ret2dir attacks.
+
+4. We present a generic attack to circumvent KASLR,
+
+which enables ROP attacks inside the kernel. We demon-
+strate our attack on a Windows 10 system.
+
+5. We propose a new form of strong kernel isolation to
+mitigate Prefetch Side-Channel Attacks and double
+page fault attacks on kernel memory.
+
+Outline.
+
+This paper is structured as follows. Section 2 provides
+background on caches and address spaces. Section 3 presents
+the settings and two novel attack primitives leveraging the
+prefetch instructions: the translation-level oracle and the
+address-translation oracle. The translation-level oracle is
+used in Section 4 to perform a translation-level recovery at-
+tack to defeat ASLR. The address-translation oracle is used
+in Section 5 to perform unprivileged virtual-to-physical ad-
+dress translation as the basis of ret2dir attacks. Both oracles
+are used in Section 6 to defeat KASLR. Section 7 shows how
+to perform cache side-channel and Rowhammer attacks on
+inaccessible kernel memory. Section 8 presents countermea-
+sures against our attacks. Section 9 discusses related work,
+and Section 10 concludes this article.
+
+2. BACKGROUND AND RELATED WORK
+2.1 Address translation
+
+To isolate processes from each other, CPUs support vir-
+tual address spaces. For this purpose, they typically use a
+multi-level translation table. Which translation table is used
+is determined by a value stored in a CPU register. This reg-
+ister value is exchanged upon a context switch. Thus, each
+process has its own address mappings and only access to
+its own address space. The kernel is typically mapped into
+every address space but protected via hardware-level access
+control. When a thread performs a system call it switches to
+an operating system controlled stack and executes a kernel-
+level system call handler. However, it still has the same
+translation table register value.
+
+In the case of recent Intel CPUs, this translation table has
+4 levels. On each level, translation table entries deﬁne the
+properties of this virtual memory region, e.g., whether the
+memory region is present (i.e., mapped to physical memory),
+or whether it is accessible to user space. The upper-most
+level is the page map level 4 (PML4).
+It divides the 48-
+bit virtual address space into 512 memory regions of each
+512 GB (PML4 entries). Each PML4 entry maps to page
+directory pointer table (PDPT) with 512 entries each con-
+trolling a 1 GB memory region that is either 1 GB of phys-
+ical memory directly mapped (a so-called 1 GB page), or
+to a page directory (PD). The PD again has 512 entries,
+each controlling a 2 MB region that is either 2 MB of phys-
+ical memory directly mapped (a so-called 2 MB page), or a
+page table (PT). The PT again has 512 entries, each con-
+trolling a 4 KB page. The lowest level that is involved in
+the address translation is called the translation level. The
+CPU has special caches and so-called translation-lookaside
+buﬀers for diﬀerent translation levels, to speed up address
+translation and privilege checks.
+
+A second, older mechanism that is used on x86 CPUs in
+virtual-to-physical address translation is segmentation. User
+processes can be isolated from each other and especially from
+the kernel by using diﬀerent code and data segments. Seg-
+ments can have a physical address oﬀset and a size limit, as
+well as access control properties. However, these features are
+widely redundant with the newer translation table mecha-
+nism. Thus, most of these features are not available in 64-bit
+mode on x86 CPUs. In particular, all general purpose seg-
+ments are required to have the oﬀset set to physical address
+0 and the limit to the maximum value. Thus, the CPU can
+ignore these values at runtime and does not have to perform
+runtime range checks for memory accesses.
+2.2 Virtual address space
+
+The virtual address space of every process is divided into
+user address space and kernel address space. The user ad-
+dress space is mapped as user-accessible, unlike the kernel
+space that can only be accessed when the CPU is running in
+kernel mode.The user address space is divided into memory
+regions for code, data, heap, shared libraries and stack. De-
+pending on the operating system, the user address space may
+look entirely diﬀerent in diﬀerent processes with respect to
+the absolute virtual oﬀsets of the regions and also the order
+of the regions. In contrast, the kernel address space looks
+mostly identical in all processes.
+
+To perform context switches, the hardware requires map-
+ping parts of the kernel in the virtual address space of every
+
+3690
+
+Physical memory
+
+max. phys.
+
+a p
+
+m
+
+dire ct
+
+0
+
+User
+
+247 −247
+
+Kernel
+
+−1
+
+Virtual address space
+
+Figure 1: Direct mapping of physical memory. A
+physical address is mapped multiple times, once ac-
+cessible for user space and once in the kernel space.
+
+process. When a user thread performs a syscall or handles
+an interrupt, the hardware simply switches into kernel mode
+and continues operating in the same address space. The
+diﬀerence is that the privileged bit of the CPU is set and
+kernel code is executed instead of the user code. Thus, the
+entire user and kernel address mappings remain generally
+unchanged while operating in kernel mode. As sandboxed
+processes also use a regular virtual address space that is pri-
+marily organized by the kernel, the kernel address space is
+also mapped in an inaccessible way in sandboxed processes.
+Many operating systems have a physical memory region or
+the whole physical memory directly mapped somewhere in
+the kernel space [28, 32]. This mapping is illustrated in Fig-
+ure 1. It is used to organize paging structures and other data
+in physical memory. The mapping is located at a ﬁxed and
+known location, even in the presence of KASLR. Some hy-
+pervisors also employ a direct map of physical memory [49].
+Thus, every user page is mapped at least twice, once in the
+user address space and once in the kernel direct map. When
+performing operations on either of the two virtual addresses,
+the CPU translates the corresponding address to the same
+physical address in both cases. The CPU then performs the
+operation based on the physical address.
+
+Physical direct maps have been exploited in ret2dir at-
+tacks [27]. The attacker prepares a code page to be used in
+the kernel in the user space. Exploiting a kernel vulnera-
+bility, code execution in the kernel is then redirected to the
+same page in the physical direct map. Hence, the attacker
+has obtained arbitrary code execution in the kernel.
+
+2.3 Address-space layout randomization
+Modern CPUs protect against code injection attacks (e.g.,
+NX-bit, W ⊕X policy), code execution in user space memory
+in privileged mode (e.g., SMEP, supervisor mode execution
+protection), and data accesses in user space memory regions
+in privileged mode (e.g., SMAP, supervisor mode access pro-
+tection). However, by chaining return addresses on the stack
+it is possible to execute small code gadgets that already ex-
+ist in the executable memory regions, e.g., return-to-libc and
+ROP attacks. In an ROP attack, the attacker injects return
+addresses into the stack and in some cases modiﬁes the stack
+pointer to a user-controlled region, in order to chain the ex-
+ecution of so-called gadgets. These gadgets are fragments of
+code already existing in the binary, typically consisting of a
+few useful instructions and a return instruction.
+
+ASLR is a countermeasure against these control ﬂow hi-
+jacking attacks. Every time a process is started, its virtual
+memory layout is randomized. ASLR can be applied on
+a coarse-grained level or a ﬁne-grained level.
+In the case
+
+Core 0
+
+Core 1
+
+L
+o
+o
+k
+u
+p
+
+d
+i
+r
+e
+c
+t
+i
+o
+n
+
+ITLB
+
+DTLB
+
+PDE cache
+
+PDPTE cache
+
+PML4E cache
+
+ITLB
+
+DTLB
+
+PDE cache
+
+PDPTE cache
+
+PML4E cache
+
+Page table structures in
+system memory (DRAM)
+
+Figure 2: Paging caches are used to speed-up ad-
+dress translation table lookups.
+
+of coarse-grained ASLR, only the base addresses of diﬀer-
+ent memory regions are randomized, e.g., code, data, heap,
+libraries, stack. This is mostly performed on a page-level
+granularity. An attacker cannot predict addresses of code
+and data and thus cannot inject modiﬁed code or manipu-
+late data accesses. In particular, an attacker cannot predict
+the address of gadgets to be used in an ROP attack. All
+modern operating systems implement coarse-grained ASLR.
+Fine-grained ASLR randomizes even the order of functions,
+variables, and constants in memory on a sub-page-level gran-
+ularity. However, it incurs performance penalties, and can
+be bypassed [47] and thus is rarely used in practice.
+
+User space ASLR primarily protects against remote at-
+tackers that only have restricted access to the system and
+thus cannot predict addresses for ROP chains. KASLR pri-
+marily protects against local attackers as they cannot predict
+addresses in the kernel space for ROP chains. In particular,
+invalid accesses cause a crash of the application under attack
+or the entire system. On Windows, the start oﬀsets of the
+kernel image, drivers and modules, are randomized.
+2.4 CPU caches
+
+CPU caches hide slow memory access latencies by buﬀer-
+ing frequently used data in smaller and faster internal mem-
+ory. Modern CPUs employ set-associative caches, where ad-
+dresses are mapped to cache sets and each cache set consists
+of multiple equivalent cache lines (also called ways). The in-
+dex to determine the cache set for an address can be based on
+the virtual or physical address. The last-level cache is typ-
+ically physically indexed and shared among all cores. Thus
+executing code or accessing data on one core has immediate
+consequences for all other cores.
+
+Address translation structures are stored in memory and
+thus will also be cached by the regular data caches [21]. In
+addition to that, address translation table entries are stored
+in special caches such as the translation-lookaside buﬀers to
+allow the CPU to work with them. When accessing virtual
+addresses these buﬀers are traversed to ﬁnd the correspond-
+ing physical address for the requested memory area. The
+caches of the diﬀerent table lookups are represented in Fig-
+ure 2. These caches are typically fully-associative.
+
+As CPUs are getting faster, they rely on speculative execu-
+tion to perform tasks before they are needed. Data prefetch-
+ing exploits this idea to speculatively load data into the
+cache. This can be done in two diﬀerent ways: hardware
+prefetching, that is done transparently by the CPU itself,
+and software prefetching, that can be done by a program-
+mer. Recent Intel CPUs have ﬁve instructions for software
+
+370prefetching: prefetcht0, prefetcht1, prefetch2, prefetch-
+nta, and prefetchw. These instructions are treated like
+hints to tell the processor that a speciﬁc memory location
+is likely to be accessed soon. The diﬀerent instructions al-
+low hinting future repeated accesses to the same location
+or write accesses. Similarly, recent ARMv8-A CPUs sup-
+ply the prefetch instruction PRFM. Both on Intel and ARM
+CPUs, the processor may ignore prefetch hints.
+
+2.5 Cache attacks
+
+Cache attacks are side-channel attacks exploiting timing
+diﬀerences introduced by CPU caches. Cache attacks have
+ﬁrst been studied theoretically [26,31], but practical attacks
+on cryptographic algorithms followed since 2002 [3, 38, 48].
+In the last ten years, ﬁne-grained cache attacks have been
+proposed, targeting single cache sets. In an Evict+Time at-
+tack [37], the attacker measures the average execution time
+of a victim process, e.g., running an encryption. The at-
+tacker then measures how the average execution time changes
+when evicting one speciﬁc cache set before the victim starts
+its computation.
+If the average execution time is higher,
+then this cache set is probably accessed by the victim.
+
+A Prime+Probe attack [37,41] consists of two steps. In the
+Prime step, the attacker occupies one speciﬁc cache set. Af-
+ter the victim program has been scheduled, the Probe step is
+used to determine whether the cache set is still occupied. A
+new generation of Prime+Probe attacks have recently been
+used to perform attacks across cores and virtual machine
+borders [22, 34, 35] as well as from within sandboxes [36].
+
+Gullasch et al. [13] built a signiﬁcantly more accurate at-
+tack that exploits the fact that shared memory, e.g., shared
+libraries, is loaded into the same cache set for diﬀerent pro-
+cesses running on the same CPU core. Yarom and Falkner [50]
+presented an improvement over this attack, called Flush+
+Reload that targets the last-level cache and thus works across
+cores. Flush+Reload attacks work on a single cache line
+granularity. These attacks exploit shared inclusive last-level
+caches. An attacker frequently ﬂushes a targeted memory lo-
+cation using the clflush instruction. By measuring the time
+it takes to reload the data, the attacker determines whether
+data was loaded into the cache by another process in the
+meantime. Applications of Flush+Reload are more reliable
+and powerful in a wide range of attacks [12, 14, 23, 24, 51].
+
+Flush+Reload causes a high number of cache misses due to
+the frequent cache ﬂushes. This has recently also been used
+to perform a memory corruption attack called Rowham-
+mer [29]. In a Rowhammer attack, an attacker causes ran-
+dom bit ﬂips in inaccessible and higher privileged memory
+regions. These random bit ﬂips occur in DRAM memory
+and the Flush+Reload loop is only used to bypass all levels
+of caches to reach DRAM in a high frequency. Proof-of-
+concept exploits to gain root privileges and to evade a sand-
+box have been demonstrated [44]. For the attack to succeed,
+an attacker must hammer memory locations that map to dif-
+ferent rows in the same bank. However, the mapping from
+addresses to rows and banks is based on physical addresses.
+Thus, Rowhammer attacks are substantially faster and eas-
+ier if physical address information is available as an attacker
+can directly target the comparably small set of addresses
+that map to diﬀerent rows in the same bank. As a counter-
+measure, operating systems have recently restricted access
+to physical address information to privileged processes [30].
+
+3. SETTING AND ATTACK PRIMITIVES
+
+In this section, we describe the prefetch side channel and
+two primitives that exploit this side channel. We build a
+translation-level oracle, that determines whether a page is
+present and which translation table level is used for the
+mapping. This primitive is the basis for our translation-
+level recovery attack described in Section 4 to defeat ASLR.
+We build an address-translation oracle that allows verifying
+whether a speciﬁc virtual address maps to a speciﬁc physi-
+cal address. We use this to resolve the mapping of arbitrary
+virtual addresses to physical addresses to mount ret2dir at-
+tacks, defeating SMAP and SMEP, in Section 5. We use
+both attack primitives in our the KASLR exploit described
+in Section 6.
+3.1 Attack setting and attack vector
+
+Attack setting.
+
+In our attacks, we consider a local attack scenario where
+user space and KASLR are in place. The attacker can run
+arbitrary code on the system under attack, but does not
+have access to the kernel or any privileged interfaces such as
+/proc/self/pagemap providing user space address informa-
+tion. This includes settings such as an unprivileged process
+in a native environment, an unprivileged process in a virtual
+machine, and a sandboxed process.
+
+To exploit a potential vulnerability in kernel code, an at-
+tacker cannot inject code into a writable memory region in
+the kernel, or directly jump into code located in the user
+address space as this is prevented by modern CPUs with
+features like the NX-bit, SMEP, and SMAP. Thus, an at-
+tacker can only reuse existing code in a so-called code reuse
+attack, e.g., ROP attacks. However, building an ROP pay-
+load requires exact knowledge of the addresses space lay-
+out. Even if the operating system does not leak any address
+space information and ASLR is employed and eﬀective, we
+show that the hardware leaks a signiﬁcant amount of address
+space information.
+
+The information gained allows an attacker to conduct
+cache side-channel attacks and Rowhammer attacks, as well
+as to defeat KASLR and bypass SMAP and SMEP in a
+ret2dir-like attack.
+
+Attack vector.
+
+Prefetch Side-Channel Attacks are novel and generic side-
+
+channel attacks. We exploit the following two properties:
+
+Property 1 The execution time of prefetch instructions varies
+
+depending on the state of various CPU internal caches.
+
+Property 2 Prefetch instructions do not perform any priv-
+
+ilege checks.
+
+The execution time (Property 1) of a prefetch instruc-
+tion can be directly measured. It is independent of privi-
+lege levels and access permissions. We exploit this property
+in our translation-level oracle. Intel states that prefetching
+“addresses that are not mapped to physical pages” can in-
+troduce non-deterministic performance penalties [21]. ARM
+states that the prefetch instructions are guaranteed not to
+cause any eﬀect that is not equivalent to loading the address
+directly from the same user process [1]. In both cases, we
+found timing diﬀerences to be deterministic enough to be ex-
+ploitable. That is, Property 1 can be observed on all our test
+
+371Table 1: Experimental setups.
+CPU / SoC
+System type
+
+Microarchitecture
+
+i5-2530M, i5-2540M
+
+Sandy Bridge
+
+Laptop
+Laptop
+Desktop
+Laptop
+Desktop
+
+i5-3230M
+i7-4790
+
+i3-5005U, i5-5200U
+
+i7-6700K
+
+Xeon E5-2650
+Exynos 7420
+
+Ivy Bridge
+
+Haswell
+
+Broadwell
+
+Skylake
+
+Sandy Bridge
+
+Amazon EC2 VM
+
+ARMv8-A
+
+Smartphone
+
+platforms shown in Table 1, i.e., all Intel microarchitectures
+since Sandy Bridge as well as the ARMv8-A microarchitec-
+ture. Thus, attacks based on Property 1 are applicable to
+the vast majority of systems used in practice. We demon-
+strate our translation-level recovery attack on all platforms.
+The timing diﬀerence caused by the lack of privilege checks
+(Property 2) can only be measured indirectly using one of
+the existing cache attack techniques. The combination of
+the prefetch side channel with diﬀerent cache attack tech-
+niques yields diﬀerent properties. Intel states that software
+prefetches should not be used on addresses that are not
+“managed or owned” by the user process [19], but in prac-
+tice does not prevent it, thus letting us do this in our attack.
+Property 2 can be observed on all Intel test platforms shown
+in Table 1, i.e., all microarchitectures since Sandy Bridge.
+Thus, attacks based on Property 2 are applicable to the vast
+majority of desktop, server, and cloud systems.
+
+Measurements.
+
+Measuring the execution time of instructions or memory
+accesses is typically necessary to perform micro-benchmarks.
+On ARM CPUs we experienced no diﬃculties with out-of-
+order execution. We used clock_gettime() to measure time
+in nanoseconds, as in previous work [33], and surrounded
+the target instr. with a memory and instruction barrier con-
+sisting of DSB SY; ISB. Depending on the attack we used a
+memory access or the PRFM instruction as target instruction.
+On Intel CPUs micro-benchmark measurements are sig-
+niﬁcantly harder, due to out-of-order execution. The in-
+structions rdtsc and rdtscp both provide a sub-nanosecond
+timestamp. rdtscp also waits for all memory load opera-
+tions to be processed before retrieving the timestamp. The
+cpuid instruction can be used to serialize the instruction
+stream. To perform accurate measurements, Intel recom-
+mends using a sequence of cpuid; rdtsc before executing
+the code to measure and rdtscp; cpuid afterward [18]. In
+cache side-channel attacks memory fences like mfence can be
+used to ensure that memory store operations are also serial-
+ized. However, the prefetch instruction is not serialized by
+rdtscp or any memory fence, but only by cpuid [20]. Due to
+these serialization issues we crafted instruction sequences to
+measure exactly a target instruction in diﬀerent scenarios:
+
+1. In cases of long measurements and measurements of
+memory access times, the target instruction is unlikely
+to be reordered before a preceding rdtscp instruction.
+We thus use:
+mfence cpuid rdtscp target instr. rdtscp cpuid mfence.
+
+2. When measuring prefetch instructions repeatedly, cor-
+rect values for minimum and median latency are im-
+portant. Thus, noise introduced by cpuid is tolerable
+but reordering the target instruction is not, because it
+could lead to a lower measurement for the minimum
+latency. In this case we use:
+mfence rdtscp cpuid target instr. cpuid rdtscp mfence.
+
+Depending on the attack we used a memory access, or the
+prefetch instructions prefetchnta and prefetcht2 as target
+instruction.
+3.2 Translation-level oracle
+
+In the translation-level oracle, we exploit diﬀerences in
+the execution time of prefetch instructions (Property 1).
+Prefetch instructions resolve virtual addresses to physical
+addresses to enqueue the prefetching request.
+Intel CPUs
+follow a deﬁned procedure to ﬁnd a cache entry or a physi-
+cal address for a speciﬁc virtual address (cf. Section 4.10.3.2
+of Intel Manual Vol. 3A [21]):
+
+1. Cache lookup (requires TLB lookup)
+2. TLB lookup
+3. PDE cache lookup
+4. PDPTE cache lookup
+5. PML4E cache lookup
+
+The procedure aborts as early as possible omitting all sub-
+sequent steps. Step 1 and 2 can be executed in parallel for
+the L1 cache and thus the latency of step 2 is hidden in
+this case. However, in case of the L2 or L3 cache, step 2
+needs to be executed before to complete the cache lookup
+in step 1.
+If no entry is found in any TLB, step 3 needs
+to be executed to complete step 2 and the same applies for
+steps 4 and 5. Depending on the speciﬁc CPU, some caches
+may not be present and the corresponding steps are omitted.
+Every step of the lookup procedure introduces a timing dif-
+ferences that can be measured. For ARM CPUs, the same
+mechanism applies to the corresponding translation tables.
+However, on all CPUs tested, we found at least 4 distinct
+average execution times for diﬀerent cases.
+
+The translation-level oracle works in two steps. First, we
+calibrate the execution time of a prefetch instruction on the
+system under attack. Second, we measure the execution
+time of a prefetch instruction on an arbitrary virtual address.
+Based on the execution time, we can now derive on which
+level a prefetch instruction ﬁnished the search for a cache
+entry or a physical address.
+
+Prefetch instructions on Intel CPUs ignore privilege lev-
+els and access permissions (Property 2). Thus, it is possible
+to prefetch execute-only pages, as well as inaccessible ker-
+nel memory. When running the procedure over the whole
+address space, we now also obtain information on all kernel
+pages. Note that even a process with root privileges could
+not obtain this information without loading a kernel module
+on modern operating systems.
+3.3 Address-translation oracle
+
+The lack of privilege checks (Property 2) is the basis for
+our second oracle, as well as other privilege checks that are
+not active in 64-bit mode on x86 CPUs (cf. Section 2.1). An
+attacker can execute prefetch on any virtual address includ-
+ing kernel addresses and non-mapped addresses. Thus, we
+can use prefetch as an oracle to verify whether two virtual
+addresses p and ¯p map to the same physical address. The
+address-translation oracle works in three steps:
+
+1. Flush address p
+2. Prefetch (inaccessible) address ¯p
+3. Reload p
+
+If the two addresses map to the same physical address, the
+prefetch of ¯p in step 2 leads to a cache hit in step 3 with
+a high probability. Thus, the access time in step 3 is lower
+than for a cache miss. By repeating this measurement, the
+
+372y
+c
+n
+e
+t
+a
+l
+
+.
+
+i
+
+n
+M
+
+250
+
+200
+
+150
+
+100
+
+0
+
+e
+m
+
+i
+t
+
+n
+o
+i
+t
+u
+c
+e
+x
+E
+
+400
+
+300
+
+200
+
+250
+
+100
+
+50
+Page oﬀset in kernel direct map
+
+200
+
+150
+
+Figure 3: Minimum memory access time for an ad-
+dress p after prefetching diﬀerent inaccessible ad-
+dresses, on an i5-3320M. Peak shows the single ad-
+dress ¯p mapping to the same physical address as p.
+
+conﬁdence level can be increased to the desired value. One
+measurement round takes 100–200 nanoseconds on our test
+systems. Thus, an attacker can run up to 10 million such
+measurements per second. Figure 3 shows the minimum
+access time from step 3, over a set of inaccessible addresses ¯p
+measured on an i5-3320M. The peak shows the single address
+¯p that maps to the same physical address as p.
+
+Similarly, we can also perform a microarchitectural tim-
+ing attack on prefetch instructions directly. Based on the
+execution time of prefetch instructions (Property 1), we can
+measure whether a targeted address p is in the cache.
+In
+this Evict+Prefetch-variant of the address-translation ora-
+cle, we exploit both properties of prefetch instructions (cf.
+Section 3.1). As the target address might be inaccessible,
+we evict the address instead of ﬂushing it in the ﬁrst step.
+The prefetching replaces the reload step and checks whether
+the inaccessible address is already in the cache:
+
+1. Evict address p
+2. Execute function or system call
+3. Prefetch p
+
+If the function or system call in step 2 accesses any address
+¯p that maps to the same physical address as address p, we
+will observe a lower timing in step 3 with a high probability.
+Thus, as in the regular address-translation oracle, we deter-
+mine whether an address ¯p and an address p map to the
+same physical address. The diﬀerence is that in the Evict+
+Prefetch-variant the address ¯p is unknown to the attacker.
+Instead, the attacker learns that a targeted address p is used
+by the function or system call.
+
+4. TRANSLATION-LEVEL
+
+RECOVERY ATTACK
+
+In this section, we describe how to determine the trans-
+lation level from an unprivileged user space process based
+on the translation-level oracle described in Section 3.2. Pro-
+cesses with root privileges can normally obtain system infor-
+mation to derive the translation level, for instance on Linux
+using the pagemap ﬁle in procfs. However, even here the
+information provided by the operating system is incomplete
+and to obtain the translation-level information for kernel
+memory, it is necessary to install a kernel module for this
+purpose. We instead only rely on the timing diﬀerence ob-
+served when running a prefetch attack on an address.
+
+Figure 4 shows the median prefetch execution time for 5
+diﬀerent cases measured on an i5-2540M compared to the
+actual mapping level. We measured the execution time of
+prefetchnta and prefetcht2 in 0.5 million tests. The low-
+est median timing can be observed when the address is valid
+
+383
+
+230
+
+P D P T
+
+246
+
+P D
+
+222
+
+P T
+P a g e
+
+181
+( c a c h e d )
+P a g e
+
+( u n c a c h e d )
+
+Mapping level
+
+Figure 4: Median prefetch execution time in cycles
+compared to the actual address mapping level, mea-
+sured on an i5-2540M.
+
+Check PML4 oﬀsets
+
+0
+
+0
+
+0
+
+Check PDPT offsets
+
+Check PDPT offsets
+
+Check PD offsets
+
+511
+
+511
+
+0
+
+1 GB page
+
+511
+
+511
+
+2 MB page
+
+Entry present
+
+Figure 5: Breadth-ﬁrst search through the page
+translation entries that are present. The attacker
+obtains an accurate map of the page translation level
+for user and kernel address space.
+
+and cached, with a median of 181 cycles. It is interesting
+to observe that prefetching a non-cached address when all
+TLB entries are present has a median execution time of 383
+cycles. Thus, we can use prefetch instructions to distinguish
+cache hits and misses for valid addresses. In case the tar-
+geted address is not valid, we observe diﬀerent execution
+times depending the mapping level where the address reso-
+lution ends. If the memory region has a page directory but
+the page table is not valid, the median execution time is 222
+cycles. If the memory region does not have a page directory
+but a PDPT, the median execution time is 246 cycles.
+If
+the memory region does not have a PDPT, the median ex-
+ecution time is 230 cycles. Note that these timings strongly
+depend on the measurement techniques in Section 3.1.
+
+We perform a breadth-ﬁrst search starting with the PML4
+and going down to single pages as illustrated in Figure 5.
+We start the recovery attack with the top-level PML4 re-
+cursively going down to the lowest level (cf. Section 2.1).
+We eliminate measurement noise by checking multiple ad-
+dresses in each of the 512 regions on each layer. The median
+execution time of a prefetch instruction sequence is used to
+decide whether a PDPT is mapped or not. On the PDPT
+level we thus obtain information on 1 GB pages, on the PD
+level we obtain information on 2 MB pages and on the lowest
+level (PT) we obtain information on 4 KB pages. On each
+level we learn whether the address is mapped directly from
+this level, or a lower level, or whether it is marked as invalid.
+For a single check, we perform 28 tests that in total take
+less than 4ms on the i5-2540M. We check 4 addresses per
+region and thus require less than 16ms per memory region.
+Thus, for every translation table that is present, our attack
+has a runtime of approximately 8 seconds. Programs on
+
+373Linux typically use at least 8 translations tables (1 PML4,
+2 PDPTs, 2 page directories, 3 page tables). The total run-
+time to only recover the translation levels for the user space
+here is approximately 1 minute. However, recovering the
+translation levels for the kernel can take several minutes if
+1 GB pages are used by the kernel, or even several hours if
+2 MB pages are used for the physical direct map. If more
+addresses are mapped in the user space, the execution time
+can increase to several minutes or hours, depending on the
+target process.
+
+In either case, our attack successfully recovers the trans-
+lation level which is normally only accessible for processes
+with root privileges. Obtaining this information eﬀectively
+defeats ASLR, as the attacker can now accurately deter-
+mine which addresses are mapped to physical memory by
+locating libraries or drivers in inaccessible memory regions.
+Finally, our attack defeats recently proposed countermea-
+sures [7] that employ execute-only mappings, as prefetch
+instructions ignore access permissions.
+
+Translation-level recovery from Android apps.
+
+Similarly to 64-bit x86, 64-bit ARMv8-A has a 4-level page
+translation mechanism. This is for instance the case on our
+Samsung Galaxy S6 with an Exynos 7420 system-on-chip
+with a non-rooted stock Android system. On this system, we
+use the unprivileged PRFM PLDL1KEEP instruction to prefetch
+memory and the unprivileged DC CIVAC instruction to ﬂush
+memory from user space.
+
+The basic translation-level recovery attack on our ARMv8-
+A CPU is the same as on Intel x86 CPUs. The timing
+measurement by clock_gettime provides a measurement
+on a nanosecond scale. The timing measurement is signiﬁ-
+cantly faster than on Intel x86 CPUs as there is no cpuid
+instruction consuming a signiﬁcant amount of cycles. We
+performed 28 tests per address from an Android app.
+In
+total this takes less than 50µs on our ARMv8-A system.
+Thus, the translation-level recovery attack runs on ARM-
+based devices successfully.
+5. ADDRESS-TRANSLATION ATTACK
+
+In this section, we describe how to mount ret2dir-like at-
+tacks without knowledge of physical addresses based on our
+address-translation oracle. We also build an eﬃcient attack
+to resolve virtual addresses to physical addresses. This at-
+tack exploits the physical direct map in the kernel. Many
+operating systems and hypervisors use such a mapping to
+read and write on physical memory [28, 32, 49]. The phys-
+ical direct map has been exploited by Kemerlis et al. [27]
+to bypass SMEP in their attack called ret2dir. Similarly,
+this map can also be used for return stacks in an ROP at-
+tack if the attacker has knowledge of the physical address of
+user-accessible memory. However, our address-translation
+attack is not restricted to ret2dir-like attacks, it also pro-
+vides physical address information that is necessary in many
+side-channel attacks and fault attacks [11,22,29,30,34,42,45].
+The attack does not require prior knowledge of the virtual
+oﬀset of the physical direct map in the kernel. This oﬀset
+is typically ﬁxed, but it can also be determined by using a
+translation-level recovery attack. We demonstrate our at-
+tack on a native Ubuntu Linux system, and from within an
+Amazon EC2 instance.
+
+The attacker runs the address-translation oracle on one
+address p and one address ¯p in the virtual memory area of
+
+Prefetched
+
+Not prefetched
+
+s
+e
+s
+a
+C
+
+108
+
+105
+
+102
+
+100
+
+150
+
+250
+
+300
+200
+Latency in cycles
+
+350
+
+400
+
+Figure 6: Access latency that has (or has not) been
+prefetched through a kernel address. Measurements
+performed on Linux on an Intel i5-3320M.
+
+s
+d
+n
+o
+c
+e
+S
+
+150
+
+100
+
+50
+
+0
+
+Expected time per GB
+
+Raw false negatives
+60%
+
+40%
+
+20%
+
+0%
+
+i 5 - 2 5 4 0 M
+
+i 5 - 3 2 3 0 M
+
+i 7 - 4 7 9 0
+
+i 5 - 5 2 0 0 U
+
+i 7 - 6 7 0 0 K
+
+Experimental setup
+
+Figure 7: Expected brute-force search time per GB
+of physical memory, searching for a 2 MB page. Raw
+false negative rate after a single run of the attack.
+On all platforms the whole system memory can be
+searched exhaustively within minutes to hours.
+
+the kernel that is directly mapped to physical memory. The
+timing diﬀerence resulting from prefetching ¯p is shown in
+Figure 6. Note that p and ¯p have the same page oﬀset, as
+the page oﬀset is identical for physical and virtual pages. By
+only checking the possible oﬀsets based on the known page
+size, the attacker reduces the number of addresses to check
+to a minimum. The search space for 2 MB pages is only 512
+possibilities per 1 GB of physical memory and for 4 KB pages
+only 262 144 possibilities per 1 GB of physical memory. The
+attacker performs a brute-force search for the correct kernel
+physical direct-map address by trying all possible values for
+¯p. Finding an address ¯p means that the attacker has ob-
+tained an address that maps user space memory in the ker-
+nel address space, thus providing a bypass for SMAP and
+SMEP. Thus it is possible to mount ret2dir-like attacks us-
+ing this address. However, the correct physical address can
+be obtained by subtracting the virtual address of the start
+of the physical direct map. On Linux, the physical direct
+map is located at virtual address 0xffff 8800 0000 0000.
+Figure 7 shows the average brute-force search time per gi-
+gabyte of physical memory, when searching for a 2 MB page.
+In this search, we ran our address-translation oracle 214 to
+217 times, depending on the architecture.
+Increasing the
+number of runs of the address-translation oracle decreases
+the false negative rate but at the same time increases the
+execution time. We did not ﬁnd any false positives in any
+of the native attack settings. Depending on the architec-
+ture, delays were introduced to lower the pressure on the
+prefetcher. The highest accuracy was achieved on the i5-
+3230M (Ivy Bridge), the i7-4790 (Haswell), and the i5-5200U
+(Broadwell) systems where the false negative rate was be-
+
+374tween 7% and 13%. The accuracy was signiﬁcantly lower
+on the i5-2540M (Sandy Bridge) test system. However, the
+false-negative rate remained at ≥ 25% even with a higher
+number of address-translation oracle runs. For the expected
+execution time per gigabyte of physical memory, we com-
+puted how long the attacks have to be repeated until the
+physical address is found with a probability of more than
+99%. The i5-2540M (Sandy Bridge) test system had the
+highest false negative rate and thus the expected search time
+is the highest here. Similarly, on the Skylake system, the at-
+tack needs to be executed 3 times to ﬁnd a physical address
+with a probability of more than 99%. However, as the exe-
+cution time per round of the attack on the Skylake system
+was much lower than on the other systems, the expected
+execution time is close to the other systems.
+
+Getting host physical addresses on Amazon EC2.
+
+On the Amazon EC2 instance running Linux, we exploit
+the Xen PVM physical direct map, located at virtual address
+0xffff 8300 0000 0000. Apart from this, the basic attack
+remains the same. To perform the attack on an Amazon
+EC2 instance, we compensated the noise by checking mul-
+tiple 4 KB oﬀsets per 2 MB page. Our machine was sched-
+uled on an Intel Xeon E5-2650 (Sandy Bridge). In a dual
+CPU conﬁguration, it can manage up to 768 GB of physical
+memory. To compensate for this huge amount of poten-
+tially addressable physical memory, we reduced the number
+of address-translation oracle runs from 215 to 213. Our at-
+tack speed is thus reduced from 154 seconds to 46 seconds
+per gigabyte on average, limiting the total attack time to
+less than 10 hours. While this is signiﬁcantly more than
+in a native environment with a smaller amount of physical
+memory, it is still practical to use this attack to translate a
+small number of virtual addresses to physical addresses.
+
+As we had no direct access to the real address translation
+information, we veriﬁed our results based on the technique
+from Section 3.3. Translations are considered correct if mul-
+tiple consecutive veriﬁcation loops conﬁrm that the hypervi-
+sor physical direct-map addresses indeed allow prefetching
+the targeted user virtual address, and if the mappings of
+multiple addresses from the same virtual page can be con-
+ﬁrmed as well using the address-translation oracle. We ob-
+tained an accuracy of the attack in the cloud that is compa-
+rable to the accuracy of the attack in a native environment.
+The presumably correct physical address is always found,
+i.e., no false negatives. When searching through the maxi-
+mum 768 GB of address space, we consistently found 1 false
+positive match (i.e., a 2 MB page) that was later eliminated
+in the veriﬁcation loop.
+
+Other operating systems.
+
+Many other operating systems, such as BSD or OSX,
+maintain a physical direct map. However, we found no such
+mapping on Windows. Thus, our address-translation oracle
+can not directly be applied to Windows systems.
+
+Although 64-bit Android has a physical direct map lo-
+cated at virtual address 0xffff ffc0 0000 0000 and 32-
+bit Android at virtual address 0xc000 0000, we were not
+able to build an address-translation oracle on Android. As
+the prefetch instructions do not prefetch kernel addresses
+mapped through the second translation-table base register,
+the attack is mitigated. However, an attack could be pos-
+sible on systems where user space and kernel space share a
+
+translation-table base register, while the kernel would still
+be inaccessible. Similarly, the attack does not work on to-
+day’s Google NaCl sandbox as it uses a 32-bit address space
+using 32-bit segmentation. The sandboxed process there-
+fore only partially shares an address space with the non-
+sandboxed code and thus the attack is mitigated. However,
+we veriﬁed that a Prefetch Side-Channel Attack using cache
+eviction instead of clflush within the Google NaCl sandbox
+works on the lowest 4 GB of virtual memory. Thus, when
+Google NaCl introduces support for 64-bit address spaces
+in the NaCl sandbox, 32-bit segmentation cannot be used
+anymore and our attack is likely to succeed on all virtual
+addresses and thus to leak physical addresses to sandboxed
+processes.
+
+6. KERNEL ASLR EXPLOIT
+
+In this section, we demonstrate how to defeat KASLR by
+using prefetch instructions. We demonstrate our attack on
+Windows 10 and Windows 7 systems. Similarly as in the
+previous attack, we try to locate mapped memory regions in
+address space regions that are not accessible from user space.
+Again, we exploit the omission of privilege checks by prefetch
+instructions (Property 2). As described in Section 3, we use
+prefetch instructions in combination with code execution to
+identify the load address of drivers in kernel mode in this
+ﬁrst stage of the attack. In the second stage of the attack,
+we determine addresses used by a speciﬁc driver. By locating
+the driver, we eﬀectively defeat KASLR.
+
+Similarly, on Windows 7, kernel and hardware-abstraction
+layer are located between virtual address 0xffff f800 0000
+0000 and 0xffff f87f ffff ffff and system drivers are lo-
+cated between virtual address 0xffff f880 0000 0000 and
+0xffff f88f ffff ffff. On Windows 10, the address range
+is extended to the region from 0xffff 8000 0000 0000 to
+0xffff 9fff ffff ffff. Which drivers are present in the
+driver area depends on the system conﬁguration. Further-
+more, the order in virtual address space directly depends on
+the order the drivers are loaded, which again depends on
+the system conﬁguration. To exploit a kernel vulnerability
+and build an ROP chain in the code of a known driver, an
+attacker has to know the exact address oﬀset of the driver.
+However, the exact address oﬀsets are randomized and can
+normally not be retrieved from user processes. Our attack
+exploits that KASLR does not randomize the oﬀset of drivers
+on a sub-page level. Kernel and hardware-abstraction layer
+are loaded on consecutive 2 MB pages with a random 4 KB
+start oﬀset on Windows 7. Thus, we cannot attack this
+memory region directly using a translation-level recovery at-
+tack. However, an Evict+Prefetch attack is possible on any
+kernel memory region. To build the most eﬃcient attack, we
+target the driver memory area where we can ﬁrst perform a
+translation-level recovery attack and an Evict+Prefetch at-
+tack afterward. Windows 10 uses 4 KB pages instead, adding
+entropy to the randomized driver location.
+
+In the ﬁrst stage of our attack, we locate addresses mapped
+to physical memory in the driver memory area using our
+translation-level recovery attack. Figure 8 illustrates the
+timing diﬀerence between valid and invalid addresses in the
+driver region on Windows 7 on an Intel i3-5005U. As drivers
+are loaded consecutively in the virtual address space, we
+found it to be suﬃcient for our attack to search through the
+address space in 2 MB steps and measure where pages are
+mapped to physical memory. On Windows 7, the average
+
+375s
+e
+s
+a
+C
+
+100%
+75%
+50%
+25%
+0%
+
+Valid
+
+Invalid
+
+80
+
+100
+
+120
+
+140
+
+Time in cycles
+
+Figure 8: Timing diﬀerence of a prefetch sequence
+on valid and invalid addresses in kernel space, from
+unprivileged user space process. Measurements per-
+formed on Windows 7 on an Intel i3-5005U.
+
+120
+
+110
+
+100
+
+90
+
+e
+m
+
+i
+t
+
+n
+o
+i
+t
+u
+c
+e
+x
+e
+
+.
+g
+v
+A
+
+0
+
+4,000
+
+8,000
+
+12,000
+
+Page oﬀset in kernel driver region
+
+Figure 9: Second stage: driver region is searched
+by measuring average execution times of prefetching
+addresses in the driver memory area from the ﬁrst
+stage. Lowest average execution time is measured
+on an address in the memory of the targeted driver.
+
+runtime for the ﬁrst stage of the attack, mapping both the
+kernel region and the driver region, is 7 ms on an idle sys-
+tem. On Windows 10, the ﬁrst stage runs in 64 KB steps and
+takes 101 ms on average. As Windows 10 maps 4 KB pages
+we scan the address range in 4 KB steps in an intermediate
+step taking 180 ms on average. At a high system load, the
+attack requires several hundred repetitions to perform the
+ﬁrst stage of the attack reliably, having an average runtime
+below 2 seconds on Windows 7.
+
+In the second stage of our attack, we use the Evict+
+Prefetch variant of the address-translation oracle. Instead
+of searching for pages that are mapped to physical memory,
+we now determine whether a target address p is used by a
+syscall. Therefore, we perform the Evict+Prefetch attack
+over all potentially used addresses in a random order. We
+run the following three steps:
+
+1. We evict all caches. For this purpose, we access a
+buﬀer large enough to evict all driver addresses from all
+TLBs, page translation caches, code and data caches.
+2. We perform a syscall to the targeted driver. If the tar-
+get address p is used by the targeted driver, the CPU
+fetches it into the caches while executing the syscall.
+
+3. We measure the timing of a prefetch instruction se-
+quence. This reveals whether the target address p was
+loaded into the cache by the driver in the second step.
+In order to verify the measurement, we perform a control
+run where we omit the system call to the targeted driver. If
+the execution time of a prefetch instruction sequence on the
+target address p is higher without the system call, we learn
+that p is in fact used by the driver and not loaded into the
+cache by other driver activity on the system. The attack
+can be repeated multiple times to increase the accuracy.
+
+By determining the lowest virtual address in the driver
+region that is used by the targeted driver, we learn where
+the driver starts. As we know the driver version we can now
+use the virtual addresses from this kernel driver in return-
+oriented-programming attacks.
+
+The average runtime for the second stage of the attack is
+490 seconds on Windows 7. Thus, the total average runtime
+is below 500 seconds on Windows 7 on our i3-5005U. On
+Windows 10 we narrowed down the potential addresses in
+the ﬁrst stage more than in Windows 7. Thus, the average
+runtime of the second stage is also lower on Windows 10,
+requiring only 12 seconds on average to locate a driver.
+
+7. OTHER APPLICATIONS
+
+In this section, we discuss how prefetch instructions can
+be used in other cache attacks. First, we implemented mod-
+iﬁed variant of Flush+Reload called Flush+Prefetch. The
+measurement accuracy of this cache attack is comparable to
+Prime+Probe while the spatial accuracy is the same as in
+a Flush+Reload attack. We veriﬁed the feasibility of this
+attack by implementing a cross-core covert channel. On a
+Haswell i7-4790 we achieved a performance of 146 KB/s at
+an error rate of < 1%. This is in the same order of magnitude
+as the fastest state-of-the-art cache covert channels [11].
+
+Second, the Evict+Prefetch variant of the address-trans-
+lation oracle can be used to perform a Flush+Reload -style
+attack on privileged kernel addresses.
+Indeed, we demon-
+strated such an attack in Section 6 to detect whether speciﬁc
+virtual addresses are used by a driver. However, an attacker
+could also spy on the usage of known virtual addresses in
+kernel code and drivers. This would allow monitoring activ-
+ity on system and speciﬁc hardware interfaces.
+
+Third, the Evict+Prefetch attack also allows performing
+Rowhammer attacks on privileged addresses. An attacker
+could directly target kernel page tables or any other kernel
+data structure. As the execution time is lower than that
+of Evict+Reload , an attack is likely possible. We veriﬁed
+that bit ﬂips can be induced by this attack on a system
+running at a refresh rate reduced to 25%. However, we leave
+examinations on the prevalence of this problem on default
+conﬁgured systems and the study of practical Rowhammer
+exploits using Evict+Prefetch open to future work.
+
+8. COUNTERMEASURES
+
+In this section, we discuss countermeasures against Prefetch
+
+Side-Channel Attacks. First, we propose a new form of
+strong kernel isolation, that eﬀectively prevents all Prefetch
+Side-Channel Attacks on the kernel address space. Second,
+we will discuss countermeasures that have been proposed
+against other side-channel attacks and hardware modiﬁca-
+tions to mitigate Prefetch Side-Channel Attacks.
+
+Stronger kernel isolation.
+
+Removing the identity mapping would help against our
+virtual-to-physical address translation attack and completely
+prevent ret2dir-like attacks, however, it would not protect
+against our KASLR or translation-level recovery attacks.
+
+We propose stronger kernel isolation, a new form of strong
+kernel isolation, to provide security against a wide range of
+attacks. Strong kernel isolation ensures that no address is
+mapped in both user space and kernel space. This mech-
+anism has initially been proposed by Kemerlis et al. [27].
+
+376Today’s operating systems:
+
+Shared address space
+
+User memory
+
+Kernel memory
+
+context switch
+
+Stronger kernel isolation:
+
+User address space
+
+User memory
+
+Not mapped
+
+−1
+
+−1
+
+context switch
+
+a
+d
+d
+r
+.
+
+s
+p
+a
+c
+e
+
+s
+w
+i
+t
+c
+h
+
+Interrupt
+dispatcher
+
+Not mapped
+
+Kernel memory
+
+Kernel address space
+
+−1
+
+0
+
+0
+
+0
+
+Figure 10: Currently kernel and user memory
+are only separated through privilege levels. With
+stronger kernel isolation, the kernel switches from
+the user space to a dedicated kernel space, directly
+after a context switch into privileged mode. Thus,
+only a negligible portion of interrupt dispatcher code
+is mapped in both address spaces.
+
+Their approach unmaps pages from the kernel physical di-
+rect map when they are mapped in user space. This only
+introduces a performance penalty of 0.18–2.91%. However,
+this is not suﬃcient to protect against our attacks. Instead,
+stronger kernel isolation does not run syscalls and unrelated
+kernel threads in the same address space as user threads.
+We propose to switch the address translation tables imme-
+diately after the context switch into the kernel. Thus, only
+short and generic interrupt dispatching code would need to
+be mapped in the same address space used by the user pro-
+gram. The remainder of the kernel and also the direct map-
+ping of physical memory would thus not be mapped in the
+address translation tables of the user program. This layout
+is illustrated in Figure 10.
+
+Stronger kernel isolation also eliminates the double page
+fault side channel [17], as no virtual address in the user pro-
+gram is valid in both user space and kernel space. This
+countermeasure can be implemented on commodity hard-
+ware and existing operating systems and it only requires a
+few modiﬁcations in operating system kernels. The perfor-
+mance impact is comparably small as switching the address
+translation tables has to be done once per context switch
+into the kernel and once per context switch from the ker-
+nel back to the user space. This is done by replacing the
+value in the cr3 register on Intel x86 CPUs once per con-
+text switch. We implemented a proof-of-concept to measure
+the overhead of updating the cr3 as an estimate for the per-
+formance penalty of stronger kernel isolation. Table 2 shows
+the overhead in diﬀerent benchmarks. We observe that for
+benchmarks that perform a small number of syscalls, the
+performance overhead is negligible, e.g., 0.06%. For other
+benchmarks the overhead can be higher, e.g., up to 5.09%
+in the case of pgbench.
+
+State-of-the-art countermeasures.
+
+While there have been recent advances in detecting cache
+attacks using performance counters [6, 11, 15, 40] it is less
+
+Table 2: Estimation of overhead.
+
+Benchmark
+
+Baseline
+
+Stronger kernel isolation Overhead
+
+apache
+pgbench
+pybench
+x264
+
+37578.83 req./s
+146.81 trans./s
+1552 ms
+96.20 fps
+
+37205.16 req./s
+139.70 trans./s
+1553 ms
+96.14 fps
+
++1.00%
++5.09%
++0, 06%
++0.06%
+
+clear whether this is also applicable to Prefetch Side-Channel
+Attacks. Prefetch Side-Channel Attacks can indeed cause
+an increased number of DTLB misses and thus could be de-
+tected using hardware performance counters. We observe
+approximatively 4 billion DTLB hits/minute while brows-
+ing in Firefox, and approximatively 47 billion while running
+our virtual-to-physical attack. A more thorough evaluation
+is needed to assess false positives. While there are numerous
+events related to prefetching that can be monitored with per-
+formance counters, to the best of our knowledge, since Ne-
+halem micro-architecture it is not possible anymore to mon-
+itor software prefetching but only hardware prefetching [21].
+Future work has to show whether performance counters can
+indeed be used for a reliable detection mechanism. We also
+note that while it is possible to disable hardware prefetching,
+it is not possible to disable software prefetching.
+
+Hardware modiﬁcations.
+
+Complete protection against Prefetch Side-Channel At-
+tacks could also be achieved through microarchitectural mod-
+iﬁcations. We think that prefetch instructions need to be
+modiﬁed in two ways to completely close this attack vector.
+First, if prefetch instructions performed privilege checks just
+as other memory referencing instructions, prefetching kernel
+addresses would trigger a segmentation fault and the process
+would be killed. It would also prevent measuring the trans-
+lation table levels over the whole address space as the pro-
+cess would be killed after accessing the ﬁrst invalid address.
+Second, prefetch instructions leak timing information on the
+cache state. The timing diﬀerence on our ARM-based smart-
+phones was even higher than on our Intel x86 test system.
+Eliminating this timing diﬀerence would only introduce a
+small performance overhead, as prefetch instruction are not
+used by most software. This would prevent cache attacks
+based on prefetch instructions completely.
+
+9. RELATED WORK
+
+Hund et al. [17] demonstrated three timing side channel
+attacks to obtain address information. The ﬁrst is a cache
+attack searching for cache collisions with kernel addresses.
+The second performs double page faults to measure timing
+diﬀerences for valid and invalid memory regions introduced
+by the TLB. The third exploits page fault timing diﬀerences
+due to the TLB and address translation caches. The ﬁrst
+attack is mitigated on current operating systems by prevent-
+ing access to physical addresses, and the second and third
+attacks can be prevented at the operating system level by
+preventing excessive use of page faults leading to segmenta-
+tion faults. In contrast, our attack exploits the TLB and ad-
+dress translation caches without triggering any page faults.
+Furthermore, as our approach leaks the timing more directly
+through prefetch instructions, it is faster and retrieves infor-
+mation on a ﬁner granularity, i.e., we can obtain the exact
+virtual-to-physical address translation. Our approach is also
+more generic as it bypasses the operating system.
+
+377Kemerlis et al. [27] presented two methods providing a ba-
+sis of ret2dir attacks. First, they use the procfs interface to
+obtain physical addresses, now mitigated on current operat-
+ing systems by preventing access to this interface. Second,
+they perform a memory spraying attack where they can use
+any address in the physical direct map for their ret2dir at-
+tack. Our attack enables ret2dir-like attacks without knowl-
+edge of physical addresses and recovery of physical addresses
+from unprivileged user space applications, enabling ret2dir
+attacks. As a countermeasure, they proposed strong kernel
+isolation, which we extended in this paper.
+
+Barresi et al. [2] focused on a cross-VM scenario to break
+ASLR in the cloud with CAIN, while our work mostly fo-
+cuses on a local attack, that can also be performed on a
+guest VM. However, CAIN attacks assume a cloud environ-
+ment that enables memory deduplication, which is already
+known to be nefarious and is not deployed on e.g., Ama-
+zon EC2. In contrast, our attacks do not require memory
+deduplication and have been performed on Amazon EC2.
+
+Bhattacharya et al. [4] showed that hardware prefetching,
+performed automatically by the CPU, leaks information. In
+contrast to this work, we exploit software prefetching which
+can be triggered at any time by an attacker, from user space.
+The hardware prefetcher has also been used by Fuchs and
+Lee [9], as a countermeasure against cache side channels.
+
+Concurrent to our work, Jang et al. [25] exploited In-
+tel TSX transaction to defeat KASLR. TSX transactions
+prevent pagefaults by jumping to an alternative code path.
+When accessing or executing on kernel address the timing
+diﬀerence until reaching the alternative code path leaks in-
+formation on the address translation caches. Evtyushkin et al.
+[8] exploit the branch-target buﬀer to break KASLR. Finally,
+Chen et al. [5] proposed dynamic ﬁne-grained ASLR during
+runtime to defeat KASLR attacks.
+
+10. CONCLUSION
+
+Prefetch Side-Channel Attacks are a new class of generic
+attacks exploiting fundamental weaknesses in the hardware
+design of prefetch instructions. These new attacks allow un-
+privileged local attackers to completely bypass access con-
+trol on address information and thus to compromise an en-
+tire physical system by defeating SMAP, SMEP, and kernel
+ASLR. Our attacks work in native and virtualized environ-
+ments alike. We introduced two primitives that build the
+basis of our attacks. First, the translation-level oracle, ex-
+ploiting that prefetch leaks timing information on address
+translation. Second, the address-translation oracle, exploit-
+ing that prefetch does not perform any privilege checks and
+can be used to fetch inaccessible privileged memory into
+various caches. The translation-level oracle allowed us to
+defeat ASLR and locate libraries and drivers in inaccessi-
+ble memory regions. Using the address-translation oracle,
+we were able to resolve virtual to physical addresses on 64-
+bit Linux systems and from unprivileged user programs in-
+side an Amazon EC2 virtual machine. This is the basis for
+ret2dir-like attacks that bypass SMEP and SMAP. Based on
+both oracles, we demonstrated how to defeat kernel ASLR
+on Windows 10, providing the basis for ROP attacks on ker-
+nel and driver binary code. As a countermeasure against
+this new class of attacks, we proposed stronger kernel isola-
+tion, such that syscalls and unrelated kernel threads do not
+run in the same address space as user threads. This coun-
+termeasure only requires a few modiﬁcations in operating
+
+system kernels and that the performance penalty is as low
+as 0.06–5.09%. Therefore, we recommend that it is deployed
+in all commodity operating systems.
+
+11. ACKNOWLEDGMENTS
+
+We would like to thank Klaus Wagner for help with some
+experiments and our anonymous reviewers for their valuable
+comments and suggestions.
+
+Supported by EU Horizon 2020 programme
+GA No. 644052 (HECTOR) and EU FP7
+programme GA No. 610436 (MATTHEW).
+
+12. REFERENCES
+[1] ARM Limited. ARM Architecture Reference Manual
+
+ARMv8. ARM Limited, 2013.
+
+[2] A. Barresi, K. Razavi, M. Payer, and T. R. Gross.
+
+CAIN: silently breaking ASLR in the cloud. In
+WOOT’15, 2015.
+
+[3] D. J. Bernstein. Cache-Timing Attacks on AES.
+
+http://cr.yp.to/antiforgery/cachetiming-20050414.pdf,
+2004.
+
+[4] S. Bhattacharya, C. Rebeiro, and D. Mukhopadhyay.
+
+Hardware prefetchers leak : A revisit of SVF for
+cache-timing attacks. In 45th International Symposium
+on Microarchitecture Workshops (MICRO’12), 2012.
+
+[5] Y. Chen, Z. Wang, D. Whalley, and L. Lu. Remix:
+
+On-demand live randomization. In 6th ACM
+Conference on Data and Application Security and
+Privacy, 2016.
+
+[6] M. Chiappetta, E. Savas, and C. Yilmaz. Real time
+detection of cache-based side-channel attacks using
+hardware performance counters. Cryptology ePrint
+Archive, Report 2015/1034, 2015.
+
+[7] S. Crane, C. Liebchen, A. Homescu, L. Davi,
+
+P. Larsen, A. Sadeghi, S. Brunthaler, and M. Franz.
+Readactor: Practical code randomization resilient to
+memory disclosure. In S&P’15, pages 763–780, 2015.
+
+[8] D. Evtyushkin, D. Ponomarev, and N. Abu-Ghazaleh.
+
+Jump Over ASLR: Attacking Branch Predictors to
+Bypass ASLR. In IEEE/ACM International
+Symposium on Microarchitecture (MICRO), 2016 (to
+appear).
+
+[9] A. Fuchs and R. B. Lee. Disruptive Prefetching:
+
+Impact on Side-Channel Attacks and Cache Designs.
+In Proceedings of the 8th ACM International Systems
+and Storage Conference (SYSTOR’15), 2015.
+
+[10] D. Gruss, C. Maurice, and S. Mangard.
+
+Rowhammer.js: A Remote Software-Induced Fault
+Attack in JavaScript. In DIMVA’16, 2016.
+
+[11] D. Gruss, C. Maurice, K. Wagner, and S. Mangard.
+Flush+Flush: A Fast and Stealthy Cache Attack. In
+DIMVA’16, 2016.
+
+[12] D. Gruss, R. Spreitzer, and S. Mangard. Cache
+
+Template Attacks: Automating Attacks on Inclusive
+Last-Level Caches. In USENIX Security Symposium,
+2015.
+
+[13] D. Gullasch, E. Bangerter, and S. Krenn. Cache
+
+Games – Bringing Access-Based Cache Attacks on
+AES to Practice. In S&P’11, 2011.
+
+[14] B. G¨ulmezo˘glu, M. S. Inci, T. Eisenbarth, and
+
+B. Sunar. A Faster and More Realistic Flush+Reload
+
+378Attack on AES. In Constructive Side-Channel
+Analysis and Secure Design (COSADE), 2015.
+
+[15] N. Herath and A. Fogh. These are Not Your Grand
+
+Daddys CPU Performance Counters – CPU Hardware
+Performance Counters for Security. In Black Hat 2015
+Brieﬁngs, 2015.
+
+[16] R. Hund, T. Holz, and F. C. Freiling. Return-oriented
+
+rootkits: Bypassing kernel code integrity protection
+mechanisms. In USENIX Security Symposium, 2009.
+[17] R. Hund, C. Willems, and T. Holz. Practical Timing
+Side Channel Attacks against Kernel Space ASLR. In
+S&P’13, 2013.
+
+[18] Intel. How to Benchmark Code Execution Times on
+Intel IA-32 and IA-64 Instruction Set Architectures
+White Paper, 2010.
+
+[19] Intel. Intel R(cid:13) 64 and IA-32 Architectures Optimization
+[20] Intel. Intel R(cid:13) 64 and IA-32 Architectures Software
+
+Reference Manual. 2014.
+
+Developer’s Manual Volume 2 (2A, 2B & 2C):
+Instruction Set Reference, A-Z. 253665, 2014.
+
+[21] Intel. Intel R(cid:13) 64 and IA-32 Architectures Software
+
+Developer’s Manual, Volume 3 (3A, 3B & 3C): System
+Programming Guide. 253665, 2014.
+
+[33] M. Lipp, D. Gruss, R. Spreitzer, C. Maurice, and
+
+S. Mangard. ARMageddon: Last-Level Cache Attacks
+on Mobile Devices. In USENIX Security Symposium,
+2016.
+
+[34] F. Liu, Y. Yarom, Q. Ge, G. Heiser, and R. B. Lee.
+
+Last-Level Cache Side-Channel Attacks are Practical.
+In S&P’15, 2015.
+
+[35] C. Maurice, C. Neumann, O. Heen, and A. Francillon.
+
+C5: Cross-Cores Cache Covert Channel. In
+DIMVA’15, 2015.
+
+[36] Y. Oren, V. P. Kemerlis, S. Sethumadhavan, and
+
+A. D. Keromytis. The Spy in the Sandbox: Practical
+Cache Attacks in JavaScript and their Implications. In
+CCS’15, 2015.
+
+[37] D. A. Osvik, A. Shamir, and E. Tromer. Cache
+
+Attacks and Countermeasures: the Case of AES. In
+CT-RSA 2006, 2006.
+
+[38] D. Page. Theoretical use of cache memory as a
+
+cryptanalytic side-channel. Cryptology ePrint Archive,
+Report 2002/169, 2002.
+
+[39] PaX Team. Address space layout randomization (aslr).
+
+http://pax.grsecurity.net/docs/aslr.txt, 2003.
+
+[40] M. Payer. HexPADS: a platform to detect “stealth”
+
+[22] G. Irazoqui, T. Eisenbarth, and B. Sunar. S$A: A
+
+attacks. In ESSoS’16, 2016.
+
+Shared Cache Attack that Works Across Cores and
+Deﬁes VM Sandboxing – and its Application to AES.
+In S&P’15, 2015.
+
+[23] G. Irazoqui, M. S. Inci, T. Eisenbarth, and B. Sunar.
+
+Know thy neighbor: Crypto library detection in cloud.
+Proceedings on Privacy Enhancing Technologies,
+1(1):25–40, 2015.
+
+[41] C. Percival. Cache missing for fun and proﬁt. In
+
+Proceedings of BSDCan, 2005.
+
+[42] P. Pessl, D. Gruss, C. Maurice, and S. Mangard.
+Reverse engineering intel DRAM addressing and
+exploitation. In USENIX Security Symposium, 2016.
+[43] M. E. Russinovich, D. A. Solomon, and A. Ionescu.
+
+Windows internals. Pearson Education, 2012.
+
+[24] G. Irazoqui, M. S. Inci, T. Eisenbarth, and B. Sunar.
+
+[44] M. Seaborn. Exploiting the DRAM rowhammer bug
+
+Lucky 13 strikes back. In AsiaCCS’15, 2015.
+
+[25] Y. Jang, S. Lee, , and T. Kim. Breaking Kernel
+
+Address Space Layout Randomization with Intel TSX.
+In CCS’16, 2016 (to appear).
+
+to gain kernel privileges.
+http://googleprojectzero.blogspot.com/2015/03/
+exploiting-dram-rowhammer-bug-to-gain.html, March
+2015. Retrieved on June 26, 2015.
+
+[26] J. Kelsey, B. Schneier, D. Wagner, and C. Hall. Side
+
+[45] M. Seaborn and T. Dullien. Exploiting the DRAM
+
+Channel Cryptanalysis of Product Ciphers. Journal of
+Computer Security, 8(2/3):141–158, 2000.
+
+rowhammer bug to gain kernel privileges. In Black Hat
+2015 Brieﬁngs, 2015.
+
+[27] V. P. Kemerlis, M. Polychronakis, and A. D.
+
+[46] H. Shacham, M. Page, B. Pfaﬀ, E. Goh,
+
+Keromytis. ret2dir: Rethinking kernel isolation. In
+USENIX Security Symposium, pages 957–972, 2014.
+
+N. Modadugu, and D. Boneh. On the eﬀectiveness of
+address-space randomization. In CCS’04, 2004.
+
+[28] kernel.org. Virtual memory map with 4 level page
+
+[47] K. Z. Snow, F. Monrose, L. Davi, A. Dmitrienko,
+
+tables (x86 64). https://www.kernel.org/doc/
+Documentation/x86/x86 64/mm.txt, May 2009.
+
+[29] Y. Kim, R. Daly, J. Kim, C. Fallin, J. H. Lee, D. Lee,
+
+C. Wilkerson, K. Lai, and O. Mutlu. Flipping bits in
+memory without accessing them: An experimental
+study of DRAM disturbance errors. In ISCA’14, 2014.
+
+[30] Kirill A. Shutemov. Pagemap: Do Not Leak Physical
+
+Addresses to Non-Privileged Userspace.
+https://git.kernel.org/cgit/linux/kernel/git/torvalds/
+linux.git/commit/?id=
+ab676b7d6fbf4b294bf198fb27ade5b0e865c7ce, Mar.
+2015. Retrieved on November 10, 2015.
+
+[31] P. C. Kocher. Timing Attacks on Implementations of
+
+Diﬀe-Hellman, RSA, DSS, and Other Systems. In
+Crypto’96, pages 104–113, 1996.
+
+[32] J. Levin. Mac OS X and IOS Internals: To the
+
+Apple’s Core. John Wiley & Sons, 2012.
+
+C. Liebchen, and A. R. Sadeghi. Just-in-time code
+reuse: On the eﬀectiveness of ﬁne-grained address
+space layout randomization. In S&P’13, 2013.
+
+[48] Y. Tsunoo, T. Saito, and T. Suzaki. Cryptanalysis of
+
+DES implemented on computers with cache. In
+CHES’03, pages 62–76, 2003.
+
+[49] xenbits.xen.org. page.h source code. http://xenbits.
+xen.org/gitweb/?p=xen.git;a=blob;hb=refs/heads/
+stable-4.3;f=xen/include/asm-x86/x86 64/page.h,
+Mar. 2009.
+
+[50] Y. Yarom and K. Falkner. Flush+Reload: a High
+
+Resolution, Low Noise, L3 Cache Side-Channel
+Attack. In USENIX Security Symposium, 2014.
+
+[51] Y. Zhang, A. Juels, M. K. Reiter, and T. Ristenpart.
+Cross-Tenant Side-Channel Attacks in PaaS Clouds.
+In CCS’14, 2014.
+
+379

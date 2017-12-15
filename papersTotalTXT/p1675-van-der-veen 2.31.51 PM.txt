@@ -1,0 +1,2492 @@
+Drammer: Deterministic Rowhammer Attacks
+
+on Mobile Platforms
+
+Victor van der Veen
+
+Vrije Universiteit Amsterdam
+
+vvdveen@cs.vu.nl
+
+Yanick Fratantonio
+
+UC Santa Barbara
+yanick@cs.ucsb.edu
+
+Daniel Gruss
+
+Graz University of Technology
+
+gruss@tugraz.at
+
+Clémentine Maurice
+
+Graz University of Technology
+
+cmaurice@tugraz.at
+
+Vrije Universiteit Amsterdam
+
+Vrije Universiteit Amsterdam
+
+Kaveh Razavi
+
+kaveh@cs.vu.nl
+
+Herbert Bos
+
+herbertb@cs.vu.nl
+
+Martina Lindorfer
+UC Santa Barbara
+martina@iseclab.org
+
+Giovanni Vigna
+UC Santa Barbara
+vigna@cs.ucsb.edu
+
+Cristiano Giuffrida
+
+Vrije Universiteit Amsterdam
+
+giuffrida@cs.vu.nl
+
+ABSTRACT
+Recent work shows that the Rowhammer hardware bug can
+be used to craft powerful attacks and completely subvert a
+system. However, existing eﬀorts either describe probabilis-
+tic (and thus unreliable) attacks or rely on special (and often
+unavailable) memory management features to place victim
+objects in vulnerable physical memory locations. Moreover,
+prior work only targets x86 and researchers have openly won-
+dered whether Rowhammer attacks on other architectures,
+such as ARM, are even possible.
+
+We show that deterministic Rowhammer attacks are feasi-
+ble on commodity mobile platforms and that they cannot be
+mitigated by current defenses. Rather than assuming special
+memory management features, our attack, Drammer, solely
+relies on the predictable memory reuse patterns of standard
+physical memory allocators. We implement Drammer on
+Android/ARM, demonstrating the practicability of our at-
+tack, but also discuss a generalization of our approach to
+other Linux-based platforms. Furthermore, we show that
+traditional x86-based Rowhammer exploitation techniques
+no longer work on mobile platforms and address the resulting
+challenges towards practical mobile Rowhammer attacks.
+
+To support our claims, we present the ﬁrst Rowhammer-
+based Android root exploit relying on no software vulner-
+ability, and requiring no user permissions. In addition, we
+present an analysis of several popular smartphones and ﬁnd
+that many of them are susceptible to our Drammer attack.
+We conclude by discussing potential mitigation strategies
+and urging our community to address the concrete threat of
+faulty DRAM chips in widespread commodity platforms.
+
+Permission to make digital or hard copies of all or part of this work for personal or
+classroom use is granted without fee provided that copies are not made or distributed
+for proﬁt or commercial advantage and that copies bear this notice and the full cita-
+tion on the ﬁrst page. Copyrights for components of this work owned by others than
+ACM must be honored. Abstracting with credit is permitted. To copy otherwise, or re-
+publish, to post on servers or to redistribute to lists, requires prior speciﬁc permission
+and/or a fee. Request permissions from permissions@acm.org.
+CCS’16, October 24–28, 2016, Vienna, Austria.
+c(cid:13) 2016 ACM. ISBN 978-1-4503-4139-4/16/10. . . $15.00
+DOI: http://dx.doi.org/10.1145/2976749.2978406
+
+1.
+
+INTRODUCTION
+
+The Rowhammer hardware bug allows an attacker to mod-
+ify memory without accessing it, simply by repeatedly ac-
+cessing, i.e., “hammering”, a given physical memory loca-
+tion until a bit in an adjacent location ﬂips. Rowhammer
+has been used to craft powerful attacks that bypass all cur-
+rent defenses and completely subvert a system [16,32,35,47].
+Until now, the proposed exploitation techniques are either
+probabilistic [16,35] or rely on special memory management
+features such as memory deduplication [32], MMU paravir-
+tualization [47], or the pagemap interface [35]. Such features
+are often unavailable on commodity platforms (e.g., all are
+unavailable on the popular Amazon EC2 cloud, despite re-
+cent work explicitly targeting a cloud setting [32,47]) or dis-
+abled for security reasons [40, 46]. Recent JavaScript-based
+attacks, in turn, have proven capable to reliably escape the
+JavaScript sandbox [11], but still need to resort to proba-
+bilistic exploitation to gain root privileges and to completely
+subvert a system [16].
+
+Probabilistic Rowhammer attacks [16,35] oﬀer weak relia-
+bility guarantees and have thus more limited impact in prac-
+tice. First, they cannot reliably ensure the victim object,
+typically a page table in kernel exploits [16], is surgically
+placed in the target vulnerable physical memory location.
+This may cause the Rowhammer-induced bit ﬂip to corrupt
+unintended data (rather than the victim page table) and
+crash the whole system. Second, even when the victim page
+table is corrupted as intended, they cannot reliably predict
+the outcome of such an operation. Rather than mapping an
+attacker-controlled page table page into the address space as
+intended, this may cause the Rowhammer-induced bit ﬂip to
+map an unrelated page table, which, when modiﬁed by the
+attacker, may also corrupt unintended data and crash the
+whole system.
+
+This paper makes two contributions. First, we present
+a generic technique for deterministic Rowhammer exploita-
+tion using commodity features oﬀered by modern operating
+systems. In particular, we only rely on the predictable be-
+havior of the default physical memory allocator and its mem-
+ory reuse patterns. Using this technique (which we term
+
+1675Phys Feng Shui), we can reliably control the layout of phys-
+ical memory and deterministically place security-sensitive
+data (e.g., a page table) in an attacker-chosen, vulnerable
+physical memory location.
+
+Second, we use the aforementioned technique to mount
+a deterministic Rowhammer attack (or Drammer) on mo-
+bile platforms, since they present diﬀerent and unexplored
+hardware and software characteristics compared to previ-
+ous eﬀorts, which focus only on x86 architectures, mainly in
+desktop or server settings. Concerning the hardware, mo-
+bile platforms mostly use ARM processors. However, all
+known Rowhammer techniques target x86 and do not read-
+ily translate to ARM. Moreover, researchers have questioned
+whether memory chips on mobile devices are susceptible to
+Rowhammer at all or whether the ARM memory controller
+is fast enough to trigger bit ﬂips [13, 35]. Concerning the
+software, mobile platforms such as Android run diﬀerent
+and more limited operating systems that implement only
+a subset of the features available in desktop and server en-
+vironments. For example, unless explicitly speciﬁed by a
+device vendor, the Android kernel does currently not sup-
+port huge pages, memory deduplication, or MMU paravirtu-
+alization, making it challenging to exploit the Rowhammer
+bug and impossible to rely on state-of-the-art exploitation
+techniques.
+
+Drammer is an instance of the Flip Feng Shui (FFS ) ex-
+ploitation technique (abusing the physical memory alloca-
+tor to surgically induce hardware bit ﬂips in attacker-chosen
+sensitive data) [32], which for the ﬁrst time relies only on
+always-on commodity features. For any Rowhammer-based
+Flip Feng Shui attack to be successful, three primitives are
+important. First, attackers need to be able to “hammer
+suﬃciently hard”—hitting the memory chips with high fre-
+quency. For instance, no bits will ﬂip if the memory con-
+troller is too slow. Second, they need to ﬁnd a way to mas-
+sage physical memory so that the right, exploitable data is
+located in the vulnerable physical page. Third, they need
+to be able to target speciﬁc contiguous physical addresses to
+achieve (i) double-sided Rowhammer [9,35], a technique that
+yields more ﬂips in less time than other approaches, and (ii)
+more control when searching for vulnerable pages (impor-
+tant when mounting deterministic attacks). We show that,
+when attacking mobile platforms, none of these primitives
+can be implemented by simply porting existing techniques.
+In this paper, we present techniques to implement afore-
+mentioned primitives when attacking mobile platforms. We
+detail the challenges towards reliable exploitation on An-
+droid/ARM and show how to overcome its limited feature
+set by relying on DMA buﬀer management APIs provided
+by the OS. To concretely demonstrate the eﬀectiveness of
+our Drammer attack on mobile platforms, we present the
+ﬁrst deterministic, Rowhammer-based Android root exploit.
+Our exploit can be launched by any Android app with no
+special permission and without relying on any software vul-
+nerability.
+
+Finally, we present an empirical study and assess how
+widespread the Rowhammer bug is on mobile devices. We
+investigate how fast we can exploit these bugs in popular
+smartphones and identify multiple phones that suﬀer from
+faulty DRAM: 17 out of 21 of our tested 32-bit ARMv7
+devices—still the most dominant platform with a market
+share of over 97% [44]—and 1 out of our 6 tested 64-bit
+ARMv8 phones are susceptible to Rowhammer. We con-
+
+clude by discussing how state-of-the-art Rowhammer de-
+fenses are ineﬀective against our Drammer attack and de-
+scribe new mitigation techniques.
+
+In summary, we make the following contributions:
+
+• We present the ﬁrst technique to perform determin-
+istic Rowhammer exploitation using only commodity
+features implemented by modern operating systems.
+• We demonstrate the eﬀectiveness of our technique on
+mobile platforms, which present signiﬁcant hardware
+and software diﬀerences with respect to prior eﬀorts.
+We implement our Drammer attack on Android/ARM
+and present the ﬁrst deterministic, Rowhammer-based
+Android root exploit. Our exploit cannot be mitigated
+by state-of-the-art Rowhammer defenses.
+
+• We evaluate the eﬀectiveness of Drammer and our
+Android root exploit and complement our evaluation
+with an empirical Rowhammer study on multiple An-
+droid devices. We identify multiple ARMv7/ARMv8
+smartphones that suﬀer from faulty DRAM.
+
+• To support future research on mobile Rowhammer, we
+release our codebase as an open source project and
+aim to build a public database of known vulnerable
+devices.1
+
+2. THREAT MODEL
+
+We assume that an attacker has control over an unpriv-
+ileged Android app on an ARM-based device and wants to
+perform a privilege escalation attack to acquire root priv-
+ileges. We do not impose any constraints on the attacker-
+controlled app or the underlying environment. In particular,
+we assume the attacker-controlled app has no permissions
+and the device runs the latest stock version of the Android
+OS with all updates installed, all security measures acti-
+vated, and no special features enabled.
+
+3. ROWHAMMER EXPLOITATION
+
+Rowhammer is a software-induced hardware fault that af-
+fects dynamic random-access memory (DRAM) chips.
+In
+practice, this has the net eﬀect that a piece of software can
+ﬂip some bits in physical memory by solely performing mem-
+ory read operations. It is important to note that triggering
+the Rowhammer bug is diﬀerent than using (i.e., exploiting)
+it in a security-relevant manner. In fact, an exploit usually
+needs to trick a victim component (e.g., another process, the
+OS, or another VM hosted on the same physical node) to
+use a vulnerable physical memory location to store security-
+sensitive content. In the general case, software exploitation
+of this kind proved to be challenging.
+
+In this section, we ﬁrst provide general background in-
+formation on memory hardware and the Rowhammer bug.
+Then, we summarize existing exploitation techniques and
+describe the three distinct primitives that Rowhammer ex-
+ploits need to implement.
+
+1https://www.vusec.net/projects/drammer/
+
+16763.1 Memory Hardware
+
+In order to understand the root cause of the Rowhammer
+bug, it is important to understand the architecture and com-
+ponents of DRAM chips. DRAM works by storing charges
+in an array of cells, each of which consists of a capacitor
+and an access transistor. A cell represents a binary value
+depending on whether it is charged or not. Cells are fur-
+ther organized in rows, which are the basic unit for memory
+accesses. On each access, a row is “activated” by copying
+the content of its memory cells to a row buﬀer (thereby dis-
+charging them), and then copying the content back to the
+memory cells (thereby charging them). A group of rows that
+is serviced by one row buﬀer is called a bank. Finally, multi-
+ple banks further form a rank, which spans across multiple
+DRAM chips. A page frame is the smallest ﬁxed-length con-
+tiguous block of physical memory into which the OS maps a
+memory page (a contiguous block of virtual memory). From
+a DRAM perspective, a page frame is merely a contiguous
+collection of memory cells, aligned on the page-size bound-
+ary (typically 4 KB).
+
+Memory cells naturally have a limited retention time and
+leak their charge over time. Therefore, they have to be re-
+freshed regularly in order to keep their data. Thus, the
+DDR3 standard [19] speciﬁes that the charge of each row
+has to be refreshed at least every 64 ms. This memory re-
+fresh interval is a trade-oﬀ between memory integrity on the
+one hand, and energy consumption and system performance
+on the other. Refreshing more often consumes more power
+and also competes with legitimate memory accesses, since a
+speciﬁc memory region is unavailable during the refresh [10].
+
+3.2 The Rowhammer Bug
+
+In a quest to meet increasing memory requirements, hard-
+ware manufacturers squeeze more and more cells into the
+same space. Unfortunately, Kim et al. [23] observed that
+the increasing density of current memory chips also makes
+them prone to disturbance errors due to charge leaking into
+adjacent cells on every memory access. They show that, by
+repeatedly accessing, i.e., “hammering,” the same memory
+row (the aggressor row) over and over again, an attacker
+can cause enough of a disturbance in a neighboring row (the
+victim row) to cause bits to ﬂip. Thus, triggering bit ﬂips
+through Rowhammer is essentially a race against the DRAM
+internal memory refresh in performing enough memory ac-
+cesses to cause suﬃcient disturbance to adjacent rows. Rely-
+ing on activations of just one aggressor row to attack an adja-
+cent row is called single-sided Rowhammer, while the more
+eﬃcient double-sided Rowhammer attack accesses the two
+rows that are directly above and below the victim row [35].
+
+3.3 Exploitation Primitives
+
+While it was originally considered mostly a reliability is-
+sue, Rowhammer becomes a serious security threat when an
+attacker coerces the OS into storing security-sensitive data
+in a vulnerable memory page (a virtual page that maps to a
+page frame consisting of at least one cell that is subject to
+the Rowhammer bug). Depending on the underlying hard-
+ware platform, OS, and already-deployed countermeasures,
+prior eﬀorts developed diﬀerent techniques to perform a suc-
+cessful end-to-end Rowhammer attack. This section sum-
+marizes prior techniques and describes the three required
+primitives to exploit the Rowhammer bug.
+
+P1. Fast Uncached Memory Access. This primitive
+is the prerequisite to ﬂip bits in memory and refers to the
+ability of activating rows in each bank fast enough to trigger
+the Rowhammer bug. In practice, this can be non-trivial for
+two reasons. First, the CPU memory controller might not
+be able to issue memory read commands to the memory
+chip fast enough. However, most often the challenge relates
+to the presence of several layers of caches, which eﬀectively
+mask out all the CPU memory reads (after the ﬁrst one).
+Thus, all known exploitation techniques need to implement
+a mechanism to bypass (or nullify) the cache.
+
+P2. Physical Memory Massaging. This primitive con-
+sists of being able to trick the victim component to use—
+in a predictable or, in a weaker form, probabilistic way—a
+memory cell that is subject to the Rowhammer bug. More
+importantly, the attacker needs to be able to massage the
+memory precisely enough to push the victim to use the vul-
+nerable cell to store security-sensitive data, such as a bit
+from a page table entry. This primitive is critical for an at-
+tacker to mount a privilege escalation attack, and it is also
+the most challenging one to implement in a fully determin-
+istic way.
+
+P3. Physical Memory Addressing. This last primitive
+relates to understanding how physical memory addresses are
+used in the virtual address space of an unprivileged process.
+While this primitive is not a hard requirement for Rowham-
+mer exploitation in general, it is crucial to perform double-
+sided Rowhammer: to access memory from two aggressor
+rows, an attacker must know which virtual addresses map
+to the physical addresses of these rows.
+
+4. THE FIRST FLIP
+
+This section documents our eﬀorts to perform Rowham-
+mer on memory chips of mobile devices. In the ﬁrst part, we
+focus on testing the hardware without attempting to mount
+any exploit. In the second part, we discuss how going from
+“ﬂipping bits” to mounting a root privilege escalation at-
+tack is challenging, since there are several aspects that make
+successful exploitation on mobile devices fundamentally dif-
+ferent compared to previous eﬀorts on desktop and server
+settings. To support our claims, we compare all known
+techniques to implement the three primitives discussed in
+the previous section and we discuss why these techniques do
+not apply to commodity mobile platforms.
+4.1 RowhARMer
+
+Researchers have speculated that Rowhammer on ARM
+could be impossible, one of the main reasons being that the
+ARM memory controller might be too slow to trigger the
+Rowhammer bug [13,35]. Not surprisingly, no existing work
+from academia or industry currently documents any success
+in reproducing the Rowhammer bug on mobile devices.
+
+We set up an experiment to test whether memory chips
+used in mobile devices are subject to bit ﬂips induced by
+Rowhammer and whether the ARM memory controller can
+issue memory read operations fast enough. Since this is a
+preliminary feasibility analysis, we perform the Rowhammer
+attack from a kernel module (i.e., with full privileges), which
+allows us to cultivate optimal conditions for ﬁnding bit ﬂips:
+we disable CPU caching and perform double-sided Rowham-
+mer by using the pagemap interface to ﬁnd aggressor rows
+for each victim address.
+
+1677We hammer rows by performing one million read opera-
+tions on their two aggressors. To determine the minimum
+memory access time that still results in bit ﬂips, we repeat-
+edly hammer the same 5 MB of physical memory while arti-
+ﬁcially increasing the time between two read operations by
+inserting NOP instructions. We measure the time it takes
+to complete a single read operation and report the median
+over all hammered pages. We initiate all bytes in the victim
+row to 0xff (all bits are set) and once the hammering phase
+ﬁnishes, we scan the victim row for bit ﬂips—i.e., any byte
+that has a value diﬀerent than 0xff. Since we only per-
+form read operations, any such modiﬁcation to the memory
+content can be directly attributed to Rowhammer.
+
+For this experiment, we used an LG Nexus 5 device run-
+ning Android 6.0.1 (the latest version at the time of writing).
+The results of this experiment are encouraging: not only do
+bits ﬂip, but it is also relatively simple to obtain them. In
+fact, we triggered ﬂips in a matter of seconds, and observed
+up to 150 ﬂips per minute. Figure 1 depicts the results of
+our experiment. It shows the dependency between the ac-
+cess time and the number of bit ﬂips found when scanning a
+5 MB memory chunk. Moreover, it shows that access times
+of 300 ns or higher are unlikely to trigger bit ﬂips and that,
+surprisingly, the “sweet spot” for triggering the most ﬂips on
+this particular DRAM chip is not reading at full speed (70 ns
+per read), but throttling to 100 ns per read. However, note
+that throttling does not necessarily result in a lower rate of
+actual accesses to DRAM cells: the memory controller may
+reorder accesses internally.
+4.2 Exploitation on the x86 Architecture
+
+Even when a memory chip is vulnerable to Rowhammer
+attacks,
+it is challenging to perform a successful end-to-
+end exploitation—we need to implement the three primi-
+tives described earlier. We now review how currently known
+Rowhammer exploitation techniques, which all target the
+x86 architecture, implement those primitives.
+
+4.2.1 P1. Fast Uncached Memory Access
+First and foremost an attacker needs the capability to
+activate alternating rows in each bank fast enough to trigger
+the Rowhammer bug. The main challenge here is to bypass
+the CPU cache. For this purpose, state-of-the-art attacks
+rely on one of the following techniques:
+
+Explicit cache ﬂush. This technique is based on using
+the clflush instruction, which ﬂushes the cache entry asso-
+ciated to a given address. One can execute this instruction
+after accessing a particular memory address, so that sub-
+sequent read operations on that same address also trigger
+DRAM accesses. On x86 architectures, the clflush instruc-
+tion is particularly useful because it can be executed even
+by a non-privileged process. This technique is used, for ex-
+ample, by Seaborn et al. [35,36] and is based on the ﬁndings
+from Kim et al. [23].
+
+Cache eviction sets. This technique relies on repeatedly
+accessing memory addresses that belong to the same cache
+eviction set [9, 11, 16]. A cache eviction set is deﬁned as a
+set of congruent addresses, where two addresses are congru-
+ent if and only if they map to the same cache line. Thus,
+accesses to a memory address belonging to the same con-
+gruent set will automatically ﬂush the cache while reading
+(because the associated cache line contains the content of
+
+s
+p
+ﬂ
+
+i
+
+t
+i
+b
+
+d
+e
+v
+r
+e
+s
+b
+O
+#
+
+400
+
+350
+
+300
+
+250
+
+200
+
+150
+
+100
+
+50
+
+0
+
+350
+
+300
+
+250
+
+200
+
+150
+
+100
+
+50
+
+0
+
+)
+s
+n
+(
+
+d
+a
+e
+r
+
+r
+e
+p
+
+e
+m
+
+i
+t
+
+s
+s
+e
+c
+c
+a
+
+n
+a
+i
+d
+e
+m
+
+0
+
+20
+
+40
+
+60
+
+80
+
+100
+
+120
+
+140
+
+# NOP instructions
+
+bit ﬂips
+
+time per read
+
+Figure 1: Dependency between observed bit ﬂips
+(y1) and memory access time (y2) when repeatedly
+hammering the same 5 MB memory chunk, while in-
+creasing the number of NOP instructions (x) to sim-
+ulate slower access times. The spike in access time
+around 60 to 80 NOP instructions may be caused by
+a background process during our analysis. The spike
+in observed bit ﬂips around 20 NOP instructions in-
+dicates a “sweet spot” of memory access time.
+
+the previously-read memory address). This observation is
+the basis for the several access patterns described by Gruss
+et al. [16] and is particularly useful when the clflush in-
+struction is not available (e.g., when triggering Rowhammer
+from JavaScript).
+
+Non-temporal access instructions. This technique re-
+lies on accessing memory using CPU instructions or APIs
+that, by design, do not use the cache. Previous eﬀorts rely
+on non-temporal write instructions (e.g., MOVNTI, MOVNTDQA),
+which are also used in some memset() and memcopy() imple-
+mentations [31]. In this context, non-temporal means that
+the data will not likely be reused soon and thus does not
+have to be cached. As a result, these operations cause the
+CPU to directly write the content to memory, thus bypass-
+ing the cache.
+4.2.2 P2. Physical Memory Massaging
+This primitive is essential to trick the victim component
+into storing security-sensitive data (e.g., a page table) in an
+attacker-chosen, vulnerable physical memory page. Existing
+eﬀorts have mainly relied on the following techniques for this
+purpose:
+
+Page-table spraying. Previous work exploits the Rowham-
+mer bug to achieve root privilege escalation by ﬂipping bits
+in page table entries (PTEs) [35, 36]. This attack suggests
+a probabilistic exploitation strategy that sprays the memory
+with page tables, hoping that at least one of them lands on a
+physical memory page vulnerable to Rowhammer. The next
+step is then to ﬂip a bit in the vulnerable physical mem-
+ory page, so that the victim page table points to an arbi-
+trary physical memory location. Given the sprayed physical
+memory layout, such location should probabilistically con-
+tain one of the attacker-controlled page table pages (PTPs)
+which allows attackers to map their own page tables in the
+
+1678controlling address space. At that point, they can overwrite
+their own PTEs and access arbitrary (e.g., kernel) pages in
+physical memory to escalate privileges.
+
+Memory deduplication. Razavi et al. [32] abuse mem-
+ory deduplication to perform deterministic Rowhammer ex-
+ploitation [11,32]. They show that an attacker can use mem-
+ory deduplication to trick the OS into mapping two pages,
+an attacker-controlled virtual memory page and a victim-
+owned virtual memory page, to the same attacker-chosen
+vulnerable physical memory page. While such an exploita-
+tion strategy is powerful and has been successfully demon-
+strated in a cross-VM setting, it relies on memory dedupli-
+cation, which is not an always-on feature, even in modern
+operating systems (e.g., oﬀ by default on Linux).
+
+MMU paravirtualization. Xiao et al. [47] leverage Xen
+MMU paravirtualization to perform deterministic Rowham-
+mer exploitation from a guest VM. This exploits the prop-
+erty that Xen allows a guest VM to specify the physical
+location of a (read-only) PTP, allowing a malicious VM to
+trick the VM monitor into mapping a page table into a vul-
+nerable location to “hammer.” Similar to memory dedupli-
+cation, this is not an always-on feature and only available
+inside Xen MMU paravirtualized VMs. In addition, MMU
+paravirtualization is no longer the common case in popu-
+lar cloud settings, with MMU virtualization becoming much
+more practical and eﬃcient.
+4.2.3 P3. Physical Memory Addressing
+Processes have direct access only to virtual memory which
+is then mapped to physical memory. While the virtual mem-
+ory layout is known to processes in userland, the physical
+memory layout is not. As discussed in the previous section,
+to perform double-sided Rowhammer, an attacker needs to
+repeatedly access speciﬁc physical memory pages. For this
+purpose, previous eﬀorts suggest the following techniques:
+
+Pagemap interface. This technique relies on accessing
+the /proc/self/pagemap ﬁle which contains complete infor-
+mation about the mapping of virtual to physical addresses.
+Clearly, having access to this information is suﬃcient to re-
+peatedly access speciﬁc rows in physical memory.
+
+Huge pages. Another option is to use huge (virtual) pages
+that are backed by physically contiguous physical pages. In
+particular, a huge page covers 2 MB of contiguous physical
+addresses. Although this is not as ﬁne-grained as know-
+ing absolute physical addresses, one can use relative oﬀsets
+to access speciﬁc physical memory pages for double-sided
+Rowhammer. In fact, it guarantees that two rows that are
+contiguous in virtual memory are also contiguous in physical
+memory.
+4.3 Challenges on Mobile Devices
+
+When assessing whether one can exploit Rowhammer bugs
+on mobile devices, we attempted, as a ﬁrst step, to reuse
+known exploitation techniques described above. We found,
+however, that none of the primitives are applicable to mobile
+devices. Table 1 presents an overview of our analysis.
+
+Table 1: Techniques previously used for x86-based
+Rowhammer attacks and their availability on ARM-
+
+are available in unprivileged mode, but are not prac-
+
+based mobile devices in unprivileged mode ((cid:32)), priv-
+ileged mode ((cid:35)), or not at all (–). Some techniques
+tical enough to use in our setting ((cid:71)(cid:35)). Note how
+
+none of these techniques can be generally applied
+on all modern versions of mobile devices.
+
+Primitive
+
+Fast Uncached Memory Access
+Explicit cache ﬂush
+Cache eviction sets
+Non-temporal access instructions
+
+Physical Memory Massaging
+Page-table spraying
+Memory deduplication
+MMU paravirtualization
+
+Physical Memory Addressing
+Pagemap interface
+Huge pages
+
+x86
+
+Platforms
+
+Mobile
+Devices
+
+ARMv7/ARMv8
+
+(cid:32)
+(cid:32)
+(cid:32)
+(cid:32)
+(cid:32)
+(cid:32)
+(cid:32)
+(cid:32)
+
+–/–
+
+(cid:35)/(cid:71)(cid:35)
+–/(cid:71)(cid:35)
+(cid:71)(cid:35)
+
+–
+–
+
+(cid:35)
+
+–
+
+userland, this system call ﬂushes only up to the Level 2 cache
+and thus fails to force repetitive DRAM accesses for a single
+address.
+Interestingly, ARMv8 does provide unprivileged
+cache ﬂush instructions, but they may be disabled by the
+kernel.
+
+Cache eviction sets (P1). In principle, it is possible to
+use cache eviction sets to ﬂush addresses from the cache.
+Unfortunately, this technique proved to be too slow in prac-
+tice to trigger bit ﬂips on both ARMv7 and ARMv8.
+
+Non-temporal access instructions (P1). ARMv8 of-
+fers non-temporal load and store instructions, but they only
+serve as a hint to the CPU that caching is not useful [8]. In
+practice, we found that memory still remains cached, mak-
+ing these instructions not usable for our exploitation goals.
+
+Page-table spraying (P2). As documented by Seaborn et
+al. [36], the page-table spraying mechanism is probabilistic
+and may crash the OS. We aim to implement a deterministic
+Rowhammer exploit and thus cannot rely on this technique.
+
+Special memory management features (P2). Although
+device vendors may enable memory deduplication for Low
+RAM conﬁgurations [1], it is not enabled by default on stock
+Android. Moreover, MMU paravirtualization is not avail-
+able and we can thus not rely on existing special memory
+management features.
+
+Pagemap interface (P3). The Linux Kernel no longer al-
+lows unprivileged access to /proc/self/pagemap since ver-
+sion 4.0 [40]. This change was (back)ported to the Android
+Linux kernel in November 2015 [34], making it impossible
+for us to use this interface for double-side Rowhammer.
+
+Explicit cache ﬂush (P1). On ARMv7, the cache ﬂush
+instruction is privileged and thus only executable by the
+kernel. Since our threat model assumes an unprivileged app,
+we cannot use this instruction to implement P1. Although
+the Android kernel exposes a cacheflush() system call to
+
+Huge pages (P3). Although some vendors ship their mo-
+bile devices with huge page support (Motorola Moto G, 2013
+model, for example), stock Android has this feature disabled
+by default. We thus cannot rely on huge pages to perform
+double-sided Rowhammer in our setting.
+
+1679Additional challenges.
+In addition, there are further
+characteristics that are speciﬁc to mobile devices and that
+aﬀect mobile Rowhammer attacks. First, the ARM speci-
+ﬁcations [7, 8] do not provide memory details and, for ex-
+ample, it is not clear what the size of a row is. Second,
+mobile devices do not have any swap space. Consequently,
+the OS—the Low Memory Killer in particular on Android—
+starts killing processes if the memory pressure is too high.
+
+5. THE DRAMMER ATTACK
+
+We now describe how we overcome the limited availability
+of known techniques on mobile devices and how we mount
+our Drammer attack in a deterministic fashion. In contrast
+to most primitives discussed in the previous section, Dram-
+mer relies on general memory management behavior of the
+OS to perform deterministic Rowhammer attacks. For sim-
+plicity, we ﬁrst describe our attack for Android/ARM (fo-
+cusing on the more widespread ARMv7 platform) and later
+discuss its applicability to other platforms in Section 7.
+5.1 Mobile Device Memory
+
+One prerequisite to implement useful exploitation prim-
+itives is to understand the memory model of the chip we
+are targeting. One of the key properties to determine is the
+row size. Previous x86-based eﬀorts ascertain the row size
+either by consulting the appropriate documentation or by
+running the decode-dimms program. Unfortunately, ARM
+does not document row sizes, nor does its platform provide
+instructions for ﬁngerprinting DRAM modules. As such, we
+propose a timing-based side channel to determine a DRAM
+chip’s row size.
+
+Our technique is generic and can be applied independently
+from the chosen target architecture. It relies on the observa-
+tion that accessing two memory pages from the same bank
+is slower than reading from diﬀerent banks: for same-bank
+accesses, the controller has to reﬁll the bank’s row buﬀer
+for each read operation. In particular, by accessing physical
+pages n and n + i while increasing i from 0 to x, our timing
+side channel shows a slower access time when page n + i
+lands in the same bank as page n. Such increase in access
+time indicates that we walked over all the pages in a row and
+that n + i now points to the ﬁrst page in the second row,
+falling in the same bank. By setting x large enough (e.g.,
+to 64 pages, which would indicate a row size of 256 KB), we
+ensure that we always observe the side channel, as it is not
+expected that the row size is 256 KB or larger. We evaluate
+our side channel in more detail in Section 8.
+5.2 DMA Buffer Management
+
+Modern (mobile) computing platforms consist of several
+diﬀerent hardware components: besides the CPU or System-
+on-Chip (SoC) itself, devices include a GPU, display con-
+troller, camera, encoders, and sensors. To support eﬃcient
+memory sharing between these devices as well as between
+devices and userland services, an OS needs to provide direct
+memory access (DMA) memory management mechanisms.
+Since processing pipelines that involve DMA buﬀers bypass
+the CPU and its caches, the OS must facilitate explicit cache
+management to ensure that subparts of the pipeline have a
+coherent view of the underlying memory. Moreover, since
+most devices perform DMA operations to physically contigu-
+ous memory pages only, the OS must also provide allocators
+that support this type of memory.
+
+We refer to the OS interface that provides all these mecha-
+nisms as a DMA Buﬀer Management API which essentially
+exports “DMA-able” memory to userland. By construction,
+userland-accessible DMA buﬀers implement two of our at-
+tack primitives: (P1) providing uncached memory access
+and (P3) (relative) physical memory addressing.
+5.3 Physical Memory Massaging
+
+For the remaining and most crucial primitive (P2), we
+need to arrange the physical memory in such a way that
+we can control the content of a vulnerable physical mem-
+ory page and deterministically land security-sensitive data
+therein. For this purpose, we propose Phys Feng Shui, a
+novel technique to operate physical memory massaging that
+is solely based on the predictable memory reuse patterns
+of standard physical memory allocators. In addition to be-
+ing deterministic, this strategy does not incur the risk of
+accidentally crashing the system by causing bit ﬂips in un-
+intended parts of physical memory.
+
+On a high level, our technique works by exhausting avail-
+able memory chunks of diﬀerent sizes to drive the physical
+memory allocator into a state in which it has to start serv-
+ing memory from regions that we can reliably predict. We
+then force the allocator to place the target security-sensitive
+data, i.e., a page table, at a position in physical memory
+which is vulnerable to bit ﬂips and which we can hammer
+from adjacent parts of memory under our control.
+
+5.3.1 Memory Templating
+Since our attack requires knowledge about which exact
+memory locations are susceptible to Rowhammer, we ﬁrst
+need to probe physical memory for ﬂippable bits—although
+the number and location of vulnerable memory regions natu-
+rally diﬀers per DRAM chip, once found, the large majority
+of ﬂips is reproducible [23]. We refer to this process as mem-
+ory templating [32]. A successful templating session results
+in a list of templates that contain the location of vulnerable
+bits, as well as the direction of the ﬂip, i.e., whether it is a
+0-to-1 or 1-to-0 ﬂip.
+
+5.3.2 Physical Memory Allocator
+Linux platforms manage physical memory via the buddy
+allocator [15]. Its goal is to minimize external fragmenta-
+tion by eﬃciently splitting and merging available memory
+in power-of-2 sized blocks. On each allocation request, it
+iteratively splits larger blocks in half as necessary until it
+ﬁnds a block matching the requested size. It is important to
+note that the buddy allocator always prioritizes the smallest
+ﬁtting block when splitting—e.g., it will not attempt to split
+a block of 16 KB if a ﬁtting one of 8 KB is also available. As
+a result, the largest contiguous chunks remain unused for as
+long as possible.
+
+On each deallocation request, the buddy allocator exam-
+ines neighboring blocks of the same size to merge them again
+if they are free. To minimize the internal fragmentation pro-
+duced by the buddy allocator for small objects, Linux imple-
+ments a slab allocator abstraction on top of it. The default
+SLUB allocator implementation organizes small objects in a
+number of pools (or slabs) of commonly used sizes to quickly
+serve allocation and deallocation requests. Each slab is ex-
+panded on demand as necessary using physically contiguous
+chunks of a predetermined per-slab size allocated through
+the buddy allocator.
+
+16805.3.3 Phys Feng Shui
+Phys Feng Shui lures the buddy allocator into reusing and
+partitioning memory in a predictable way. For this purpose,
+we use three diﬀerent types of physically contiguous chunks:
+large chunks (L), medium-sized chunks (M), and small chunks
+(S). The size of small chunks is ﬁxed at 4 KB (the page size).
+Although other values are possible (see also Section 6), for
+simplicity, we set the size of M to the row size and use the
+size of the largest possible contiguous chunk of memory that
+the allocator provides for L. As illustrated in Figure 2, our
+attack then includes the following steps:
+
+Preparation and templating. We ﬁrst exhaust (i.e., allo-
+cate until no longer possible) all available physically contigu-
+ous chunks of size L (step 1) and probe them for vulnerable
+templates which we later can exploit. We then exhaust all
+chunks of size M (step 2), leaving the allocator in a state
+where blocks of size M and larger are no longer available (un-
+til existing ones are released).
+
+Selective memory reuse. Next, we select one of the tem-
+plates generated in the previous step as the target for our
+exploit and refer to its corresponding L block as L*. We then
+release L* (step 3), and immediately exhaust all M chunks
+again (step 4). Since we depleted all the free chunks of size
+M or larger in the previous step, this forces the allocator to
+place them in the region we just released (i.e., predictably
+reuse the physical memory region of the released L* chunk).
+We refer to the M chunk that now holds the exploitable tem-
+plate as M*.
+
+Our technique naturally increases memory pressure.
+
+Finally, in preparation of landing the page table (PT) in
+the vulnerable page of M*, in the next step we release M* (step
+5). Note that we restrict our choice of M* to chunks that are
+not at the edge of L*, since we need access to its surrounding
+memory in order to perform double-sided Rowhammer later.
+In
+practice, the OS handles low memory or out of memory
+(OOM) conditions by freeing up unused memory when the
+available memory falls under a certain threshold. This is es-
+pecially critical on mobile devices, which do not utilize swap
+space. In preparation of the next steps, which need to allo-
+cate several S chunks and would risk bumping the amount
+of available memory below the threshold, we now free the
+remaining L chunks to avoid triggering memory cleanup by
+the OS (or worse: a system crash).
+
+Landing the ﬁrst page table in the vulnerable re-
+gion. We now steer the memory allocator to place a S
+chunk in the vulnerable chunk M* that was released. For
+this purpose, we deplete the allocator of available blocks of
+size S...M/2 by repeatedly allocating S chunks. This guaran-
+tees that subsequent S allocations land in M* (step 6). We
+allocate S chunks by forcing (4 KB) page table allocations:
+we repeatedly map memory at ﬁxed virtual addresses that
+mark page table boundaries (i.e., every 2 MB of the virtual
+address space on ARMv7). Since the maximum number of
+page tables per process is 1024, we spawn a number of worker
+processes to allocate as many as we need. Once all smaller
+chunk sizes are depleted, our next S allocation predictably
+lands in the vulnerable region (no other smaller block is
+available).
+
+Determining when allocations reach the vulnerable region
+is trivial on Linux: the proc ﬁlesystem provides /proc/zone-
+info and /proc/pagetypeinfo. These special ﬁles are world-
+readable and detail information on the number of available
+
+Figure 2: Physical memory layout before and after
+each step of Phys Feng Shui. Depending on the di-
+rection of the targeted bit ﬂip, we map either the
+chunk before or after the vulnerable one in the last
+step.
+
+and allocated memory pages and zones. In case these ﬁles
+are not available, we can exploit a timing or instruction-
+count (via the Performance Monitoring Unit) side-channel
+to detect when S lands in M*: depending on whether the al-
+locator can serve a request from a pool of available chunks
+of a matching size, or whether it has to start splitting larger
+blocks, the operation takes more time and instructions. We
+can use this observation by measuring the time between an
+allocation and deallocation of an M chunk every time we force
+the allocation of a new S chunk. Once this time falls below
+
+freeL chunkM chunkS chunkSTEP 3Free(L*)STEP 1Exhaust(L) + Template(L)allocatedSTEP 2Exhaust(M)PpaddingPTpage tableSTEP 4Exhaust(M)STEP 5Free(M*) + FreeAll(L)STEP 6Land(S)STEP 7Padding(S)STEP 8Map(M)PT0-to-11-to-0PPPPUNINITIALIZED MEMORY1681a certain (adaptively computed) threshold, we know that
+we are ﬁlling the vulnerable region with S, since the alloca-
+tor could no longer place a new M chunk there and had to
+start breaking down blocks previously occupied by one of
+the former L chunks.
+
+Aligning the victim page table. Finally, we map a page
+p in the former L* chunk that neighbors M* on the left (in
+case of a 0-to-1 ﬂip), or on the right (in case of a 1-to-0 ﬂip),
+at a ﬁxed location in the virtual memory address space to
+force a new PTP allocation (step 8). Depending on the
+virtual address we pick, the page table entry (PTE) that
+points to p is located at a diﬀerent oﬀset within the PTP—
+essentially allowing us to align the victim PTE according to
+the vulnerable template.
+
+We can similarly align the victim PTP according to the
+vulnerable page to make sure that we can ﬂip selected bits in
+the victim PTE. For this purpose, we force the allocation of a
+number of padding PTPs as needed before or after allocating
+the victim PTP (step 7).
+
+We further need to ensure that the vulnerable PTP allo-
+cated in M* and the location of p are 2n pages apart: ﬂip-
+ping the n lowest bit of the physical page address in the
+victim PTE deterministically changes the PTE to point to
+the vulnerable PTP itself, mapping the latter into our ad-
+dress space. To achieve this, we select any page p in the M
+chunk adjacent to M* to map in the victim PTP, based on
+whether it satisﬁes this property.
+
+Exploitation. Once we selected and aligned the victim
+PTP, PTE, and n according the vulnerable template, we
+perform double-sided Rowhammer and replicate the bit ﬂip
+found in the templating phase. Once we trigger the de-
+sired ﬂip, we gain write access to the page table as it is now
+mapped into our address space. We can then modify one
+of our own PTPs and gain access to any page in physical
+memory, including kernel memory.
+
+Note that the exploit is fully reliable and may only fail
+if the ﬂip discovered in the templating phase is not repro-
+ducible (e.g., if a 0-to-1 ﬂip is now applied to a 1-bit con-
+tent). Since the buddy allocator provides chunk alignment
+by design, however, we can address this issue. By exploiting
+knowledge about relative oﬀsets inside the L* chunk, we can
+predict the lower bits of physical addresses in the vulnera-
+ble PTE. For example, if L* is of size 4 MB, meaning that it
+must start at a physical address that is a multiple of 222, we
+can predict the lower 222/4096 = 210 = 10 bits of all 1024
+page frames that fall in L*. Thus, if our templating phase
+on ARMv7 reports a 0-to-1 ﬂip in page 426, at bit oﬀset 13
+of a 32-bit word—a potential PTE, where oﬀsets 1–12 are
+part of its properties ﬁeld—we can immediately conclude
+that this ﬂip is not exploitable:
+if, after Rowhammer, bit
+13 is 1, the PTE may never point to its own page 426 (in
+fact, it could only point to uneven pages).
+In contrast, a
+1-to-0 ﬂip in page 389, at bit oﬀset 16 of a 32-bit word is
+exploitable if we ensure that a PTE at this location points
+to page 397: ____ ____ __01 1000 1101|ppro pert iess ﬂips
+to ____ ____ __01 1000 0101|ppro pert iess (= 389).
+5.4 Exploitable Templates
+
+The number of templates that an attacker can use for ex-
+ploitation is determined by a combination of (i) the number
+of ﬂips found in potential PTEs, and (ii) the relative location
+of each ﬂip in L*.
+
+As discussed earlier, a bit ﬂip in a PTE is exploitable if it
+ﬂips one of the lower bits of the address part. For ARMv7,
+this means that ﬂips found in the lowest 12 bits of each
+32-bit aligned word are not exploitable as these fall into
+the properties ﬁeld of a PTE. Moreover, a ﬂip in one of the
+higher bits of a PTE is also not exploitable in a deterministic
+matter: a 0-to-1 ﬂip in the highest bit would require the PTE
+to point to a page that is, physically, 2 GB to the right of its
+PTP. Without access to absolute physical addresses, we can
+only support bit ﬂips that trigger a page oﬀset shift of at
+most the size of L − 1. For example, if L is 4 MB (512 page
+frames), a 0-to-1 ﬂip in bit 9 of a possible 32-bit word in the
+ﬁrst page of L, is exploitable: the exploit requires a PTE
+that points to a page that is 29 = 256 pages away from the
+vulnerable page. The same ﬂip in page 300 of L, however,
+is not exploitable, as it would require an entry pointing to a
+page outside of L.
+
+In addition, ARMv7’s page tables are, unlike x86’s ones,
+of size 1 KB. Linux, however, expects page tables to ﬁll an
+entire page of 4 KB and solves this by storing two 1 KB ARM
+hardware page tables, followed by two shadow pages (used
+to hold extra properties that are not available in the hard-
+ware page tables), in a single 4 KB page. This design further
+reduces the number of exploitable ﬂips by a factor two: only
+ﬂips that fall in the ﬁrst half of a page may enclose a hard-
+ware PTE.
+
+To conclude, for ARMv7, with a maximum L size of 4 MB,
+a template is not exploitable if (i) it falls in the second half
+of a page (a shadow page) (ii) it falls in the lowest 12 bits
+of a 32-bit word (the properties ﬁeld of a PTE), or (iii) it
+falls in the highest 11 bits of a 32-bit word. Consequently,
+for each word, at most 9 bits are exploitable, and since there
+are only 256 hardware PTEs per page, this means that, at
+most, 2, 304 bits out of all possible 32, 768 bits of a single
+page are exploitable (around 7.0%).
+5.5 Root Privilege Escalation
+
+Once we have control over one of our own PTPs, we can
+perform the ﬁnal part of the attack (i.e., escalate privileges
+to obtain root access). For this purpose, we repeatedly map
+diﬀerent physical pages to scan kernel memory for the se-
+curity context of our own process (struct cred), which we
+identify by using a unique 24-byte signature based on our
+unique (per-app) UID. We discuss more details and evaluate
+the performance of our Android root exploit in Section 8.
+
+6.
+
+IMPLEMENTATION
+
+To demonstrate that deterministic Rowhammer attacks
+are feasible on commodity mobile platforms, we implemented
+our end-to-end Drammer attack on Android. Android pro-
+vides DMA Buﬀer Management APIs through its main mem-
+ory manager called ION, which allows userland apps to ac-
+cess uncached, physically contiguous memory. Note, how-
+ever, that Drammer extends beyond ION and we discuss
+how to generalize our attack on other platforms in Section 7.
+6.1 Android Memory Management
+
+With the release of Android 4.0 (Ice Cream Sandwich),
+Google introduced ION [50] to unify and replace the frag-
+mented memory management interfaces previously provided
+by each hardware manufacturer. ION organizes its memory
+pools in at least four diﬀerent in-kernel heaps, including the
+SYSTEM_CONTIG heap, which allocates physically contiguous
+
+1682memory allocated via kmalloc() (slab allocator). Further-
+more, ION supports buﬀer allocations with explicit cache
+management, i.e., cache synchronization is left up to the
+client and memory access is essentially direct, uncached.
+Userland apps can interact with ION through /dev/ion—
+allowing uncached, physically contiguous memory to be al-
+located by any unprivileged app without any permissions.
+
+Our implementation uses ION to allocate L and M chunks—
+and maps such chunks to allocate S page table pages (4 KB
+on Android/ARM). Given that SLUB’s kmalloc() resorts
+directly to the buddy allocator for chunks larger than 8 KB,
+we can use ION to reliably allocate 16 KB and larger chunks.
+We set L to 4 MB, the largest size kmalloc() supports. This
+gives us the most ﬂexibility when templating and isolat-
+ing vulnerable pages. Although more complex conﬁgura-
+tions are possible, for simplicity we set M to the row size
+(always larger than 16 KB). Intuitively, this allows us to
+release a single vulnerable row for page table allocations,
+while still controlling the aggressor rows to perform double-
+sided Rowhammer. Supporting other M values yields more
+exploitable templates, at the cost of additional complexity.
+6.2 Noise Elimination
+
+To ensure reliability, an attacker needs to eliminate inter-
+ferences from other activity in the system (e.g., other run-
+ning apps) during the Phys Feng Shui phase. The risk of in-
+terferences is, however, minimal. First, our Phys Feng Shui
+phase is designed to be extremely short-lived and naturally
+rule out interferences. Second, interferences are only possi-
+ble when the kernel independently allocates memory via the
+buddy allocator in the low memory zone. Since most kernel
+allocations are served directly from slabs, interferences are
+hard to ﬁnd in practice.
+
+Nonetheless, the attacker can further minimize the risk
+of noise by scheduling the attack during low system ac-
+tivity, e.g., when no user is interacting with the device or
+when the system enters low power mode with essentially
+no background activity. Android provides notiﬁcations for
+both scenarios through the intents ACTION_SCREEN_OFF and
+ACTION_BATTERY_LOW.
+
+7. GENERALIZATION
+
+ION facilitates a Rowhammer attack on Android/ARM
+by readily providing DMA buﬀer management APIs to user-
+land, but it is not yet available on every Linux platform (al-
+though there are plans to upstream it [39,42]). Nonetheless,
+we describe how one can generalize our deterministic attack
+to other (e.g., x86) platforms by replacing ION with other
+standard capabilities found in server and desktop Linux en-
+vironments. More speciﬁcally, the use of ION in Drammer
+can be replaced with the following strategies:
+
+(1) Uncached memory. Rather than having ION map un-
+cached memory in userland, one can employ clflush or any
+of the other cache eviction techniques that have previously
+been used for Rowhammer [11, 16, 23, 25, 26, 31, 32, 35, 47].
+
+(2) L chunks. Transparent hugepages (THP) [2] supported
+by Linux (enabled by default on recent distributions for
+better performance [6, 33] and available on some Android
+devices) can replace the physically contiguous L chunks al-
+located by ION. By selectively unmapping part of each L
+chunk backed by a THP, one can also directly create a M*-
+sized hole without ﬁlling it with M chunks ﬁrst. To learn
+
+when a THP allocation fails (i.e., when L chunks have been
+exhausted), one can read statistics from /proc/vmstat [24].
+To force the kernel to allocate THPs (normally allocated in
+high memory) in low memory (normally reserved to kernel
+pages, e.g., PTPs), one can deplete the ZONE_HIGHMEM zone
+before starting the attack, as detailed in prior work [22].
+Note that THPs contribute to the ability to mount deter-
+ministic attacks, not just to operate double-sided Rowham-
+mer [32, 35, 47], in our setting.
+
+(3) M chunks. While using THPs to exhaust M chunk al-
+locations is infeasible (they are larger), one can abuse the
+SLUB allocator and force it to allocate chunks of a spe-
+ciﬁc size through the buddy allocator. This can be done
+by depleting a slab cache of a carefully selected size (e.g.,
+depleting kmalloc-256 would force one 4 KB allocation) by
+triggering multiple allocations via particular system calls,
+e.g., sendmmsg(), as described by Xu et al. [48, 49].
+
+(4) Predictable PTE content. To ensure that our victim
+PTE points to an attacker-controlled physical page at a pre-
+dictable oﬀset, we rely on mapping neighboring chunks (the
+ﬁrst and the last fragment of a THP in our generalized at-
+tack) multiple times in userland (the ﬁrst time at allocation
+time, the second time when creating the victim page table).
+To implement this strategy with THPs, one can create a
+shared memory segment associated to the vulnerable THP
+(shared memory support for THPs is being merged main-
+line [41]) and attach it multiple times at ﬁxed addresses to
+force page table allocations with PTEs pointing to it. As an
+alternative (until THP shared memory support is available
+mainline), one can simply map a new anonymous (4 KB)
+user page when forcing the allocation of the page table. As
+the ZONE_HIGHMEM zone is depleted, such user page will also
+end up in low memory right next to the PTP.
+
+8. EVALUATION
+
+In this section, we evaluate various aspects of Drammer.
+We (i) evaluate our proposed side channel to detect the row
+size on a given device. Using its results, we (ii) perform
+an empirical study on a large set of Android smartphones
+to investigate to what extent consumer devices are aﬀected
+by susceptible DRAM chips. Finally, we (iii) combine re-
+sults from our study with the ﬁnal exploitation step (i.e.,
+from page table write access to root privilege escalation) and
+compute how fast we can perform our end-to-end attack.
+8.1 Mobile Row Sizes
+
+We evaluate the row size detection side channel described
+in Section 5 by constructing a heatmap for page-pair access
+times. We set our upper limit in both directions to 64 pages,
+and thus read from page pairs (1, 1), (1, 2), . . . , (1, 64), (2, 1),
+(2, 2), . . . , (64, 64).
+Figure 3 shows such a heatmap for a LG Nexus 5 phone.
+We determined that the row size is 16 pages, which is 16 ×
+4K = 64K. This is somewhat surprising, given that most
+previous x86 eﬀorts report a row size of 128K.
+8.2 Empirical Study
+
+For our empirical study, we acquired the following ARMv7-
+based devices: 15 LG Nexus 5 phones, a Samsung Galaxy
+S5, two One Plus Ones, two Motorola Moto G devices (the
+2013 and 2014 model), and a LG Nexus 4. We further ana-
+lyzed a number of ARMv8-based devices: a LG Nexus 5X,
+
+168364
+
+48
+
+32
+
+16
+
+2
+
+e
+g
+a
+p
+
+0
+
+0
+
+175
+
+150
+
+125
+
+100
+
+)
+s
+n
+(
+
+d
+a
+e
+r
+
+r
+e
+p
+
+e
+m
+
+i
+t
+
+16
+
+32
+
+page 1
+
+48
+
+64
+
+Figure 3: Heatmap representing the time required
+to access a given pair of pages on a LG Nexus 5.
+The diagonal pattern clearly indicates that the row
+size is 16 pages = 64K.
+
+a Samsung Galaxy S6, a Lenovo K3 Note, a Xiaomi Mi 4i,
+a HTC Desire 510, and a LG G4.
+
+We subject each device to a Rowhammer test, which (i)
+exhausts all the large ION chunks to allocate a maximum
+amount of hammerable memory (starting at 4 MB chunks,
+down to chunks that are 4 times the row size); (ii) performs
+double-sided Rowhammer on each victim page for which ag-
+gressor pages are available twice and checks the entire victim
+row for ﬂips (i.e., we hammer once with all victim bits set
+to 1—searching for 1-to-0 ﬂips—and once with all bits set
+to 0); and (iii) for each induced ﬂip, dumps its virtual (and
+physical, if /proc/self/pagemap is available) address, the
+time it took to ﬁnd it (i.e., after n seconds), its direction (1-
+to-0 or 0-to-1), and whether it is exploitable by our speciﬁc
+Drammer attack, as discussed in Section 5.
+
+To hammer a page, we perform 2x 1M read operations on
+its aggressor pages. Although prior work shows that 2.5M
+reads yields the optimal amount of ﬂips, lowering the read
+count allows us to ﬁnish our experiments faster, while still
+inducing plenty of bit ﬂips.
+
+Our results (presented in Table 2) show that many tested
+ARMv7 devices are susceptible to the Rowhammer bug,
+while our ARMv8 devices seem somewhat more reliable (al-
+though still vulnerable). However, due to our small current
+ARMv8 sample size, we cannot conclude that ARMv8 de-
+vices are more resilient by design. Moreover, it should be
+noted that our Nexus 5 devices have been used extensively
+in the past for a variety of research projects. This may in-
+dicate a correlation between (heavy) use and the ability to
+induce (more) bit ﬂips. Future research is required, however,
+to conﬁrm whether DRAM wearing actually contributes to
+more observable bit ﬂips.
+
+A second key ﬁnding presented in Table 2 is that a de-
+vice from 2013 (Moto G, 1st generation) is vulnerable to the
+Rowhammer bug. This shows that ARM memory controllers
+have been capable in performing Rowhammer attacks for
+at least three years. Moreover, the MSM8226 SoC (Qual-
+comm Snapdragon 400), which both Moto Gs are shipped
+with, is still a popular SoC for smartwatches (e.g., Motorola
+Moto 360 2nd generation or Huawei Watch), suggesting that
+smartwatches may be susceptible to Rowhammer-based ex-
+
+d
+e
+r
+e
+v
+o
+c
+s
+i
+D
+s
+p
+
+i
+l
+
+F
+
+1
+
+0.8
+
+0.6
+
+0.4
+
+0.2
+
+0
+
+0
+
+0.2
+
+0.4
+0.6
+Bytes Hammered
+
+0.8
+
+1
+
+Flips – Nexus 55
+Flips – Moto G2013
+Flips – OnePlus One2
+
+Expl. – Nexus 55
+Expl. – Moto G2013
+Expl. – OnePlus One2
+
+Figure 4: Template distribution over memory for
+three cases—one with many ﬂips (Nexus 55), one
+with few ﬂips (Moto G2013), one with a large memory
+region without ﬂips (OnePlus One2).
+
+ploits as well. Additionally, while the majority of ﬂips are in-
+duced on LPDDR3-devices, the reported ﬂips on the Nexus
+4 show that even LPDDR2 is be vulnerable.
+
+Third, when looking at the exploitability of observed ﬂips
+(exploitable and 1st columns of Table 2), we conclude that
+once we see ﬂips, we will eventually ﬁnd exploitable ﬂips. Al-
+though only around 6% of all observed ﬂips are exploitable,
+we always ﬁnd enough ﬂips to also ﬁnd those that we can
+use in our end-to-end Android root exploit.
+
+To get a better understanding of the template distribu-
+tion over memory, we display a CDF for three interesting
+devices in Figure 4: one with many ﬂips (Nexus 55), one
+with few ﬂips (Moto G2013), and the OnePlus One2. For
+most other devices, the distribution trend is similar as that
+of the Nexus 5 and Moto G. For the OnePlus One, however,
+it is interesting to notice that a large region of the DRAM
+exposes no ﬂips at all (from 5% to 60%).
+
+8.3 Root Privilege Escalation
+
+Armed with bit ﬂips from the memory templating step,
+we rely on Phys Feng Shui to place the victim page table
+in a vulnerable template-matching location and proceed to
+reproduce an exploitable bit ﬂip. This step allows us to
+control one of our own page tables, enabling root privilege
+escalation. To complete our Android root exploit, we over-
+write the controlled page table to probe kernel memory for
+our own struct cred structure.
+
+The struct cred structure represents a process’ security
+context and holds, among others,
+its real, eﬀective, and
+saved user and group IDs (6 UIDs). Since Android provides
+each app—and thus each running process—a unique UID, we
+can ﬁngerprint a security context by comparing 6 × 4 = 24
+bytes. In our experiments on the latest kernel, the physical
+page that stores a speciﬁc struct cred has 20 bits of en-
+tropy, placed between 0x30000000 and 0x38000000. More-
+over, the structure is always aligned to a 128 byte boundary,
+that is there are 4096
+128 = 32 possible locations within a page
+on which a struct cred can be found. To successfully ﬁnd
+our own, we thus have to map and scan 220 diﬀerent physi-
+
+1684Table 2: Empirical analysis results. For each device, the table shows Hardware Details, which include the
+SoC (System on a Chip), available DRAM (LPDDR3, unless stated otherwise), and detected row size (RS),
+and Analysis Results. For the latter, the MB column depicts the amount of hammered DRAM, ns shows
+the median access time for a single read operation, ﬂips holds the number of unique ﬂips found, KB depicts
+the average amount of KB that contain a single ﬂip, 1-to-0 and 0-to-1 show the directions of the found ﬂips,
+exploitable shows the number of exploitable templates according our attack, and 1st shows after how many
+seconds of hammering we found the ﬁrst exploitable ﬂip. For same model devices, we use a subscript number
+to identify them individually. The top half of the table shows ARMv7-based (32-bit) smartphones, while the
+lower rows are ARMv8 (64-bit).
+
+Device
+
+Nexus 51
+Nexus 52
+Nexus 53
+Nexus 54
+Nexus 55
+Nexus 56
+Nexus 58
+Nexus 59
+Nexus 510
+Nexus 511
+Nexus 512
+Nexus 513
+Nexus 514
+Nexus 515
+Nexus 517
+Galaxy S5
+OnePlus One1
+OnePlus One2
+Moto G2013
+Moto G2014
+Nexus 4
+
+7
+v
+M
+R
+A
+
+8
+v
+M
+R
+A
+
+Nexus 5x
+Galaxy S6
+K3 Note
+Mi 4i
+Desire 510
+G4
+
+Hardware Details
+SoC
+
+DRAM RS MB
+
+MSM8974†
+MSM8974†
+MSM8974†
+MSM8974†
+MSM8974†
+MSM8974†
+MSM8974†
+MSM8974†
+MSM8974†
+MSM8974†
+MSM8974†
+MSM8974†
+MSM8974†
+MSM8974†
+MSM8974†
+MSM8974‡
+MSM8974‡
+MSM8974‡
+MSM8226
+MSM8226
+
+APQ8064
+
+MSM8992
+
+Exynos7420
+
+MT6752
+MSM8939
+
+MSM8916
+
+MSM8992
+
+2 GB
+2 GB
+2 GB
+2 GB
+2 GB
+2 GB
+2 GB
+2 GB
+2 GB
+2 GB
+2 GB
+2 GB
+2 GB
+2 GB
+2 GB
+2 GB
+3 GB
+3 GB
+1 GB
+1 GB
+2 GB∗
+2 GB
+3 GB◦
+2 GB
+2 GB
+1 GB
+3 GB
+
+64
+64
+64
+64
+64
+64
+64
+64
+64
+64
+64
+64
+64
+64
+64
+64
+64
+64
+32
+32
+64
+
+64
+128
+64
+64
+32
+64
+
+441
+472
+461
+616
+630
+512
+485
+569
+406
+613
+600
+575
+576
+573
+621
+207
+292
+1189
+134
+151
+82
+
+271
+234
+423
+327
+186
+833
+
+ns
+
+70
+69
+69
+71
+69
+69
+70
+69
+69
+70
+70
+69
+69
+69
+70
+82
+71
+69
+127
+127
+18
+
+63
+82
+218
+159
+122
+64
+
+†MSM8974AA ‡MSM8974AC ∗LPDDR2 ◦LPDDR4
+
+Analysis Results
+
+# ﬂips KB # 1-to-0 # 0-to-1
+
+# exploitable
+
+1,058
+284,428
+547,949
+0
+747,013
+215,233
+32,328
+476,170
+160,245
+0
+17,384
+161,514
+295,537
+38,969
+0
+0
+3,981
+1,992
+429
+1,577
+1,328
+
+0
+0
+0
+0
+0
+117,496
+
+426
+2
+1
+–
+1
+3
+15
+2
+3
+–
+35
+4
+2
+15
+–
+–
+75
+611
+275
+98
+64
+
+–
+–
+–
+–
+–
+8
+
+1,011
+261,232
+534,695
+–
+704,824
+207,856
+28,500
+434,086
+150,485
+–
+16,767
+160,473
+277,708
+35,515
+–
+–
+2,924
+942
+419
+1,523
+1,061
+
+–
+–
+–
+–
+–
+117,260
+
+47
+23,196
+13,254
+–
+42,189
+7,377
+3,828
+42,084
+9,760
+–
+617
+1,041
+17,829
+3,454
+–
+–
+1,057
+1,050
+10
+54
+267
+
+–
+–
+–
+–
+–
+236
+
+62 (5.86%)
+14,852 (5.22%)
+32,715 (5.97%)
+–
+46,609 (6.24%)
+13,365 (6.21%)
+1,894 (5.86%)
+30,190 (6.34%)
+8,701 (5.43%)
+–
+1,241 (7.14%)
+10,378 (6.43%)
+18,900 (6.40%)
+2,775 (7,12%)
+–
+–
+242 (6.08%)
+94 (4.72%)
+30 (6.99%)
+71 (4.66%)
+104 (7.83%)
+
+–
+–
+–
+–
+–
+6,560 (5.58%)
+
+1st
+
+116s
+1s
+1s
+–
+1s
+3s
+4s
+0s
+1s
+–
+16s
+355s
+1s
+11s
+–
+–
+942s
+326s
+441s
+92s
+7s
+
+–
+–
+–
+–
+–
+5s
+
+cal pages in the worst-case scenario, and for each page per-
+form 32 diﬀerent compare operations, resulting in, at most,
+220 ∗ 32 = 33, 554, 432 calls to memcmp. Since we control only
+a single page table—on ARMv7 capable of storing PTEs to
+512 physical pages—we also need to ﬂush the TLB every
+512 tries. Thus, in order to read all possible pages that may
+contain own our struct cred, we must perform 220
+512 = 2, 048
+TLB ﬂushes.
+
+We ﬂush the TLB by reading from 8, 196 diﬀerent pages in
+a 32 MB memory region, which takes approximately 900 µs.
+Comparing 24 bytes using memcmp() takes at most 600 ns,
+limiting the upper bound time of the ﬁnal exploitation step
+to 2, 048× 900 µs + 33, 554, 432× 600 ns ∼ 22 seconds (mea-
+sured on a Nexus 5). Note that having to break 20 bits of
+entropy does not make our attack less deterministic: we will
+always be able to ﬁnd our own struct cred.
+
+Based on the results from our empirical study, we ﬁnd
+that, for the most vulnerable phone, an end-to-end attack
+(including the ﬁnal exploitation step) takes less than 30 sec-
+
+onds, while in the worst-case scenario, it takes a little over
+15 minutes, where templating is obviously the most time-
+consuming phase of the attack. To conﬁrm that our exploit
+is working, we successfully exploited our Nexus 58 in less
+than 20 seconds.2
+
+Finally, to support future research on mobile Rowhammer
+and to expand our empirical study to a broader range of
+devices, we release our codebase as an open source project
+and aim to build a public database of known vulnerable
+devices on our project website.
+
+9. MITIGATION AND DISCUSSION
+
+In this section, we investigate the eﬀectiveness of current
+Rowhammer defenses and discuss potential design improve-
+ments of the memory management process that could miti-
+gate our attack.
+
+2See https://vusec.net/projects/drammer/ for a demo.
+
+16859.1 Existing Rowhammer Defenses
+
+9.2 Countermeasures Against Drammer
+
+Countermeasures against Rowhammer have already been
+proposed, both in software and hardware, but very few are
+applicable to the mobile domain or eﬀective against a generic
+attack such as the one we proposed.
+
+Software-based. Instruction “blacklisting”, i.e., disallow-
+ing or rewriting instructions such as CLFLUSH [35, 36] and
+non-temporal instructions [31] has been proposed as a coun-
+termeasure and is now deployed in Google Native Client
+(NaCl). Similarly, access to the Linux pagemap interface is
+now prohibited from userland [34,40]. However, these coun-
+termeasures have already proven insuﬃcient, since Rowham-
+mer has been demonstrated in JavaScript [11,16], where nei-
+ther these special instructions nor the pagemap interface are
+present. As a more generic countermeasure, ANVIL [9] tries
+to detect Rowhammer attacks by monitoring the last-level
+cache miss rate and row accesses with high temporal local-
+ity. Similarly, Herath et al. [17] propose to monitor the num-
+ber of last-level cache misses during a given refresh interval.
+Both approaches rely on CPU performance counters speciﬁc
+to Intel/AMD. Furthermore, our attack bypasses the cache
+completely, thus producing no cache misses that could raise
+red ﬂags.
+
+Hardware-based. Memory with Error Correcting Codes
+(ECC) corrects single bit ﬂip errors, and reports other er-
+rors. However, Lanteigne [26] studied Rowhammer on server
+settings with ECC and reported surprising results, as some
+server vendors implement ECC to report bit ﬂip errors only
+upon reaching a certain threshold—and one vendor even
+failed to report any error. Likewise, ECC often does not
+detect multiple ﬂips in a single row. Doubling DRAM re-
+fresh rates has been the response of most hardware vendors
+via EFI or BIOS updates [5, 18, 27]. It severely limits most
+attacks. However, Kim et al. [23] show that the refresh
+rate would need to be increased up to eight times to com-
+pletely mitigate the issue. Aweke et al. [9] mention that
+both doubling the DRAM refresh rate and prohibiting the
+CLFLUSH instruction defeat Rowhammer attacks, but no sys-
+tem currently implements it. As increased refresh rates have
+severe consequences for both power consumption and perfor-
+mance [10], this countermeasure does not seem well-suited
+for mobile devices. In addition, it aligns poorly with the di-
+rection taken by the LPDDR4 standard [20], which requires
+the refresh rate to drop at low temperatures to conserve
+battery life.
+
+Further mitigations rely on the Detection of Activation
+Patterns to refresh targeted rows and need support from the
+DRAM chip or the memory controller. The LPPDR4 stan-
+dard proposes Target Row Refresh (TRR) [20], which seems
+to be an eﬀective countermeasure, but we need to expand
+our study to more devices shipped with this type of mem-
+ory. Probabilistic Adjacent Row Activation (PARA) [23]
+refreshes neighboring rows on each activation with a low
+probability (and thus very likely during repeated activations
+in a Rowhammer attack), but requires modiﬁcations of the
+memory controller to do so. ARMOR [14] introduces an
+extra cache buﬀer for rows with frequent activations, i.e.,
+hammered rows, but again needs to be implemented in the
+memory controller.
+
+We now elaborate on countermeasures that are more spe-
+
+ciﬁc to our Drammer attack on mobile platforms.
+
+Restriction of userland interface. Since DMA plays an
+important part in the deterministic Rowhammer attack on
+mobile devices, the question arises whether userland apps
+should be allowed unrestricted access to DMA-able memory.
+On Android, the motivation for doing so via ION is device
+fragmentation: vendors need to deﬁne custom heaps depend-
+ing on the speciﬁc hardware requirements of each product,
+and provide a mapping of use cases to heaps in their custom
+implementation of gralloc(). It is Google’s policy to keep
+the vendors’ product-speciﬁc code in user rather than in
+kernel mode [43].3 Linux implements similar DMA-support
+with the dma-buf buﬀer sharing API [37], but with a more
+restricted interface. However, ION seems to ﬁll a gap in this
+regard [3] and eﬀorts are underway to upstream it [39, 42].
+Concurrently to our work Google has adopted several de-
+fenses from the Linux kernel in Android [21] concerning
+memory protection and attack surface reduction. While the
+majority of defenses do not aﬀect our attack, Android now
+provides mechanisms to enforce access restrictions to ioctl
+commands and added seccomp to enable system call ﬁlers.
+These mechanisms could be used to restrict the userland
+interface of ION.
+
+However, we note that simply disabling ION is not the
+ﬁnal solution to Rowhammer-based attacks: (i) as discussed
+in Section 7, it is possible to generalize our attack to other
+Linux-based platforms without ION; (ii) since a large num-
+ber of DRAM chips are vulnerable to bit ﬂips and an at-
+tacker might still be able to exploit them through other
+means. Nevertheless, improvements to the interface of ION
+and memory management in general could signiﬁcantly raise
+the bar for an attacker. For example, a possible improve-
+ment is to adopt constraint-based allocation [38], where the
+(ION) allocator picks the type of memory for an allocation
+based on constraints on the devices sharing a buﬀer and de-
+fers the actual allocation of buﬀers until the ﬁrst device at-
+taches one (rather than upon request from a userland client).
+
+Memory isolation and integrity. In the face of an OS in-
+terface that provides user applications access to DMA-able
+memory, stricter enforcement of memory isolation may be
+useful. Speciﬁcally, it may be possible to completely iso-
+late DMA-able memory from other regions. Currently, ION
+readily breaks the isolation of memory zones by allowing
+userland to allocate physically contiguous memory in low
+memory regions usually reserved for the kernel and page
+tables. One option is to isolate ION regions controlled by
+userland from kernel memory.
+In principle, ION can al-
+ready support isolated heaps (e.g., ION carveout), but such
+heaps are statically preallocated and do not yet provide a
+general buﬀer management primitive. Furthermore, even in
+the absence of ION, an attacker can force the buddy allo-
+cator to allocate memory (e.g., huge or regular pages) in
+kernel memory zones by depleting all the memory available
+to userland [22]. Thus, the design of isolation and integrity
+measures for security-critical data such as page tables also
+needs improvements.
+
+3Full discussion at the Linux Plumbers Conference 2013:
+https://www.youtube.com/watch?v=8okc75j5cKk
+
+1686For instance, the characteristics of the underlying DRAM
+cells could be taken into account when allocating memory
+regions for security-critical data. Flikker [29] proposes to
+allocate critical data in memory regions with higher refresh
+rates than non-critical data. RAPID [45] suggests that the
+OS should prefer pages with longer retention times, i.e., that
+are less vulnerable to bit ﬂips. Even without a DRAM-aware
+allocator, isolating security-critical data (e.g., page tables)
+in zones that the system never uses for data that can be
+directly (e.g., ION buﬀers) or indirectly (e.g., slab buﬀers)
+controlled would force attackers to resort to a probabilistic
+attack with low chances of success (no deterministic or prob-
+abilistic memory reuse). However, enforcing strict isolation
+policies is challenging as, when faced with high memory pres-
+sure, the physical page allocator naturally encourages cross-
+zone reuse to eliminate unnecessary OOM events—opening
+up again opportunities for attacks [22].
+In addition, even
+strict isolation policies may prove insuﬃcient to completely
+shield security-sensitive data. For example, ION is also used
+by the media server, which is running at a higher privilege
+than normal apps. Hence, an attacker controlling a hypo-
+thetically isolated ION region could still potentially corrupt
+security-sensitive data, i.e., the media server’s state, rather
+than, say, page tables.
+
+Prevention of memory exhaustion. Per-process mem-
+ory limits could make it harder for an attacker (i) to ﬁnd
+exploitable templates and (ii) exhaust all available memory
+chunks of diﬀerent sizes during Phys Feng Shui. Android
+already enforces memory limits for each app, but only at
+the Dalvik heap level. As a countermeasure, we could en-
+force this limit at the OS level (accounting for both user and
+kernel memory), and per-user ID (to prohibit collusion).
+
+10. RELATED WORK
+
+The Rowhammer bug has gathered the attention of the
+scientiﬁc community for two years, beginning with the work
+of Kim et al. [23], who studied the possibility and the preva-
+lence of bit ﬂips on DDR3 for x86 processors. Aichinger [4]
+later analyzed the prevalence of the Rowhammer bug on
+server systems with ECC memory and Lanteigne performed
+an analysis on DDR4 memory [25]. In contrast to these ef-
+forts, we are the ﬁrst to study the prevalence of the Rowham-
+mer bug on ARM-based devices. Several eﬀorts focused on
+ﬁnding new attack techniques [9, 11, 16, 23, 31, 32]. However,
+all these techniques only work on x86 architectures and, as
+discussed in Section 4.3, are not applicable to our setting.
+
+Drammer is an instance of the Flip Feng Shui (FFS ) ex-
+ploitation technique [32]. Rather than using memory dedu-
+plication, Drammer relies on Phys Feng Shui for physical
+memory massaging on Linux. This shows that FFS can be
+implemented with always-on commodity features.
+
+Lipp et al. [28] demonstrated cache eviction on ARM-
+based mobile devices, but did not evaluate the possibility
+of Rowhammer attacks based on cache eviction. Other at-
+tack techniques focus on the DRAM itself. Lanteigne [25,26]
+examined the inﬂuence of data and access patterns on bit
+ﬂip probabilities on DDR3 and DDR4 memory on Intel and
+AMD CPUs. Pessl et al. [30] demonstrated that reverse en-
+gineering the bank DRAM addressing can reduce the search
+time for Rowhammer bit ﬂips. These techniques are com-
+plementary to our work.
+
+Another line of related work uses the predictable mem-
+ory allocation behavior of Linux for the exploitation of use-
+after-free vulnerabilities. Kemerlis et al. [22] showed in their
+ret2dir attack how kernel allocators can be forced to allo-
+cate user memory in kernel zones. Xu et al. [48, 49] used
+the recycling of slab caches by the SLUB allocator to craft
+the PingPongRoot root exploit for Android. Finally, Lee
+Campbell [12] relied on kernel object reuse to break out of
+the Chrome sandbox on Android.
+
+In concurrent work, Zhang et al. [51] perform a system-
+atic analysis of the design and implementation of ION, al-
+though without studying the topic of cache coherency. They
+found similar security ﬂaws as the ones we exploit for our
+attack, but described diﬀerent attack scenarios: (i) due to
+the unlimited access to ION heaps, both concerning access
+restrictions and memory quotas, an attacker can perform
+a denial-of-service attack by exhaustively allocating all de-
+vice memory; (ii) the recycling of kernel memory for user-
+land apps—and in this case missing buﬀer zeroing logic in
+between—makes ION vulnerable to sensitive information
+leakage. Consequently, their proposed redesign of ION con-
+tains some of the countermeasures we discussed in the pre-
+vious section, e.g., enforcing memory quotas and restrict-
+ing the userland interface. However, they observe that im-
+plementing these changes is challenging, as they incur per-
+formance penalties, break backward-compatibility, and add
+complexity by introducing new security mechanisms specif-
+ically for the access to ION heaps.
+
+11. CONCLUSION
+
+In this paper, we demonstrated that powerful determin-
+istic Rowhammer attacks that grant an attacker root priv-
+ileges on a given system are possible, even by only rely-
+ing on always-on features provided by commodity operat-
+ing systems. To concretely substantiate our claims, we pre-
+sented an implementation of our Drammer attack on the
+Android/ARM platform. Not only does our attack show
+that practical, deterministic Rowhammer attacks are a real
+threat for billions of mobile users, but it is also the ﬁrst ef-
+fort to show that Rowhammer is even possible at all (and
+reliably exploitable) on any platform other than x86 and
+with a much more limited software feature set than exist-
+ing solutions. Moreover, we demonstrated that several de-
+vices from diﬀerent vendors are vulnerable to Rowhammer.
+To conclude, our research shows that practical large-scale
+Rowhammer attacks are a serious threat and while the re-
+sponse to the Rowhammer bug has been relatively slow from
+vendors, we hope our work will accelerate mitigation eﬀorts
+both in industry and academia.
+
+Disclosure
+We have reported our attack (and possible countermeasures)
+to Google and cooperated with the National Cyber Security
+Centre in the Netherlands to coordinate disclosure of the
+vulnerabilities to relevant parties.
+
+Acknowledgements
+We would like to thank the anonymous reviewers for their
+valuable comments and input to improve the paper, as well
+as Ben Gras, Erik Bosman, Kevin Borgolte, Andrea Con-
+tinella, Michael Schwarz, and Moritz Lipp for help with some
+
+1687experiments. This work was supported by the Netherlands
+Organisation for Scientiﬁc Research through grants NWO
+639.023.309 VICI “Dowsing” and NWO CSI-DHS 628.001.021,
+and by the European Commission through project H2020
+ICT-32-2014 “SHARCS” under Grant Agreement No. 644571,
+programme GA No. 644052 (HECTOR) and EU FP7 pro-
+gramme GA No. 610436 (MATTHEW).
+
+This material is also based upon work supported by the
+ONR under Award No. N00014-15-1-2948, and by the NSF
+under Award No. CNS-1408632. Any opinions, ﬁndings,
+and conclusions or recommendations expressed in this pub-
+lication are those of the authors and do not necessarily reﬂect
+the views of the ONR and the NSF.
+
+12. REFERENCES
+[1] Low RAM Conﬁguration. https://source.android.com/
+
+devices/tech/conﬁg/low-ram.html.
+
+[2] Transparent Hugepage Support. https://www.kernel.
+
+org/doc/Documentation/vm/transhuge.txt.
+
+[3] L. Abbott. Lessons from Ion. Embedded Linux
+
+Conference (ELC), April 2016.
+
+[4] B. Aichinger. DDR Memory Errors caused by Row
+
+Hammer. In Proceedings of the 19th IEEE High
+Performance Extreme Computing Conference
+(HPEC), 2015.
+
+[5] Apple Inc. Mac EFI Security Update 2015-001.
+
+https://support.apple.com/en-us/HT204934, June
+2015.
+
+[6] A. Arcangeli. Transparent Hugepage Support. http://
+www.linux-kvm.org/images/9/9e/2010-forum-thp.pdf,
+August 2010.
+
+[7] ARM Limited. ARM Architecture Reference Manual.
+
+ARMv7-A and ARMv7-R edition, 2012.
+
+[15] M. Gorman. Understanding the Linux Virtual Memory
+
+Manager. Prentice Hall PTR, 2007.
+
+[16] D. Gruss, C. Maurice, and S. Mangard.
+
+Rowhammer.js: A Remote Software-Induced Fault
+Attack in JavaScript. In Proceedings of the 13th
+Conference on Detection of Intrusions and Malware &
+Vulnerability Assessment (DIMVA), 2016.
+
+[17] N. Herath and A. Fogh. These are Not Your Grand
+
+Daddy’s CPU Performance Counters - CPU Hardware
+Performance Counters for Security. In Black Hat USA
+(BH-US), 2015.
+
+[18] Hewlett Packard. Moonshot Component Pack Version
+
+2015.05.0 Release Notes.
+http://h10032.www1.hp.com/ctg/Manual/c04676483,
+May 2015.
+
+[19] JEDEC Solid State Technology Association. DDR3
+
+SDRAM Speciﬁcation. JESD79-3F, 2012.
+
+[20] JEDEC Solid State Technology Association. Low
+
+Power Double Data 4 (LPDDR4). JESD209-4A, 2015.
+
+[21] Jeﬀ Vander Stoep. Protecting Android with more
+
+Linux kernel defenses.
+http://android-developers.blogspot.com/2016/07/
+protecting-android-with-more-linux.html, July 2016.
+
+[22] V. P. Kemerlis, M. Polychronakis, and A. D.
+
+Keromytis. ret2dir: Rethinking Kernel Isolation. In
+Proceedings of the 23rd USENIX Security Symposium,
+2014.
+
+[23] Y. Kim, R. Daly, J. Kim, C. Fallin, J. H. Lee, D. Lee,
+C. Wilkerson, K. Lai, and O. Mutlu. Flipping Bits in
+Memory Without Accessing Them: An Experimental
+Study of DRAM Disturbance Errors. In Proceedings of
+the 41st International Symposium on Computer
+Architecture (ISCA), 2014.
+
+[8] ARM Limited. ARM Architecture Reference Manual.
+
+ARMv8, for ARMv8-A architecture proﬁle, 2013.
+
+[24] C. Lameter. Light weight event counters V4.
+https://lwn.net/Articles/188327, June 2006.
+
+[9] Z. B. Aweke, S. F. Yitbarek, R. Qiao, R. Das,
+
+[25] M. Lanteigne. A Tale of Two Hammers: A Brief
+
+M. Hicks, Y. Oren, and T. Austin. ANVIL:
+Software-Based Protection Against Next-Generation
+Rowhammer Attacks. In Proceedings of the 21st ACM
+International Conference on Architectural Support for
+Programming Languages and Operating Systems
+(ASPLOS), 2016.
+
+[10] I. Bhati, M.-T. Chang, Z. Chishti, S.-L. Lu, and
+
+Rowhammer Analysis of AMD vs. Intel.
+http://www.thirdio.com/rowhammera1.pdf, May
+2016.
+
+[26] M. Lanteigne. How Rowhammer Could Be Used to
+
+Exploit Weaknesses in Computer Hardware.
+http://www.thirdio.com/rowhammer.pdf, March
+2016.
+
+B. Jacob. DRAM Refresh Mechanisms, Penalties, and
+Trade-Oﬀs. IEEE Transactions on Computers, 65(1),
+2016.
+
+[27] Lenovo. Row Hammer Privilege Escalation.
+
+https://support.lenovo.com/us/en/product security/
+row hammer, March 2015.
+
+[11] E. Bosman, K. Razavi, H. Bos, and C. Giuﬀrida.
+
+[28] M. Lipp, D. Gruss, R. Spreitzer, and S. Mangard.
+
+Dedup Est Machina: Memory Deduplication as an
+Advanced Exploitation Vector. In Proceedings of the
+37th IEEE Symposium on Security and Privacy
+(S&P), 2016.
+
+[12] L. Campbell. Exploiting NVMAP to escape the
+
+Chrome sandbox - CVE-2014-5332.
+http://googleprojectzero.blogspot.com/2015/01/
+exploiting-nvmap-to-escape-chrome.html, January
+2015.
+
+ARMageddon: Cache Attacks on Mobile Devices. In
+Proceedings of the 25th USENIX Security Symposium,
+2016.
+
+[29] S. Liu, K. Pattabiraman, T. Moscibroda, and B. Zorn.
+
+Flikker: Saving DRAM Refresh-power through
+Critical Data Partitioning. In Proceedings of the 16th
+ACM International Conference on Architectural
+Support for Programming Languages and Operating
+Systems (ASPLOS), 2011.
+
+[13] H. Flake. Three Things that Rowhammer Taught Me.
+
+[30] P. Pessl, D. Gruss, C. Maurice, M. Schwarz, and
+
+Null Singapore, March 2016.
+
+[14] M. Ghasempour, M. Lujan, and J. Garside. ARMOR:
+A Run-Time Memory Hot-Row Detector. http://apt.
+cs.manchester.ac.uk/projects/ARMOR/RowHammer,
+2015.
+
+S. Mangard. DRAMA: Exploiting DRAM Addressing
+for Cross-CPU Attacks. In Proceedings of the 25th
+USENIX Security Symposium, 2016.
+
+1688[31] R. Qiao and M. Seaborn. A New Approach for
+
+[42] J. Stultz. Integrating the ION memory allocator.
+
+Rowhammer Attacks. In Proceedings of the 9th IEEE
+International Symposium on Hardware Oriented
+Security and Trust (HOST), 2016.
+
+[32] K. Razavi, B. Gras, E. Bosman, B. Preneel,
+
+C. Giuﬀrida, and H. Bos. Flip Feng Shui: Hammering
+a Needle in the Software Stack. In Proceedings of the
+25th USENIX Security Symposium, 2016.
+
+https://lwn.net/Articles/565469/, September 2013.
+
+[43] J. Stultz. Summary of the Android Graphics
+
+microconference. https://lwn.net/Articles/569704/,
+October 2013.
+
+[44] Unity. Mobile (Android) Hardware Stats.
+
+http://hwstats.unity3d.com/mobile/cpu-android.html,
+June 2016.
+
+[33] Red Hat. How to use, monitor, and disable
+
+[45] R. K. Venkatesan, S. Herr, and E. Rotenberg.
+
+transparent hugepages in Red Hat Enterprise Linux 6?
+https://access.redhat.com/solutions/46111, September
+2015.
+
+[34] M. Salyzyn. AOSP Commit 0549ddb9: ”UPSTREAM:
+
+pagemap: do not leak physical addresses to
+non-privileged userspace”. http://goo.gl/Qye2MN,
+November 2015.
+
+[35] M. Seaborn and T. Dullien. Exploiting the DRAM
+
+Rowhammer Bug to Gain Kernel Privileges. In Black
+Hat USA (BH-US), 2015.
+
+[36] M. Seaborn and T. Dullien. Exploiting the DRAM
+
+rowhammer bug to gain kernel privileges.
+http://googleprojectzero.blogspot.com/2015/03/
+exploiting-dram-rowhammer-bug-to-gain.html, March
+2015.
+
+[37] S. Semwal. DMA Buﬀer Sharing API Guide.
+https://www.kernel.org/doc/Documentation/
+dma-buf-sharing.txt.
+
+[38] S. Semwal. dma-buf Constraints-Enabled Allocation
+helpers. https://lwn.net/Articles/615892/, October
+2014.
+
+[39] S. Semwal. Upstreaming ION Features: Issues that
+remain. Linux Plumbers Conference, August 2015.
+
+[40] K. A. Shutemov. Linux commit ab676b7d: ”pagemap:
+
+do not leak physical addresses to non-privileged
+userspace”. http://goo.gl/Zvd0qf, March 2015.
+
+[41] K. A. Shutemov. THP-enabled tmpfs/shmem using
+
+compound pages. http://lwn.net/Articles/687352,
+May 2016.
+
+Retention-aware placement in DRAM (RAPID):
+Software methods for quasi-non-volatile DRAM. In
+Proceedings of the 12th International Symposium on
+High-Performance Computer Architecture (HPCA),
+2006.
+
+[46] VMware. Security considerations and disallowing
+inter-Virtual Machine Transparent Page Sharing.
+https://kb.vmware.com/kb/2080735, October 2014.
+
+[47] Y. Xiao, X. Zhang, Y. Zhang, and M.-R. Teodorescu.
+
+One Bit Flips, One Cloud Flops: Cross-VM Row
+Hammer Attacks and Privilege Escalation. In
+Proceedings of the 25th USENIX Security Symposium,
+2016.
+
+[48] W. Xu and Y. Fu. Own Your Android! Yet Another
+
+Universal Root. In Proceedings of the 9th USENIX
+Workshop on Oﬀensive Technologies (WOOT), 2015.
+
+[49] W. Xu, J. Li, J. Shu, W. Yang, T. Xie, Y. Zhang, and
+
+D. Gu. From Collision To Exploitation: Unleashing
+Use-After-Free Vulnerabilities in Linux Kernel. In
+Proceedings of the 22nd ACM Conference on
+Computer and Communications Security (CCS), 2015.
+
+[50] T. M. Zeng. The Android ION memory allocator.
+https://lwn.net/Articles/480055, February 2012.
+
+[51] H. Zhang, D. She, and Z. Qian. Android ION Hazard:
+
+the Curse of Customizable Memory Management
+System. In Proceedings of the 23rd ACM Conference
+on Computer and Communications Security (CCS),
+2016.
+
+1689

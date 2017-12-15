@@ -1,0 +1,1411 @@
+Düppel: Retroﬁtting Commodity Operating Systems to
+
+Mitigate Cache Side Channels in the Cloud
+
+Yinqian Zhang
+
+Department of Computer Science
+
+University of North Carolina at Chapel Hill
+
+Chapel Hill, NC, USA
+yinqian@cs.unc.edu
+
+Michael K. Reiter
+
+Department of Computer Science
+
+University of North Carolina at Chapel Hill
+
+Chapel Hill, NC, USA
+reiter@cs.unc.edu
+
+ABSTRACT
+This paper presents the design, implementation and evalu-
+ation of a system called D¨uppel that enables a tenant vir-
+tual machine to defend itself from cache-based side-channel
+attacks in public clouds. D¨uppel includes defenses for time-
+shared caches such as per-core L1 and L2 caches. Exper-
+iments in the lab and on public clouds show that D¨uppel
+eﬀectively obfuscates timing signals available to an attacker
+VM via these caches and incurs modest performance over-
+heads (at most 7% and usually much less) in the common
+case of no side-channel attacks. Moreover, D¨uppel requires
+no changes to hypervisors or support from cloud operators.
+
+Categories and Subject Descriptors
+D.4.6 [OPERATING SYSTEMS]: Security and Protec-
+tion—Information ﬂow controls
+
+General Terms
+Security
+
+Keywords
+Side-channel attack; cross-VM side channel; cache-based side
+channel
+
+1.
+
+INTRODUCTION
+
+The threat of side-channel attacks in multi-tenant public
+clouds is becoming a realistic security concern [29, 38]. In
+such attacks as demonstrated to date, shared CPU caches
+enable virtual machines (VM) administered by competing
+organizations to exﬁltrate sensitive information from each
+other. This has recently been shown to be possible despite
+considerable interference and background “noise” from the
+hypervisor and other activities on the machine [38].
+
+Most approaches to address these attacks have focused on
+altering the cloud platform in some way (see Sec. 2). How-
+ever, to our knowledge, these defenses have not gained trac-
+tion in existing public clouds. Rather, a typical tenant of
+
+Permission to make digital or hard copies of all or part of this work for personal or
+classroom use is granted without fee provided that copies are not made or distributed
+for proﬁt or commercial advantage and that copies bear this notice and the full cita-
+tion on the ﬁrst page. Copyrights for components of this work owned by others than
+ACM must be honored. Abstracting with credit is permitted. To copy otherwise, or re-
+publish, to post on servers or to redistribute to lists, requires prior speciﬁc permission
+and/or a fee. Request permissions from permissions@acm.org.
+CCS’13, November 4–8, 2013, Berlin, Germany.
+Copyright 2013 ACM 978-1-4503-2477-9/13/11 ...$15.00.
+http://dx.doi.org/10.1145/2508859.2516741.
+
+a public cloud concerned about these attacks is left with
+little choice but to try to defend itself. One approach is
+to construct its software to resist side channels (e.g., [21,
+18, 11]), but these techniques can result in signiﬁcant slow-
+down. A second approach is to run its VMs on an isolated
+machine (possibly verifying this isolation using side chan-
+nels itself [37]), though existing cloud providers that oﬀer
+this service charge more for it.
+
+In this paper we explore a third possibility, namely a
+method by which a tenant can construct its VMs to au-
+tomatically inject additional noise into the timings that an
+attacker might observe from caches. Since these timings
+are the most common side-channels by which an attacker
+infers sensitive information about a victim VM, injecting
+noise into them will generally make the attacker’s job more
+diﬃcult. Our implementation of this idea, called D¨uppel1,
+modiﬁes only the guest OS kernel and is general enough to
+protect arbitrary types of user-space applications. D¨uppel
+can be conﬁgured to protect the user-space application, any
+dynamically linked libraries it uses, or both. D¨uppel does
+not need support from hypervisors or cloud providers. To
+our knowledge, our scheme is the ﬁrst work that provides
+tenant VM OS-layer mitigation of cross-VM side channels.
+Unlike the noise overcome by previous attacks, the noise
+injected by D¨uppel is designed speciﬁcally to confound at-
+tacks mounted via timing the per-core L1 cache (or per-core
+L2 cache, if present) on the platform. D¨uppel does so by
+repeatedly cleaning the L1 cache alongside the execution of
+its tenant workload, at a pace that it adjusts based upon
+the possibility with which timings reﬂecting the workload
+execution could actually have been observed from another
+VM. We also discuss extensions of D¨uppel to defeat timing
+attacks via other time-shared resources such as the branch
+prediction cache, should attacks via this cache [4, 3, 14]
+someday be adapted to a virtualized setting. We empha-
+size, however, that even with just addressing the L1 cache,
+D¨uppel already interferes with all known cryptographic side-
+channel attacks that have been demonstrated in a virtualized
+SMP environment. (See Sec. 8 for further discussion on this
+point.)
+
+Overhead of D¨uppel is modest. In tests on Amazon EC2,
+we show that ﬁle download latencies and server through-
+put over a TLS-protected connection from an Apache web
+server suﬀer by at most 4% when D¨uppel is conﬁgured to
+
+1D¨uppel takes its name from a radar countermeasure de-
+veloped by the German Luftwaﬀe during World War II, in
+which aircraft disperse clouds of tiny pieces of material to
+interfere with radar.
+
+827protect the OpenSSL library. We also demonstrate using
+the PARSEC benchmarks and other programs that compu-
+tational workloads suﬀer by up to 7% when the applications
+are protected by D¨uppel. We believe that these overheads
+are acceptable given the substantial challenge involved in de-
+fending against cache-based side-channels with no help from
+the underlying hardware or hypervisor.
+
+The rest of this paper is organized as follows. We discuss
+related work in Sec. 2. We present necessary background
+in Sec. 3 and then present the design of D¨uppel in Sec. 4
+and Sec. 5. We describe our implementation in Sec. 6 and
+its evaluation in Sec. 7. We discuss possible extensions and
+limitations in Sec. 8 and conclude in Sec. 9.
+
+2. RELATED WORK
+
+Side-channel attacks on CPU microarchitectures for ex-
+tracting cryptographic keys from a victim entity have been
+studied in diﬀerent contexts. The particular form of these
+attacks with which we are concerned are access-driven at-
+tacks, in which the attacker runs a program on the system
+that is performing the cryptographic operation of interest.
+The attacker program monitors usage of a shared hardware
+component to learn information about the key, e.g., the
+data cache [27, 25, 24, 31, 13], instruction cache [1, 2, 38],
+ﬂoating-point multiplier [5], or branch-prediction cache [4,
+3]. Our work speciﬁcally aims at defending against access-
+driven cache-based side-channel attacks in the cloud, an
+example of which was recently demonstrated by Zhang et
+al. [38].
+
+Countermeasures to cache side-channel attacks can be ap-
+plied to various layers in a computer system. In mitigating
+cross-VM side channels, prior works can roughly be classi-
+ﬁed into one of the following categories, based on the layer
+in which the countermeasure is implemented.
+
+Hardware-layer approaches. The ﬁrst category includes
+proposals of new cache designs by applying the idea of re-
+source partitioning (e.g., [26, 33, 34, 12]) or access random-
+ization (e.g., [34, 35, 16]) to mitigate timing channels in CPU
+caches on the hardware layer. Other works have proposed
+approaches to eliminate ﬁne-grained timing sources in hard-
+ware designs [20]. Compared to implementations in other
+layers, hardware methods usually have lower performance
+overhead. However, adoption of new hardware techniques is
+a complex process, which may involve considerations of side
+eﬀects (e.g., power consumption) and economic feasibility.
+Therefore, it might take years before these techniques are
+merged into production and ﬁnally used in clouds.
+
+Hypervisor-layer approaches. Countermeasures in the
+second category intend to mitigate cache timing side chan-
+nels by adapting the hypervisor. One direction along this
+line is to hide nuances in the program execution time, ei-
+ther by providing a fuzzy timer [32] or by forcing all exe-
+cutions to be deterministic [6]. However these approaches
+will exclude many applications that rely on a ﬁne-grained
+timer from running in the cloud. A conceptually similar but
+more comprehensive solution is provided by Li et al. [19],
+in which all sources of timing channels a VM can observe
+are identiﬁed and categorized; they are mitigated either by
+aggregating timing events among multiple VM replicas, or
+by making them deterministic functions of other channels.
+Another direction is to partition the shared resources in the
+hypervisor [28, 30, 17]. In particular, Raj et al. [28] statically
+
+partition the last level cache (LLC) into several regions and
+allow VMs to make use of diﬀerent regions by partitioning
+physical memory pages accordingly. Kim et al. [17] improved
+the performance by dynamically partitioning the LLCs and
+extended the protection to L1 cache as well.
+
+OS-layer approaches Previous OS-layer approaches were
+mostly proposed to defend against cross-process side-channel
+attacks, e.g., [27, 31, 13]. To our knowledge, our approach
+is the ﬁrst to modify the OS layer to mitigate cross-VM side
+channels.
+
+Application-level approaches. The last approach is to
+construct side-channel resistant software implementations.
+For example, the program counter security model [21, 11]
+eliminates key-dependent control ﬂows by transforming the
+software source code. Other eﬀorts focus on side-channel
+free cryptographic implementations (e.g., [18]). These ap-
+proaches incur signiﬁcant overheads in some cases (e.g., Cop-
+pens et al. [11] indicate up to 24×).
+
+3. BACKGROUND
+3.1 CPU Caching Architectures
+
+Modern CPU microarchitectures extensively make use of
+hardware caches to speed up expensive operations. The
+hardware caches on an x86 platform may include data caches,
+instruction caches, translation lookaside buﬀers (TLB), trace
+caches, branch target buﬀers (BTB) in the branch prediction
+unit, etc. These caches are similar in their functionalities.
+The most commonly known caches are data and instruc-
+tion caches sitting between the processor cores and the main
+memory, establishing a storage hierarchy in which each level
+stores the interim data for the next level storage system for
+quick reference. Most contemporary multi-core processors
+are equipped with separate L1 data and instruction caches
+for each core, plus one (or two) uniﬁed LLC for the whole
+CPU package. In some Intel CPUs, a uniﬁed L2 cache exists
+per core, mediating data exchange between L1 caches and
+the LLC. Modern cache sizes range from several kilobytes
+(KB) to several gigabytes (GB). They are usually organized
+as a sequence of blocks denoted cache lines with ﬁxed size.
+Caches are usually set-associative. A w-way set-associative
+cache is partitioned into m sets, each with w lines of size b. If
+the size of the cache is denoted by c, we have m = c/(w× b).
+3.2 Cache-based Side-Channel Attacks
+
+A technique commonly used in cache-based access-driven
+side-channel attacks is the prime-probe protocol. Although
+in previous works, the attacker and victim in this protocol
+would typically be OS processes, we describe the protocol
+here with the attacker and defender being virtual machines,
+to illustrate the threats relevant to the cloud.
+
+In a prime-probe protocol, as introduced by Osvik et
+al. [25], a VCPU (a virtual CPU belonging to a VM) U of
+the attacker’s VM spies on a victim’s VCPU V by measuring
+the cache load in a given cache in the following manner:
+
+prime: U ﬁlls one or more cache sets.
+idle: U waits for a prespeciﬁed prime-probe interval
+
+while the cache is utilized by V .
+
+probe: U times the duration to reﬁll the same cache sets
+with the same data to measure V ’s cache activity on those
+sets.
+
+828Cache activity induced by V during the interval between
+U ’s prime and probe will evict U ’s data from the cache sets
+and replace them with V ’s. This will result in a noticeably
+higher timing measurement in U ’s probe phase than if there
+had been little activity from V . Of course, probing also
+accomplishes priming the cache sets (i.e., evicting all data
+other than U ’s), and so repeatedly probing, with one prime-
+probe interval between each probe, eliminates the need to
+separately conduct a prime step.
+
+A CPU cache, in regard to side-channel attacks, is ei-
+ther time-shared by the attacker and victim, or simultane-
+ously shared by the two entities. An example of a time-
+shared cache is the L1 cache in an SMT-disabled2 proces-
+sor, in which the cache is dedicated to a single CPU core
+and can only be shared by two threads running on the same
+core in turns. It has been shown in previous research that
+SMT facilitates CPU-based side channel attacks because two
+threads can simultaneously use CPU resources [27, 31, 1, 2,
+4]. As most cloud infrastructures disable SMT for perfor-
+mance or security purposes (see Sec. 8.2), per-core caches in
+these environments are time-shared, and so D¨uppel focuses
+on defending against side channels in this case.
+
+4. GOALS
+
+The anticipated attack scenario is in public IaaS clouds,
+where the attacker has full control of a VM co-located with
+the D¨uppel-protected VM and is capable of exploiting per-
+core caches as side channels to exﬁltrate sensitive informa-
+tion. We assume the underlying CPU is based on x86 archi-
+tecture and is not equipped with SMT. Such hardware con-
+ﬁgurations dominate modern public clouds. The two VMs
+in question may time-share the same CPU core, thus time-
+sharing the L1 instruction cache, L1 data cache, the uniﬁed
+L2 cache (if any), BTBs, TLBs and other caching architec-
+tures in a CPU core. We further assume the attacker can
+obtain a copy of the software stack running in the D¨uppel-
+protected system and so can experiment with it to learn the
+cache behavior that it induces. The cloud provider controls
+the hypervisor, which operates as is—it neither facilitates
+the side-channel attacks nor does anything to thwart such
+threats.
+
+In light of this threat model, we have the following goals
+
+for D¨uppel:
+
+Goal 1. D¨uppel should mitigate side-channel attacks via
+
+time-shared caches.
+
+The implementation of D¨uppel that we develop here ad-
+dresses side channels using the L1 (or, if any, L2) per-core
+caches, which are time-shared caches. The principles for
+addressing side channels in these caches should apply to ad-
+dressing them in other time-shared caches, as well.
+
+Goal 2. D¨uppel should not require any hypervisor modi-
+
+ﬁcation.
+
+An important design principle of D¨uppel is to permit its
+adoption by cloud tenants on modern cloud infrastructures
+without any additional support from the cloud providers.
+
+Goal 3. D¨uppel should not require modifying applications
+
+or libraries.
+
+2“SMT” is Simultaneous Multi-Threading, or HyperThread-
+ing in Intel’s terminology.
+
+Though many secrets that might be targeted in side-channel
+attacks are handled in applications and third-party linked li-
+braries, the sheer number and diversity of applications and
+libraries makes modifying all of them an unattractive propo-
+sition. Instead, a goal for D¨uppel is to protect such secrets
+without modiﬁcations to these components. We therefore
+adopted the guest OS kernel as the (sole) location in which
+to implement our techniques.
+
+Goal 4. D¨uppel should induce little performance over-
+
+head.
+To be used in practice, D¨uppel must impose little perfor-
+mance burden on the system. This may require D¨uppel to
+operate in diﬀerent modes during its lifecycle.
+5. CLEANSING TIME-SHARED CACHES
+Because attacks on time-shared caches must involve cache
+probing via CPU preemption, the intuition behind D¨uppel
+is that a guest VM (and the OS that runs on it) can protect
+its own execution against side-channel attacks by adding
+noise to these caches very frequently so that side-channel
+readings by the attacker are confounded by noise added be-
+tween primes and probes.
+5.1 Basic Design
+
+D¨uppel employs periodic cache cleansing to mitigate side
+channels in time-shared caches, e.g., L1 data/instruction
+caches and uniﬁed, per-core L2 caches, if any. The principles
+for addressing these caches could be used to address branch
+predication caches, as well. The basic idea is illustrated in
+Fig. 1. As described in Sec. 3.2, prime-probe protocols on
+time-shared caches work as illustrated in Fig. 1(a): the at-
+tacker periodically preempts the victim’s VCPU by gaming
+the hypervisor scheduler and then probes the cache, which
+takes some time due to cache/memory access latency. Af-
+ter the attacker relinquishes the physical CPU, the victim
+VCPU is scheduled for a short period until the attacker pre-
+empts it again.
+
+Periodic cache cleansing, as illustrated in Fig. 1(b), works
+by cleansing the time-shared cache (ideally) between the at-
+tacker’s probes. Speciﬁcally, cleansing involves D¨uppel it-
+self priming the cache in random order until all of the entries
+have been evicted. The cache cleansing process is accom-
+plished by an kernel thread that is periodically invoked by
+D¨uppel.
+
+Key to the success of this technique is a ﬁne-grained reso-
+lution timer in the guest OS kernel that can be periodically
+triggered to execute cache cleansing. There are several pos-
+sible timers that might be utilized for this purpose:
+
+• Hardware Timers On x86 platforms, the hardware
+timers include the programmable interval timer (PIT),
+the local advanced programmable interrupt controller
+timer (Local APIC), the high precision event timer
+(HPET), and the advanced conﬁguration and power
+interface (ACPI) power management timer. Perfor-
+mance monitoring units (PMU) can also be regarded
+as a type of hardware timer, since they can be set
+to trigger upon hardware events that occur with pre-
+dictable rates. In modern IaaS clouds, e.g., Amazon
+EC2 and Rackspace, most guest VMs run on paravirtu-
+alized Xen platforms. However, in such settings, none
+of the above hardware timers can be set to trigger by
+a guest VM.
+
+829(a) Attackers exploits time-shared caches by preempt-
+ing victim VCPUs.
+
+(b) Periodic time-shared cache cleansing.
+
+Figure 1: Attack and defense on time-shared caches
+
+• Software Timers A software timer may be as com-
+plex as a Linux high-resolution timer (hrtimer) or as
+simple as a piece of code that busy loops and peri-
+odically invokes the execution of the timer handling
+code using interrupts. These interrupts can include
+network I/O interrupts and inter-processor interrupts
+(IPI), the latter of which was used by Zhang et al. [38].
+In paravirtualized VMs, although IPIs are also virtual-
+ized (as are I/O interrupts), they oﬀer more stable and
+shorter interrupt delays. The delay of an IPI timer can
+be as low as 3µs, while that of the hrtimer is usually
+higher than 15 to 20µs.
+
+The timers used in D¨uppel are hrtimers and software timers
+generated by IPIs. Periodic cache cleansing activities can
+operate in two modes: sentinel mode and battle mode. The
+sentinel mode is used when frequent cache cleansing is not
+critical, and thus the interval between two cleansings can
+be longer—as long as D¨uppel can detect abnormal activi-
+ties and switch to battle mode quickly. The hrtimers are
+employed in sentinel mode because it induces lower perfor-
+mance overhead (conforming to Goal 4). The much more
+rapid IPI timers are used in the battle mode, where inter-
+vals between cache cleansings are required to be as short as
+possible and the performance overhead is less of a concern
+when under active side-channel attacks.
+5.2 Optimizations
+
+We discuss in this section a few design optimizations that
+
+reduce the performance impact of D¨uppel.
+5.2.1 Limiting the Protection Scope
+D¨uppel’s periodic cleansing of the L1 cache impacts the
+performance of the victim’s application. As such, ideally
+D¨uppel would be triggered only when necessary. Fortu-
+nately, we can limit the scope of protection by allowing the
+users of D¨uppel to deﬁne speciﬁc operations as sensitive so
+that cache cleansing is triggered only when sensitive oper-
+ations run. For instance, in a TLS-protected web server,
+cryptographic routines in the OpenSSL library might be
+considered sensitive operations. The goal is to automati-
+cally enable D¨uppel when needed and disable D¨uppel when
+sensitive operations ﬁnish.
+
+D¨uppel implements this mechanism by exploiting CPU
+page-level execution protections. D¨uppel ﬁrst marks the
+memory pages that contain the instructions of the sensi-
+
+tive operations as non-executable. Thus every time these
+instructions are executed, page faults trigger D¨uppel. Then
+D¨uppel can disable the execution protection to prevent fur-
+ther page faults and start the cache cleansing timer to trigger
+cleansing each of the time-shared caches N times (Sec. 5.1).
+At the end of the N -th cleansing, the execution protection
+is re-enabled.
+
+If N is very small, unﬁnished sensitive operations will
+trigger the page fault again to initiate another N timer
+interrupts, and the overhead of frequently changing page-
+level protections can be huge. If N is too big, D¨uppel will
+keep running after the sensitive operation ends. In our de-
+sign, D¨uppel dynamically adjusts N with the following algo-
+rithms: N changes value in the range of [Nmin , Nmax ], each
+time by adding ∆. ∆ may vary in the range of [∆min , ∆max ]
+and [−∆max ,−∆min ]. If the page fault takes place right af-
+ter (i.e., no more than a threshold of L cycles) re-enabling
+execution protection, ∆ doubles if it was positive or becomes
+∆min otherwise; if the page fault happens later than L, ∆
+doubles in the negative direction or becomes −∆min .
+Alternative Approaches. Instead of exploiting page ex-
+ecution protection, another way to dynamically enable and
+disable D¨uppel is to modify the user level application. For
+example, to protect dynamically linked libraries, the most
+convenient way is to modify the procedure linkage table en-
+tries of the relevant processes so that every library call re-
+lated to the protected library function will ﬁrst go through
+a wrapper function. Similarly it is possible to use preloaded
+libraries to overwrite (to provide a wrapper for) the library
+routines. In order to protect sensitive operations in the exe-
+cutables, one either needs to instrument the functions in the
+executables or insert breakpoints and use ptrace to inter-
+cept SIGTRAP signals sent to the protected process. These
+approaches, however, violate Goal 3 and so are not adopted
+by D¨uppel.
+5.2.2
+We further optimize D¨uppel to skip unnecessary cache
+cleansings. Before cleansing the L1 cache (and any other
+time-shared caches), D¨uppel ﬁrst determines if the VCPU
+it is running on has been preempted since it last ran on the
+VCPU. If preemption took place, it then determines if the
+process interrupted by the current timer interrupt is related
+to the sensitive operations to be protected. If both answers
+are yes, D¨uppel will cleanse the cache; otherwise, it skips
+the cache cleansing step.
+
+Skipping Unnecessary Cache Cleansings
+
+A paravirtualized Xen guest VM can detect VCPU pre-
+emption by exploiting shared data structures between the
+guest and the hypervisor. In particular, Xen uses a shared
+memory page that contains a value of the timestamp counter
+to help the guest VM keep track of the system time. The
+counter value is updated at every hypervisor context switch
+if it is diﬀerent from the version stored in the hypervisor,
+which is only changed every one second. At the end of each
+cache cleansing, D¨uppel modiﬁes the shared counter value by
+one, which compared to the 64-bit counter value is rather
+small. (Greater changes may confuse the guest OS.) The
+next context switch will force a change of the counter value,
+and therefore will be detected by D¨uppel. One caveat is
+that the guest can voluntarily relinquish the VCPU, as well,
+which occurs when the VCPU is idle or at certain points
+during VCPU setup. D¨uppel instruments the code locations
+at which the guest VM kernel issues hypercalls to relinquish
+
+Attacker ProbingVictimAttacker ProbingAttacker ProbingPreempt CPURelinquish CPUVictimAttacker ProbingVictimAttacker ProbingAttacker ProbingCache CleansingVictim830the VCPU, to help distinguish voluntary context switches
+and VCPU preemptions.
+
+6.
+
+IMPLEMENTATION
+
+We implemented D¨uppel as a kernel component (1.4K
+lines of C code) in paravirtualized Linux that runs on Xen
+guest virtual machines. Speciﬁcally, our prototype imple-
+mentation modiﬁes Linux kernel v2.6.32.
+It operates on
+both Xen 4.0 hypervisors in our lab setting and Xen 3.0
+hypervisors (as reported) in Amazon Web Services.
+
+Architecture. We provided an entry in the /proc ﬁle sys-
+tem which allows user-space tools to input user speciﬁed pa-
+rameters to D¨uppel. These parameters include names of the
+protected applications and libraries. (It is currently possible
+to protect a subset or all of the libraries in one or multiple
+processes.) Our implementation extends the memory region
+management component of the Linux kernel to monitor the
+creation, deletion and splitting of the memory regions re-
+lated to the protected applications and libraries. A list of
+pointers to these memory regions is maintained by D¨up-
+pel. This list is adjusted dynamically by D¨uppel with the
+creation and termination of the protected processes. Read-
+Copy-Update (RCU) synchronization mechanisms are used
+to guarantee exclusive modiﬁcations and wait-free reads to
+this data structure with very low overhead. All memory
+pages belonging to the memory regions maintained in the
+list are disallowed to be executed by modifying the corre-
+sponding page table entries. This can be enforced by modify-
+ing the default page protection ﬂags of the memory regions,
+which will be propagated to all newly mapped memory pages
+due to on-demand paging [9]. Although the same memory
+pages can also be mapped to other processes in the system,
+they can be executed normally since they have separate page
+tables.
+
+We also instrumented the page fault handler so that every
+page fault goes through an additional check: faults caused
+by user-space execute accesses to pages that are already in
+memory are passed to D¨uppel to further examine if the faults
+take place in the protected memory regions. As such page
+faults are otherwise rare, the performance overhead caused
+by modiﬁcations to the critical page fault handling proce-
+dure is minimal.
+
+Workﬂow of D¨uppel. The main logic of D¨uppel works
+as follows: D¨uppel traps the page faults caused by execut-
+ing the protected memory regions, and it then enables the
+page execution for all pages belonging to the list of mem-
+ory regions. Then it initiates the periodic cache cleansing.
+After N cleansings have been performed, D¨uppel stops and
+enables page-execution protection in the page tables, indi-
+cating the end of a protection epoch.
+
+Additionally, a counter recording the times a VCPU is
+preempted is maintained by D¨uppel to determine in which
+mode it should operate cache cleansing, i.e., sentinel mode
+or battle mode (Sec. 5.1). If the counter is greater than a
+threshold—empirically determined as 10 in our evaluation
+(see Sec. 7)—D¨uppel enters the battle mode; otherwise it
+runs in sentinel mode. The counter is updated as an expo-
+nential moving average (or EMA) of the number of VCPU
+preemptions in the current and previous time epochs, with
+λ = 0.5 where λ is a constant that determines the depth of
+memory of the EMA [15] . Each time epoch is roughly 1ms
+(rounded down to a number of CPU cycles that is a power
+
+Figure 2: A token-based IPI synchronization algo-
+rithm.
+
+of 2 for eﬃciency). Even if the attacker is aware of D¨uppel’s
+parameters and refrains from preempting the victim (and so
+probing) less than 10 times per ms to cause D¨uppel to stay
+in sentinel mode, the L1 caches will nevertheless be cleansed
+at least 50 times per millisecond.
+
+Cache cleansing modes and operations. When oper-
+ated in sentinel mode, D¨uppel induces periodic timer inter-
+rupts and then tries to detect preemption (see Sec. 5.2.2) on
+all VCPUs. Once a preemption on a VCPU is detected, it
+sends an IPI to launch the next timer on that VCPU. As
+more preemptions are detected, D¨uppel enters battle mode,
+in which it will send IPIs to all the other cores that are
+available to process the IPI interrupts. The reason for send-
+ing IPIs to all such VCPUs (vs. only one) is to avoid cases
+where the VCPU being sent an IPI is not running (e.g.,
+is preempted or out of credit to run), thereby causing the
+cache-cleansing interrupts to pause.
+
+We implemented a token-based VCPU synchronization al-
+gorithm in D¨uppel (shown in Fig. 2) to avoid race condi-
+tions. An atomic variable serves as the token and one or
+more VCPUs simultaneously in the IPI context will try an
+atomic exchange to grab the token. So, only one VCPU will
+get it. After the cache cleansing job is done (or skipped),
+the VCPU with the token will try to send IPIs to all other
+VCPUs that have ﬁnished the last-round cache cleansing to
+pass along the token. As such, releasing tokens may not al-
+ways be successful. Failure in passing the token or detection
+of another VCPU preemption at this point will force it to
+go over the cache cleaning cycle again. If the preemption
+counter goes below the threshold value, D¨uppel jumps back
+to sentinel mode.
+
+7. EVALUATION
+7.1 Security Evaluation
+
+In this section, we report the results of our security evalu-
+ation of D¨uppel in a lab environment. Our lab testbed was
+equipped with a single-socket quad-core Intel Core 2 Q9650
+processor with an operating frequency of 3.0GHz. It had two
+levels of caches: both L1 data and instruction caches were
+
+8318-way set-associative and 32KB in size; two 24-way 6MB
+uniﬁed L2 caches, each served two CPU cores. All caches
+had 64-byte cache lines. We ran a Xen 4.0 hypervisor on
+the hardware; Dom0, the management domain in Xen, was
+given a single VCPU.
+
+To evaluate D¨uppel under attack, i.e., when it operates
+with the presence of a side-channel attacker, we assigned
+two VCPUs to the VM that ran D¨uppel, and two VCPUs
+to a co-resident attacker VM. We facilitated the attack by
+pinning the VCPUs to the physical cores so that one attacker
+VCPU and one D¨uppel VCPU shared the same L1 caches.
+D¨uppel was conﬁgured to cleanse both the L1 data cache
+and the L1 instruction cache.
+
+7.1.1 Attacking a “Dummy” Victim
+
+Victim. The “dummy” victim application in these exper-
+iments had two “dummy” functions composed of “nop” in-
+structions. The instructions in each of them were mapped
+to diﬀerent regions in the L1 instruction cache, occupying
+all cache lines in several cache sets. The victim application
+executed in a loop, alternating between these two functions.
+As such, the victim had distinguishable access patterns in
+the L1 instruction cache—all cache sets associated with the
+two functions were thoroughly evicted while other cache sets
+were almost entirely untouched.
+
+Attacker. We leveraged the side-channel attack code of
+Zhang et al. [38], which exploits IPIs to periodically pre-
+empt the victim VCPU and prime-probe the L1 instruc-
+tion cache to collect timing results from each cache set. The
+two VCPUs in the attacker’s VM have diﬀerent roles: the
+IPI VCPU keeps looping and periodically sends IPIs to the
+attacker VCPU. The attacker VCPU is otherwise idle and
+only executes cache probing functions when triggered by re-
+ceiving IPIs. The interval between two consecutive IPIs sent
+to the attacker VCPU is determined by the attacker, and is
+varied in our experiments as a tuned parameter. Each cache
+probing takes about 42000 CPU cycles (roughly 14µs), and
+one hypervisor context switch takes about 600 cycles. The
+IPI intervals, therefore, are the desired prime-probe inter-
+vals plus the time required for probing and context switches.
+Longer IPI intervals will give more chances to the victim to
+run, but multiple functions may run in the same prime-
+probe interval, leaving the cache too noisy to interpret.
+Shorter IPI intervals may cause more than one IPI to be
+delivered at the same time, making the prime-probe pro-
+tocol fail. The range for the attacker’s IPI interval that we
+evaluated was from 50000 CPU cycles to 90000 cycles.
+
+Eﬀectiveness of cache cleansing. Our ﬁrst attempt in
+evaluating the eﬀectiveness of D¨uppel’s cache cleansing was
+to measure the fraction of cache lines not evicted by D¨uppel
+prior to the attacker probing the cache. Information leaks
+can happen either when D¨uppel is not run between the at-
+tacker’s prime and probe, or when D¨uppel is run but it
+does not have enough time to cleanse the entire cache be-
+fore being preempted by the attacker. The results of our
+tests are shown in Fig. 3(a). From the graph, we can see
+that when the attacker chooses a long IPI interval (>70000
+cycles) or a short IPI interval (<65000 cycles), the potential
+information leak is minimal.
+
+When the attacker’s IPI interval is short (<65000 cycles),
+contention may result in IPIs issued by D¨uppel being sig-
+niﬁcantly delayed or even “starved” by the attacker. How-
+
+(a) Average fraction of cache potentially occupied by
+victim application data upon preemption
+
+(b) IPI intervals during which the victim application
+executed at all
+
+Figure 3: Cache cleansing eﬀectiveness under diﬀer-
+ent attacker IPI intervals.
+
+ever, recall that D¨uppel is designed to repeatedly cleanse
+the cache if it detects preemption; so even with less frequent
+IPI interrupts, D¨uppel will still consume most of the CPU
+time in cache cleansing to make sure the victim secret is
+not leaked through side channels. With longer IPI intervals
+(>70000 cycles), the IPIs issued by D¨uppel will be delivered
+on time and D¨uppel is able to ﬁnish the cache cleansing with-
+out being preempted, thus allowing the victim to run nor-
+mally while being protected. However, when the IPI inter-
+val is between 65000 and 70000 cycles, D¨uppel only gets to
+cleanse a fraction of the cache before being preempted. This
+is the worst-case scenario for D¨uppel’s protection scheme.
+Fig. 3(b) also helps illustrate this phenomenon. The y-axis
+in this ﬁgure is the fraction of attacker’s prime-probe trials
+in which the victim application ran at all.
+
+In the worst case, when the attacker’s IPI interval is 66000
+CPU cycles, about 25% of the cache lines are not evicted by
+D¨uppel but might contain victim application data. This
+provides the opportunity for some information leakage to
+the attacker, but the risk is far less than in the absence
+of D¨uppel. Fig. 4 shows the attacker’s cache readings from
+the prime-probe trials in this case. Each column in the
+heatmap represents the cache set indicated on the x-axis; the
+y-axis is the index of prime-probe readings. In Fig. 4(a) we
+can see that without D¨uppel, the attacker can easily observe
+the cache pattern (the alternating cache usage on the left)
+of the victim application. In contrast, even with 25% of the
+cache lines possibly containing victim application data not
+evicted by D¨uppel, as shown in Fig. 4(b), the victim’s cache
+patterns are substantially obfuscated.
+
+More quantitatively, in this worst-case scenario we mea-
+sured the diﬀerence, for each cache set, of the average probe
+results (averaged over 100000 prime-probe trials) for that
+cache set when one dummy function ran versus the aver-
+
+ 0 0.05 0.1 0.15 0.2 0.25 0.3 50000 60000 70000 80000 90000fraction of cacheattacker’s IPI intervals (cycles) 0 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 1 50000 60000 70000 80000 90000fraction of prime-probe trialsattacker’s IPI intervals (cycles)832(a) w/o D¨uppel
+
+p
+O
+
+Square
+Multiply
+Other
+
+p
+O
+
+Square
+Multiply
+Other
+
+Classiﬁcation
+
+Other
+
+1740 (0.84)
+
+Square
+
+Multiply
+43 (0.02) 298 (0.14)
+14 (0.01) 2213 (0.94) 123 (0.05)
+272 (0.05) 225 (0.04) 5072 (0.91)
+
+(a) w/o D¨uppel
+
+Classiﬁcation
+
+Multiply
+
+Square
+26 (0.01) 699 (0.39) 1055 (0.59)
+26 (0.01) 938 (0.48) 987 (0.51)
+86 (0.01) 3367 (0.54) 2816 (0.45)
+
+Other
+
+(b) w/ D¨uppel
+
+Figure 4: Attacker’s view of L1 instruction cache
+timings. The x-axis represents the cache sets; the
+y-axis represents the attacker’s prime-probe trials.
+The darker the cell in the heatmap, the longer it
+takes the attacker to probe the cache.
+
+age for that cache set when the other dummy function did.
+Without D¨uppel enabled, this diﬀerence-per-cache-set, av-
+eraged over all cache sets, was 32.7 cycles with a standard
+deviation of 13.2 cycles. However, cache sets to which one or
+the other dummy function mapped clearly divulged which
+dummy function had executed, exhibiting a diﬀerence-per-
+cache-set up to 190 CPU cycles — almost 12 standard de-
+viations above the mean. (By comparison, the maximum
+diﬀerence-per-cache-set among cache sets not associated with
+either dummy function was only 22 cycles.) With D¨uppel
+enabled, the diﬀerence-per-cache-set, averaged over all cache
+sets, was 3.3 cycles with a standard deviation of 2.1 cycles.
+Among those cache sets to which either dummy function
+mapped, the maximum diﬀerence-per-cache-set dropped to 8
+cycles, which is less than three standard deviations above the
+mean and, moreover, even less than the maximum diﬀerence-
+per-cache-set among cache sets not associated with either
+dummy function (which stayed basically unchanged from the
+D¨uppel-disabled case). In this respect, D¨uppel brought the
+timings of the cache sets occupied by the dummy functions
+largely “in line” with the timings of other cache sets.
+
+7.1.2 Case Study: Square and Multiply
+As a case study, we examined the victim application at-
+tacked by Zhang et al. [38], namely the modular exponentia-
+tion implementation in the libgcrypt v.1.5.0 cryptographic
+library, which uses a textbook square-and-multiply algo-
+rithm.
+In this attack, the goal of the attacker was to ex-
+tract a secret exponent used in this routine by probing the
+L1 instruction cache to infer the sequence of squares and
+multiplies executed. Here we focus on the accuracy of the
+ﬁrst stage of the Zhang et al. attack, which involves classi-
+ﬁcation of prime-probe timing vectors using a three-class
+support vector machine (SVM) — one class for “square”, one
+for “multiply”, and one for “other”. While subsequent stages
+of the attack pipeline can ﬁlter out a small rate of misclas-
+siﬁcations, a reasonably accuracy of the SVM classiﬁcations
+is necessary for the attack to work.
+
+(b) w/ D¨uppel
+
+Figure 5: Confusion matrix of SVM classiﬁcation in
+tests in Sec. 7.1.2.
+
+Training the SVM was performed using the same approach
+as taken in the Zhang et al. work. In particular, to collect
+data for training, the “victim” repeatedly performed modu-
+lar exponentiations, while informing the data collector via
+shared memory when it begins or ends a square or multiply.
+In this way, the data collector could associate its probe re-
+sults of the L1 instruction cache with the ground-truth op-
+eration that was being performed when the probe was per-
+formed. Like Zhang et al. [38] we used a linear kernel in the
+SVM classiﬁer. In each experiment, the SVM was trained
+with the labeled 90000 prime-probe results and then tested
+on an additional 10000 prime-probe results.
+
+Fig. 5 shows the confusion matrix that resulted from an
+experiment in which both training and testing were con-
+ducted with D¨uppel disabled (Fig. 5(a)) and one in which
+both training and testing were conducted with D¨uppel en-
+abled (Fig. 5(b)). With D¨uppel disabled, the SVM classiﬁes
+the testing probe results with accuracy over 90%, which
+is well enough in our experience to enable the subsequent
+stages of the Zhang et al. attack. When D¨uppel is enabled,
+however, the SVM classiﬁcation fails badly with an accu-
+racy of only about 38%. In our experience, continuing the
+Zhang et al. attack from this point would be extremely dif-
+ﬁcult. This is, of course, not a proof that no exploitable
+side-channel still exists, and it is conceivable that a persis-
+tent and adaptive attacker could still make progress; how-
+ever, we believe that D¨uppel should substantially increase
+the complexity of doing so.
+7.2 Performance Evaluation
+
+We conducted the performance evaluation of D¨uppel pri-
+marily in a public cloud environment, Amazon Web Services.
+The speciﬁcation of processors in the Amazon EC2 cloud en-
+vironment was not of our own choice. But through cpuid
+instructions, we determined that the platform was equipped
+with two 2.4GHz Intel Xeon E5645 processors, each of which
+had six cores per package with hyper-threading supported
+but disabled.
+Its L1 data caches were 32KB, 8-way set-
+associative; L1 instruction caches were also 32KB but with
+only 4 ways. One 8-way uniﬁed L2 cache was dedicated to
+each core, with 256KB capacity. Additionally, it had one
+12MB 16-way L3 cache per CPU package. All caches had
+64-byte cache lines. The shared info pages [10, Ch. 3] re-
+ported the Xen version to be xen-3.0-x86_64. The number
+
+ 0 1000 2000 3000 4000 5000 0 10 20 30 40 50 60prime-probe trialscache sets 0 1000 2000 3000 4000 5000 0 10 20 30 40 50 60prime-probe trialscache sets833Figure 6: D¨uppel’s overheads for ﬁle download la-
+tency with diﬀerent ﬁle sizes. Labels on top of the
+bars represent the baseline latency (without D¨up-
+pel) in ms.
+
+of Dom0 VCPUs was unknown. As in the lab settings, we
+implemented D¨uppel in Linux kernel v2.6.32 in the cloud.
+D¨uppel was conﬁgured to protect the L1 caches and the
+uniﬁed L2 cache.
+
+7.2.1 Securing TLS Libraries
+In the following experiments we evaluate the performance
+overhead of D¨uppel when protecting apache2 processes and
+the OpenSSL library (libcrypto.so) to which they were
+linked. We are particularly interested in preventing side
+channel attacks against the cryptographic operations pro-
+vided by libcrypto.so during the Transport Layer Secu-
+rity (TLS) protocol used in https connections. We ran an
+apache 2.2.24 web server with libcrypto.so version 1.0.0.
+We ran the web server in one VM in the EC2 cloud and ran
+the client in another VM in the same availability zone in
+order to minimize network latency.
+
+File download latency Fig. 6 shows results of an exper-
+iment to test the impact of D¨uppel on ﬁle download la-
+tency. We ran apache bench on the client and requested
+static pages with varying ﬁle sizes. The results reported are
+average values of 10000 requests for each ﬁle size. These ex-
+periments show that the impact of D¨uppel on ﬁle download
+latency was less than 4% in the worst case.
+
+File download throughput Fig. 7 shows the ﬁle down-
+load throughput degradation induced by D¨uppel in our web
+server experiments. In these experiments, we used another
+web server performance measurement tool, httperf [22], to
+produce the largest rate of requests for a 177-byte ﬁle (the
+default index.html ﬁle installed with apache2) for which
+the server could keep up.
+In order to saturate a server
+with 2 VCPUs, the requests were sent from 2 clients running
+httperf from distinct machines in the same availability zone
+in AWS; for the 4-VCPU server, 4 clients were employed in
+the test. Only one request was issued per connection and the
+SSL sessions were not reused. The timeout value for which
+httperf waited for the server’s response was set to 1s. We
+conﬁrmed by running the top utility that at its saturation
+point the server was CPU-bound; the throughput and server
+CPU usage both reached their limits simultaneously. Thus
+the throughput degradation was actually caused by D¨up-
+pel rather than other factors. As this ﬁgure illustrates, the
+maximum throughput of the 2-VCPU server dropped from
+267.1 replies per second to 258 replies per second, yielding a
+degradation of 3.4%. In the 4-VCPU case, the server’s max-
+imum throughput dropped only 1.4%, decaying from 545.3
+
+(a) 2-VCPU server
+
+(b) 4-VCPU server
+
+Figure 7: File download rate in replies per second
+with diﬀerent requests per second, with and without
+D¨uppel.
+
+Figure 8: Runtime overhead of D¨uppel for diﬀerent
+applications. Labels on top of the bars represent the
+baseline runtime (without D¨uppel) in seconds.
+
+replies per second to 537.7 replies per second. In all cases,
+the throughput overheads induced by D¨uppel were modest.
+
+Securing Other Applications
+
+Local experiments We repeated the above ﬁle download
+latency and throughput experiments in a more controlled en-
+vironment in our lab. In these tests, the clients and server
+were connected through a 1Gb/s LAN. The qualitative re-
+sults shown in Fig. 6 and Fig. 7 persisted in our local tests,
+e.g., with an induced latency degradation by D¨uppel of at
+most 3% and a throughput degradation of at most 2.1%.
+7.2.2
+We also evaluated D¨uppel in protecting other applications.
+We ﬁrst picked three applications, blackscholes, canneal
+and dedup, from the PARSEC benchmarks [7, 8] to simu-
+late diﬀerent types of applications. blackscholes simulates
+ﬁnancial analysis and, in particular, calculates the prices of
+a portfolio of options using Black Scholes partial diﬀerential
+equations. canneal uses cache-aware simulated annealing
+to design chips that minimize routing costs. dedup is short
+for “deduplication,” which is a compression approach that
+combines global and local compression in order to obtain a
+high compression ratio. We selected these benchmark appli-
+cations to represent CPU-bound applications with diﬀerent
+amounts of memory and cache usage. The inputs to these
+benchmarks were native (see [8]) and the number of threads
+was the same as the number of VCPUs in the VM. We spec-
+iﬁed the entire executables to be sensitive, and so D¨uppel
+was always enabled while the programs were running.
+
+In addition, we selected three applications that involve
+cryptographic operations, which are more likely to be of in-
+terest to attackers: GnuPG, encfs, and scp. GnuPG is part
+of the GNU project and implements the OpenPGP stan-
+
+ 0.99 1 1.01 1.02 1.03 1.041B10B100B1KB10KB100KB1MB10MBnormalized latencyfile size2 VCPU14.8614.6414.7514.7316.0122.7473.49414.904 VCPU11.9811.8711.8111.7712.3114.9334.95203.55 0 50 100 150 200 250 30050100150200250265300350replies per secondrequests per secondw/o Duppelw/ Duppel 0 100 200 300 400 500100200300400500540550600replies per secondrequests per secondw/o Duppelw/ Duppel 0.98 0.99 1 1.01 1.02 1.03 1.04 1.05 1.06 1.07dedupblackscholescannealscpencfsGnuPGnormalized runtimeprotected application71.82158.27154.3336.4139.0019.94834Figure 9: Victim VCPU preemptions per ms (expo-
+nential moving average) induced by co-located ap-
+plication in lab.
+
+Figure 10: Performance overhead (averaged over
+ﬁve runs) when under prime-probe attacks on L1
+instruction caches, w/ and w/o D¨uppel.
+
+dard. We evaluated the time for it to decrypt a 1GB ﬁle en-
+crypted using ElGamal encryption, with D¨uppel speciﬁed to
+protect libgcrypt.so. encfs is an encrypted ﬁlesystem in
+userspace. By encrypting a 1GB ﬁle, we evaluated the run-
+time of its ﬁle-encryption procedure with D¨uppel protecting
+its libcrypto.so library. scp is a network data transfer
+protocol built on top of secure shell (ssh). We transferred a
+1GB ﬁle using scp to evaluate the latency overhead due to
+D¨uppel, again conﬁgured to protect libcrypto.so. All ex-
+periments above were run 10 times (except for dedup which
+was run 30 times due to large variance) on a 2-VCPU server
+in the AWS cloud. The average runtime degradations are
+shown in Fig. 8. As can be seen there, D¨uppel induced less
+than 7% performance overhead in all cases.
+
+7.2.3 Sentinel/Battle Mode Switching
+As described in Sec. 5.1 and Sec. 6, a switch from sentinel
+mode to battle mode occurs whenever the moving average of
+the number of VCPU preemptions per millisecond exceeds
+an empirically determined, ﬁxed threshold of 10 in our pro-
+totype. We developed a set of experiments to examine if
+this threshold will trigger spurious mode switches when co-
+located with regular, benign applications. In particular, we
+employed techniques similar to that described in Sec. 5.2.2
+to detect VCPU preemptions.
+Instead of trying to detect
+a VCPU preemption during each timer interrupt, we tested
+VCPU preemptions in a loop so that every preemption was
+captured. We ﬁrst ran experiments in our local testbed in
+which an application running on another VM (with only one
+VCPU) was pinned to share a core with the VM in which
+we counted preemptions. As such, the number of VCPU
+preemptions caused by the benchmark application on the
+shared CPU core was counted. Fig. 9 illustrates the boxplot
+of the number of VCPU preemptions per millisecond (ex-
+ponential moving average), where each box shows the ﬁrst,
+second and third quartiles, each whisker extends to cover
+points within 1.5× the interquartile range, and outliers are
+marked with plus signs (“+”). As shown, these benchmark
+applications rarely caused the exponential moving average of
+VCPU preemptions to exceed the threshold of 10; e.g., the
+apache2 web server induced a false alarm rate of 3% and
+all other benchmarks induced no false alarms. It is worth
+noting that in this test the apache2 web server had been
+saturated already.
+
+We also ran experiments in the Amazon EC2 cloud, specif-
+ically on four distinct instance types (“m1 medium”, “m1
+large”, “m1 xlarge” and “c1 large”) in each of three diﬀerent
+availability zones in the US East region (“us-east-1a”, “us-
+east-1c” and “us-east-1d”). The experiments were conducted
+from 8:00am Aug 10, 2013 to 8:00am Aug 11, 2013. Since
+we had no knowledge of the applications co-located with our
+VMs in the cloud, we assumed that the co-resident VMs and
+their applications were “benign” in terms of side channels.
+In these tests, the maximum false alarm rate witnessed on
+any of these machines was 8.22 × 10−6.
+7.2.4 Performance Overhead When Being Attacked
+Cache-based side-channel attacks, especially on the L1
+cache, are essentially also performance degradation attacks.
+Moreover, D¨uppel will further degrade the whole system’s
+performance when being attacked. In Fig. 10 we show the
+results of our lab evaluation of the runtime overhead on
+blackscholes, canneal and dedup benchmarks under side-
+channel attacks on the L1 instruction caches, with and with-
+out D¨uppel. The victim was pinned to run only on the core
+being attacked for these tests. As can be seen in the ﬁgure,
+the attacker alone degraded the victim’s performance by up
+to two orders of magnitude, and D¨uppel only compounded
+that cost. Suﬀering such a denial-of-service may be prefer-
+able to succumbing to side-channel attacks. Moreover, since
+VCPUs are usually not pinned in real clouds, the duration
+of such a denial-of-service can be expected to be short.
+
+8. DISCUSSION
+8.1 Extensions of Düppel
+Extension to other cache side channels. In principle,
+D¨uppel can defend against side-channel attacks on other
+types of time-shared caches, as well. For instance, the BTB
+and TLB can be cleansed together with L1 caches. However,
+BTB attacks were only demonstrated in non-virtualized sys-
+tems, while cross-VM attacks on TLBs are unlikely because
+TLBs are ﬂushed on context switch.
+
+Extension to other clouds. D¨uppel can be implemented
+in the guest OS for cloud platforms other than Amazon, as
+well, as long as the virtualization substrate supports paravir-
+tualized Xen guests and customized OS kernels. We expect
+D¨uppel to also work on Rackspace and GoGrid, for example.
+
+apache2dedupblackscholescannealGnuPGencfsscpco-located application0246810121416preemptions per ms (EMA) 1 2 4 8 16 32 64 128 50000 60000 70000 80000 90000slowdown factor attacker’s IPI intervals (cycles)blackscholes w/oblackscholes w/dedup w/odedup w/canneal w/ocanneal w/835Extension to kernel routines. D¨uppel can be extended
+to protect sensitive operations in the guest OS kernel, as
+well. The diﬃculty, however, is that the Linux kernel is
+monolithic, and so the code and data memory sections of
+kernel routines are not cleanly separated from the rest of the
+kernel. D¨uppel will have to look for all memory pages that
+contain kernel routines and mark them as non-executable.
+8.2 Limitations
+SMT-enabled cloud platforms. When SMT is enabled
+on processors, some time-shared caches can become simul-
+taneously shared caches (e.g., L1 caches). D¨uppel may not
+be eﬀective in this case. However, from our previous expe-
+rience [38], as well as prior documented evidence [27, 25],
+SMT-enabled CPUs are more vulnerable to side-channel at-
+tacks. Moreover, as clouds often charge by CPU comput-
+ing units, with SMT-enabled cores the estimated computing
+units per VM would become unreliable if more than one
+VCPU shared the same CPU core at the same time. There-
+fore, we anticipate that cloud providers will not enable SMT
+in production clouds for both security and accounting con-
+siderations.
+
+The simultaneously shared caches. A simultaneously
+shared cache, e.g., the last level cache, might also be tar-
+geted by side-channel attacks. Again, D¨uppel does not ad-
+dress this possibility. Compared with time-shared caches,
+probing simultaneously shared caches can be done with-
+out VCPU preemption and with frequencies limited only
+by the cache and memory access latencies and the sizes
+of the caches utilized. Although ﬁne-grained cache obser-
+vations are possible in such situations, the challenges that
+attackers face to extract sensitive information may be pro-
+hibitive. The ﬁrst challenge stems from the fact that most
+LLCs are physically indexed. As such, attackers must have
+prior knowledge of the physical addresses of the memory
+regions of the victim application [23], which is usually allo-
+cated dynamically and may vary each time it is run. Second,
+exploiting last level caches when the victim and attacker
+run on diﬀerent cores can be sensitive to cache coherence
+properties. For example, probing on an LLC in an exclu-
+sive caching hierarchy (as compared with inclusive caches)
+will not invalidate contents in the lower-level caches of an-
+other core. As such, the victim’s activity may be hidden in
+lower level caches and never leaked to the last level cache
+at all. Moreover, to our knowledge, last level caches in the
+processors used in cloud platforms usually serve more than
+two cores; in this case, side-channel observations are subject
+to more background noise from cores that are not running
+the victim application. We believe for these reasons, side-
+channel attacks in simultaneously shared caches in virtual-
+ized SMP environments have been limited so far to extract-
+ing only coarse information [29] or have needed to leverage
+additional hypervisor features (e.g., sharing memory pages
+between the victim and attacker VMs [36]).
+
+9. CONCLUSION
+
+In this paper, we presented D¨uppel, a system to mit-
+igate cache side channels in public clouds by retroﬁtting
+commodity operating systems. D¨uppel cleanses time-shared
+caches (e.g., per-core L1 and L2 caches) to confound side
+channels through them. We detailed our implementation of
+D¨uppel in Linux for paravirtualized Xen, demonstrated the
+
+security eﬀectiveness of our prototype in tests on lab ma-
+chines, and evaluated the performance impact of our proto-
+type on a public cloud. To our knowledge, D¨uppel is the ﬁrst
+general and eﬃcient technique to enable tenants to defend
+themselves from cache-based side-channel attacks in public
+clouds, without help from the hypervisor or cloud operator.
+9.1 Acknowledgements
+
+We thank Dr. Weidong Cui and the anonymous review-
+ers for suggestions that led to improvements to this paper.
+This work was supported in part by NSF grants 0910483
+and 1330599, the Science of Security Lablet at North Car-
+olina State University, a gift from VMWare and Google PhD
+Fellowship to Yinqian Zhang.
+
+10. REFERENCES
+[1] O. Acii¸cmez. Yet another microarchitectural attack:
+Exploiting I-cache. In Proceedings of the 2007 ACM
+Workshop on Computer Security Architecture, pages
+11–18, 2007.
+
+[2] O. Acii¸cmez, B. B. Brumley, and P. Grabher. New
+
+results on instruction cache attacks. In Proceedings of
+the 12th International Conference on Cryptographic
+Hardware and Embedded Systems, pages 110–124,
+2010.
+
+[3] O. Acii¸cmez, S. Gueron, and J.-P. Seifert. New branch
+
+prediction vulnerabilities in openSSL and necessary
+software countermeasures. In Proceedings of the 11th
+IMA International Conference on Cryptography and
+Coding, pages 185–203, 2007.
+
+[4] O. Acii¸cmez, C. K. Ko¸c, and J.-P. Seifert. On the
+
+power of simple branch prediction analysis. In
+Proceedings of the 2nd ACM Symposium on
+Information, Computer and Communications Security,
+pages 312–320, 2007.
+
+[5] O. Aciicmez and J.-P. Seifert. Cheap hardware
+
+parallelism implies cheap security. In Proceedings of
+the Workshop on Fault Diagnosis and Tolerance in
+Cryptography, pages 80–91, 2007.
+
+[6] A. Aviram, S. Hu, B. Ford, and R. Gummadi.
+
+Determinating timing channels in compute clouds. In
+Proceedings of the 2010 ACM Cloud Computing
+Security Workshop, pages 103–108, 2010.
+
+[7] C. Bienia, S. Kumar, J. P. Singh, and K. Li. The
+PARSEC benchmark suite: Characterization and
+architectural implications. In Proceedings of the 17th
+International Conference on Parallel Architectures and
+Compilation Techniques, Oct. 2008.
+
+[8] C. Bienia and K. Li. PARSEC 2.0: A new benchmark
+
+suite for chip-multiprocessors. In Proceedings of the
+5th Workshop on Modeling, Benchmarking and
+Simulation, June 2009.
+
+[9] D. Bovet and M. Cesati. Understanding The Linux
+
+Kernel. Oreilly & Associates, 2005.
+
+[10] D. Chisnall. The Deﬁnitive Guide to the Xen
+
+Hypervisor (Prentice Hall Open Source Software
+Development Series). Prentice Hall PTR, Nov. 2007.
+
+[11] B. Coppens, I. Verbauwhede, K. D. Bosschere, and
+B. D. Sutter. Practical mitigations for timing-based
+side-channel attacks on modern x86 processors. In
+Proceedings of the 30th IEEE Symposium on Security
+and Privacy, pages 45–60, 2009.
+
+836[12] L. Domnitser, A. Jaleel, J. Loew, N. Abu-Ghazaleh,
+
+and D. Ponomarev. Non-monopolizable caches:
+Low-complexity mitigation of cache side channel
+attacks. ACM Transactions on Architecture and Code
+Optimization, 8(4), Jan. 2012.
+
+Cryptology – CT-RSA 2006, volume 3860 of Lecture
+Notes in Computer Science, pages 1–20, 2006.
+
+[26] D. Page. Partitioned cache architecture as a
+
+side-channel defense mechanism.
+http://eprint.iacr.org/2005/280, 2005.
+
+[13] D. Gullasch, E. Bangerter, and S. Krenn. Cache games
+
+[27] C. Percival. Cache missing for fun and proﬁt. In
+
+– bringing access-based cache attacks on AES to
+practice. In Proceedings of the 2011 IEEE Symposium
+on Security and Privacy, pages 490–505, 2011.
+
+[14] R. Hund, C. Willems, and T. Holz. Practical timing
+side channel attacks against kernel space ASLR. In
+Proceedings of the 2013 IEEE Symposium on Security
+and Privacy, May 2013.
+
+[15] J. S. Hunter. The exponentially weighted moving
+
+average. Journal of Quality Technology, 18:203–210,
+1986.
+
+[16] G. Keramidas, A. Antonopoulos, D. Serpanos, and
+S. Kaxiras. Non deterministic caches: a simple and
+eﬀective defense against side channel attacks. Design
+Automation for Embedded Systems, 12:221–230, 2008.
+
+[17] T. Kim, M. Peinado, and G. Mainar-Ruiz.
+
+STEALTHMEM: System-level protection against
+cache-based side channel attacks in the cloud. In
+Proceedings of the 21st USENIX Conference on
+Security Symposium, 2012.
+
+Proceedings of BSDCon 2005, 2005.
+
+[28] H. Raj, R. Nathuji, A. Singh, and P. England.
+
+Resource management for isolation enhanced cloud
+services. In Proceedings of the 2009 ACM Cloud
+Computing Security Workshop, pages 77–84, 2009.
+
+[29] T. Ristenpart, E. Tromer, H. Shacham, and S. Savage.
+
+Hey, you, get oﬀ of my cloud: Exploring information
+leakage in third-party compute clouds. In Proceedings
+of the 16th ACM Conference on Computer and
+Communications Security, pages 199–212, 2009.
+[30] J. Shi, X. Song, H. Chen, and B. Zang. Limiting
+
+cache-based side-channel in multi-tenant cloud using
+dynamic page coloring. In Proceedings of the 2011
+IEEE/IFIP 41st International Conference on
+Dependable Systems and Networks Workshops, pages
+194–199, 2011.
+
+[31] E. Tromer, D. A. Osvik, and A. Shamir. Eﬃcient
+
+cache attacks on AES, and countermeasures. Journal
+of Cryptology, 23(2):37–71, Jan. 2010.
+
+[18] R. K¨onighofer. A fast and cache-timing resistant
+
+[32] B. C. Vattikonda, S. Das, and H. Shacham.
+
+implementation of the AES. In Topics in Cryptology –
+CT-RSA 2008, volume 4964 of Lecture Notes in
+Computer Science, pages 187–202, 2008.
+
+[19] P. Li, D. Gao, and M. K. Reiter. Mitigating
+
+access-driven timing channels in clouds using
+StopWatch. In Proceedings of the 43rd IEEE/IFIP
+International Conference on Dependable Systems and
+Networks, June 2013.
+
+[20] R. Martin, J. Demme, and S. Sethumadhavan.
+
+TimeWarp: Rethinking timekeeping and performance
+monitoring mechanisms to mitigate side-channel
+attacks. In Proceedings of the 39th International
+Symposium on Computer Architecture, pages 118–129,
+2012.
+
+[21] D. Molnar, M. Piotrowski, D. Schultz, and D. Wagner.
+
+The program counter security model: Automatic
+detection and removal of control-ﬂow side channel
+attacks. In Proceedings of the 8th International
+Conference on Information Security and Cryptology,
+pages 156–168, 2006.
+
+[22] D. Mosberger and T. Jin. httperf – a tool for
+
+measuring web server performance. ACM
+SIGMETRICS Performance Evaluation Review,
+26(3):31–37, Dec. 1998.
+
+[23] K. Mowery, S. Keelveedhi, and H. Shacham. Are AES
+x86 cache timing attacks still feasible? In Proceedings
+of the 2012 ACM Cloud Computing Security
+Workshop, CCSW ’12, pages 19–24, New York, NY,
+USA, 2012. ACM.
+
+[24] M. Neve and J.-P. Seifert. Advances on access-driven
+
+cache attacks on AES. In Proceedings of the 13th
+International Conference on Selected Areas in
+Cryptography, pages 147–162, 2007.
+
+[25] D. A. Osvik, A. Shamir, and E. Tromer. Cache attacks
+
+and countermeasures: the case of AES. In Topics in
+
+Eliminating ﬁne grained timers in Xen. In Proceedings
+of the 3rd ACM Cloud Computing Security Workshop,
+pages 41–46, 2011.
+
+[33] Z. Wang and R. B. Lee. Covert and side channels due
+
+to processor architecture. In Proceedings of the 22nd
+Computer Security Applications Conference, pages
+473–482, 2006.
+
+[34] Z. Wang and R. B. Lee. New cache designs for
+
+thwarting software cache-based side channel attacks.
+In Proceedings of the 34th International Symposium on
+Computer Architecture, pages 494–505, 2007.
+
+[35] Z. Wang and R. B. Lee. A novel cache architecture
+
+with enhanced performance and security. In
+Proceedings of the 41st IEEE/ACM International
+Symposium on Microarchitecture, pages 83–93, 2008.
+
+[36] Y. Yarom and K. Falkner. Flush+Reload: a high
+
+resolution, low noise, L3 cache side-channel attack.
+http://eprint.iacr.org/2013/448, 2013.
+
+[37] Y. Zhang, A. Juels, A. Oprea, and M. K. Reiter.
+
+HomeAlone: Co-residency detection in the cloud via
+side-channel analysis. In Proceedings of the 2011 IEEE
+Symposium on Security and Privacy, pages 313–328,
+May 2011.
+
+[38] Y. Zhang, A. Juels, M. K. Reiter, and T. Ristenpart.
+
+Cross-VM side channels and their use to extract
+private keys. In Proceedings of the 2012 ACM
+Conference on Computer and Communications
+Security, pages 305–316, 2012.
+
+837

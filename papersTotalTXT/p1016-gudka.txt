@@ -1,0 +1,2142 @@
+Clean Application Compartmentalization with SOAAP
+
+Khilan Gudka
+
+University of Cambridge
+
+Cambridge, UK
+
+khilan.gudka@cl.cam.ac.uk
+
+David Chisnall
+
+University of Cambridge
+
+Cambridge, UK
+
+david.chisnall@cl.cam.ac.uk
+
+Ilias Marinos
+
+University of Cambridge
+
+Cambridge, UK
+
+ilias.marinos@cl.cam.ac.uk
+
+Robert N.M. Watson
+University of Cambridge
+
+Cambridge, UK
+
+robert.watson@cl.cam.ac.uk
+
+Brooks Davis
+SRI International
+
+Menlo Park, CA, USA
+
+brooks.davis@sri.com
+Peter G. Neumann
+
+SRI International
+
+Menlo Park, CA, USA
+
+neumann@csl.sri.com
+
+Jonathan Anderson
+
+Memorial University
+
+St. Johns, NL, Canada
+
+jonathan.anderson@mun.ca
+
+Ben Laurie
+Google UK Ltd.
+
+London, UK
+
+benl@google.com
+Alex Richardson
+University of Cambridge
+
+Cambridge, UK
+
+alr48@cam.ac.uk
+
+ABSTRACT
+Application compartmentalization, a vulnerability mitiga-
+tion technique employed in programs such as OpenSSH and
+the Chromium web browser, decomposes software into iso-
+lated components to limit privileges leaked or otherwise
+available to attackers. However, compartmentalizing appli-
+cations – and maintaining that compartmentalization – is
+hindered by ad hoc methodologies and signiﬁcantly increased
+programming eﬀort.
+In practice, programmers stumble
+through (rather than overtly reason about) compartmental-
+ization spaces of possible decompositions, unknowingly trad-
+ing oﬀ correctness, security, complexity, and performance.
+We present a new conceptual framework embodied in an
+LLVM-based tool: the Security-Oriented Analysis of Appli-
+cation Programs (SOAAP) that allows programmers to rea-
+son about compartmentalization using source-code annota-
+tions (compartmentalization hypotheses). We demonstrate
+considerable beneﬁt when creating new compartmentaliza-
+tions for complex applications, and analyze existing com-
+partmentalized applications to discover design faults and
+maintenance issues arising from application evolution.
+
+Categories and Subject Descriptors
+D.4.6 [Operating Systems]: Security and Protection
+
+Keywords
+Security, Compartmentalization, Vulnerability Mitigation
+
+1.
+
+INTRODUCTION
+
+Application compartmentalization decomposes software
+into isolated but collaborating components to mitigate ex-
+
+Permission to make digital or hard copies of all or part of this work for personal or
+classroom use is granted without fee provided that copies are not made or distributed
+for proﬁt or commercial advantage and that copies bear this notice and the full citation
+on the ﬁrst page. Copyrights for components of this work owned by others than the
+author(s) must be honored. Abstracting with credit is permitted. To copy otherwise, or
+republish, to post on servers or to redistribute to lists, requires prior speciﬁc permission
+and/or a fee. Request permissions from Permissions@acm.org.
+CCS’15 October 12–16, 2015, Denver, Colorado, USA.
+Copyright is held by the owner/author(s). Publication rights licensed to ACM.
+ACM 978-1-4503-3832-5/15/10$15.00
+DOI: http://dx.doi.org/10.1145/2810103.2813611.
+
+ploitation of vulnerabilities.
+It seeks to employ the prin-
+ciple of least privilege by granting each compartment only
+the rights that it requires to operate [38].
+It is used in
+software ranging from OpenSSH [36] to the Chromium web
+browser [37] to limit rights available to an attacker follow-
+ing a successful exploit. Recently disclosed vulnerabilities
+such as Heartbleed [30], Shellshock [32], and a symlink at-
+tack vulnerability in Wget [31], illustrate the importance of
+protecting software not just from known exploit techniques
+(e.g., stack canaries mitigating buﬀer overﬂows), but also
+from unknown future classes of vulnerabilities.
+Application compartmentalization proves
+
+surprisingly
+subtle: contrary to the implied suggestion of simplistic de-
+scriptions (“Application X has been privilege separated”),
+there are many possible compartmentalizations of most pro-
+grams within a compartmentalization space that reﬂects dif-
+ferent tradeoﬀs among correctness, security, complexity, and
+performance. Selecting a suitable point in this space is
+challenging, as implementing compartmentalization requires
+considerable eﬀort and can disrupt code structure. This
+choice is crucial, as it can be diﬃcult to change strategy
+after implementation: the non-trivial code changes made to
+application structure are often speciﬁc to the selected com-
+partmentalization. Design choices and tradeoﬀs are infre-
+quently revisited – even as understanding of program secu-
+rity grows due to discovered vulnerabilities, or as program
+functionality evolves beyond its compartmentalization.
+
+Reasoning about compartmentalization tradeoﬀs is diﬃ-
+cult for many reasons. Information about past vulnerabil-
+ities – often a good predictor of future vulnerabilities – is
+not easily accessible. Call graphs of compartmentalized ap-
+plications are extremely complex, and simple control-ﬂow
+analysis cannot follow manually encoded cross-domain ac-
+tions – typically via Inter-Process Communication (IPC) –
+found in real-world applications. Even where call graphs
+can be extracted, control ﬂow is only a starting point:
+in
+the compartmentalization adversary model, naively written
+code may be vulnerable, but it is exposure to malicious data
+that causes exploits – requiring reasoning about a combi-
+nation of vulnerabilities, information ﬂow from dangerous
+sources, and uncompartmentalized code. Application fail-
+ures due to compartmentalization are frequently mysterious:
+the libraries they link against are often designed without the
+
+1016expectation of sandboxing, and failures may not be detected
+by testing. Finally, performance characteristics are critical,
+with compartmentalization boundaries often selected that
+are not based on ideal security boundaries, but rather on ac-
+ceptable performance (e.g., in Capsicum where gzip rather
+than zlib is sandboxed [42]). Even then, performance im-
+pacts are diﬃcult to predict.
+
+Application developers would ideally be able to explore
+how new or changing compartmentalization would aﬀect fac-
+tors such as security and performance without paying the full
+cost of implementation, letting them more easily identify a
+preferred spot in the compartmentalization space. For ex-
+ample, partitioning decompression from decryption can pre-
+vent decompression-related vulnerabilities from leaking key-
+ing material – but at great costs to both code complexity
+and run-time performance. The overhead of this compart-
+mentalization may be too high for production use, requiring
+another approach, such as having per-client compartments.
+This exploration is comparable to the use of performance-
+proﬁling tools to identify the hot spots in an application
+that would beneﬁt most from optimization. Similarly, se-
+curity proﬁling tools could enable the developer to deter-
+mine whether a particular compartmentalization was “worth
+it”, namely that it would give suﬃcient security gains while
+not exceeding tolerable performance overheads. Such an ap-
+proach would also allow continuous automatic reevaluation
+as application source code evolves, ensuring that, for exam-
+ple, refactorings do not accidentally move vulnerable code
+to a more privileged context. To this end, this paper:
+
+• Describes a conceptual framework for compartmental-
+ization grounded in isolation and controlled communi-
+cation. Possible program compartmentalizations, each
+with diﬀering design tradeoﬀs in terms of complexity,
+performance, security, and functionality, exist within
+compartmentalization spaces. We also describe a set of
+compartmentalization design patterns reﬂecting com-
+mon approaches to compartmentalization.
+
+• Presents the Security-Oriented Analysis of Application
+Programs (SOAAP), an LLVM-based tool for evaluat-
+ing proposed (or extant) compartmentalizations based
+on annotated compartmentalization hypotheses, which
+document programmer expectations and designs for
+compartmentalization and security. Source-code anno-
+tations represent sandboxing strategies, cross-domain
+communication, past vulnerabilities, sensitive or risky
+data, and security goals. SOAAP scales to multi-
+million-LoC applications, providing eﬃcient control-
+ﬂow and information-ﬂow analysis of whole programs.
+
+• Demonstrates
+
+the
+
+eﬀectiveness of our approach
+through analysis of existing real-world compartmen-
+talizations – including OpenSSH and the Chromium
+web browser – and discover bugs that were introduced
+by developing these without the aid of a SOAAP-like
+tool. We also show the use of SOAAP in adding new
+compartmentalization to two existing applications:
+FreeBSD’s fetch and the Okular document viewer
+from KDE. SOAAP has identiﬁed various weaknesses,
+including untrustworthy code unexpectedly executed
+outside of sandboxes, and provides a new methodol-
+ogy for evaluating software compartmentalization.
+
+2. CONCEPTUAL FRAMEWORK
+
+Application compartmentalization rests on the principle of
+least privilege: compromised components yield fewer rights
+to attackers, and oﬀer fewer opportunities to compromise the
+rest of the system. Karger ﬁrst proposed using access con-
+trol for vulnerability mitigation while working on capability
+systems [19], and took as his threat model the trojan horse:
+subverted software working on behalf of the adversary. Con-
+temporary compartmentalization for vulnerability mitiga-
+tion, sometimes referred to as privilege separation, saw its
+foundations in work by Provos et al. [36] and Kilpatrick [20],
+and has been applied to complex, security-relevant programs
+such as OpenSSH and the Chromium web browser, both of
+which hold substantial eﬀective privilege and perform com-
+plex processing of untrustworthy, network-originated data.
+Compartmentalization adopts a de facto, and quite strong,
+threat model in which attackers gain total control of com-
+promised compartments as a result of poorly crafted C code
+(or other program weaknesses) being being exposed to ma-
+licious input. For example, buﬀer-overﬂow attacks triggered
+by network input might allow malicious code to be executed,
+or program control ﬂow to be fully subverted by the at-
+tacker. We generalize this model, adding software supply-
+chain vulnerabilities involving explicitly trojaned software
+without the need for malicious input – e.g., back doors be-
+ing inserted following compromise of a software vendor’s
+source-code repository. Weaker attacks, which fall short of
+arbitrary code execution, are also important: the OpenSSL
+Heartbleed vulnerability allows read access to victim mem-
+ory, which might reveal keys allowing further access, but
+does not immediately allow arbitrary manipulation.
+
+Compartmentalization rests on three underpinnings: a
+strong Trusted Computing Base (TCB) able to protect its
+own integrity [3]; compartment isolation (implemented by
+the TCB), which provides strong prevention of interference
+between isolated program instances [11]; and controlled com-
+munication, which allows safe communication between com-
+partments – subject to suitable policies. Applications may,
+themselves, construct application-speciﬁc TCBs on top of
+the compartmentalization substrate – for example, compo-
+nents that run with ambient authority, or that store sensitive
+keying material, etc. – but for our purposes, TCB refers to
+mechanisms underlying compartmentalization itself.
+2.1 Isolation
+
+Mechanisms for isolation vary, but will often be an
+operating-system (OS) process model based on a hardware
+Memory Management Unit (MMU). The conventional OS
+process model limits the scope of accidental damage from
+buggy programs, and also provides modest (often discre-
+tionary) isolation between users to limit the damage mali-
+cious user can cause to other users. To construct stronger
+isolation, other access control mechanisms are used to nar-
+row down access to system resources. For example, across
+various systems, OpenSSH uses mechanisms such as chroot,
+Linux seccomp, SELinux [25], Mac OS X [41], and Cap-
+sicum [42] to restrict the OS facilities available to its com-
+partments. The literature sometimes refers to a constrained
+process as a sandbox, but we prefer the term compartment as
+‘sandbox’ is often taken to refer to the near total isolation of
+a whole application (or component) rather than being part
+of a more nuanced decomposition in which processes may be
+delegated more subsets of (perhaps quite powerful) rights.
+
+1017Pattern
+
+Sandboxing
+
+Assured pipelines
+
+Horizontal compartmentalization
+
+Vertical compartmentalization
+
+Temporal compartmentalization
+
+Description
+
+Compartments handling untrustworthy data or executing untrustworthy code are
+delegated minimal rights – e.g., for web-page rendering [19, 13, 28, 40, 37].
+A series of linked compartments perform staged processing of data while limiting
+the access of (and exposure of) compartments in the chain – e.g., when processing
+protocol stages between two ﬁrewall interfaces [8].
+Compartments contain multiple instances of the same code operating on diﬀerent
+data instances – e.g., one sandbox for each image processed [43].
+Compartments encapsulate diﬀerent layers when performing a task – e.g., isolating
+web-page download from rendering [43].
+Reuse of compartments over time is avoided to prevent loss of conﬁdentiality for
+prior tasks, and loss of integrity or availability for later tasks [43].
+
+Work-bounded compartmentalization Compartments are permitted to perform bounded work, limiting potential denial-
+
+Library compartmentalization
+
+of-service impact (e.g., following a control-ﬂow exploit) [43].
+Compartmentalization occurs entirely ‘behind’ an existing API, allowing a library
+to isolate its processing while leaving programming and binary interfaces unper-
+turbed – e.g., placing compartmentalization in zlib rather than in gzip [42, 43].
+
+Table 1: Common compartmentalization design patterns found across a broad range of compartmentalized systems.
+
+Not all compartmentalization substrates are created
+equal. seccomp and Capsicum are both available to unprivi-
+leged processes, and intended to support extremely limited
+access for isolated processes.
+In contrast, chroot depends
+on OS privilege to use (requiring, for example, Chromium
+to have a setuid helper), but constrains only unprivileged
+processes. Further, chroot limits access only for the ﬁlesys-
+tem namespace (unless extended via a mechanism such as
+FreeBSD jails [18]), leaving (on many systems) interfaces
+for several forms of IPC, and also administrative interfaces,
+available to notionally isolated processes. Diﬀering delega-
+tion mechanisms used to assign rights to compartments can
+also prove challenging for programmers: whereas Capsicum
+allows system calls to be reﬁned on a per-ﬁle-descriptor ba-
+sis, but a ﬁxed set of permitted system calls, seccomp pro-
+vides a conﬁgurable ﬁlter on system calls, but not the abil-
+ity to reﬁne rights on particular ﬁle descriptors. These and
+other diﬀerences (e.g., with respect to SELinux and Mac
+OS X) present a substantial challenge to the authors of
+portable applications, who must implement compartmental-
+ization over diﬀerent substrates, and hence may experience
+variable expressiveness and mitigation properties.
+
+2.2 Controlled communication
+
+Controlled communication allows compartments to com-
+municate both with the OS and one another. This commu-
+nication takes the form of a call gate: a call between com-
+partments that provides mediated access to a well-deﬁned
+set of entry points in a piece of code running with diﬀerent
+privileges. This allows subsets of global system rights to be
+delegated to compartments, providing access to data or stor-
+age required for computation (e.g., a web-browser cache), or
+the ability to connect sockets to remote systems. Also im-
+portant are intra-application rights; for example, diﬀerent
+compartments within applications might have diﬀerent ex-
+posure to malicious data, with those protecting access to
+critical information (e.g., user payment details or private
+keys) providing only narrowly constrained interfaces to com-
+partments at greater risk (e.g., those rendering web pages).
+A key concern in compartmentalized systems is the ex-
+plicit or implied delegation of data rights, which may be con-
+sidered in three classes: OS rights that represent access to re-
+
+sources outside the compartmentalized application (e.g., an
+open ﬁle descriptor), rights that represent the ability to com-
+municate within the compartmentalized application (e.g., a
+local domain socket allowing message passing with another
+compartment), and data itself (which may ﬂow via either
+of these mechanisms). The initial and ongoing conﬁgura-
+tions of these rights and data are critical to reasoning about
+the security state of an application (and to the protective
+properties of compartmentalization) as any communication
+right not delegated to a compartment is an attack surface
+avoided, in terms of potential exploits to gain privilege, and
+also opportunities for denials of service. Data itself presents
+a number of problems from the perspective of conﬁdentiality
+and integrity. When a compartment has been compromised,
+it may have current access to conﬁdential data, either in its
+memory space or via rights it holds, as well as residual data
+from earlier execution. Likewise, a compromised compart-
+ment aﬀects the integrity of future computations performed
+in the compartment, which in turn impacts the conﬁdential-
+ity and integrity of data that may later be received.
+2.3 Compartmentalization patterns
+
+Compartmentalization is a general technique that conﬁg-
+ures a network of communication and delegated rights be-
+tween “cuts” in an application. Many compartmentalized
+applications turn out to implement similar portable patterns.
+The sandboxing pattern, for example, delegates as few rights
+as possible to compartments processing high-risk data – e.g.,
+a web-browser renderer that is able to send data to the dis-
+play and receive limited input. By delegating only limited
+rights to the sandbox – e.g., a connected socket and output
+ﬁle rather than global access to the ﬁlesystem – vulnerabil-
+ities in the sandboxed code, such as bugs in TLS process-
+ing, can be mitigated. Table 1 illustrates a set of common
+patterns [43]. We expect many further design patterns will
+emerge as compartmentalization sees further deployment.
+2.4 Compartmentalization spaces
+
+Compartmentalization spaces, illustrated in Figure 1, are
+a key concept: applications may be partitioned in many dif-
+ferent ways, requiring compartments to have more or fewer
+rights, and distributing both code of varying risk, as well
+
+1018Figure 1: fetch and libfetch can be compartmentalized along diﬀerent dimensions, oﬀering diﬀerent tradeoﬀs.
+
+as access to data of varying degrees of risk and sensitivity,
+around the compartment graph. The ﬁgure illustrates two
+possible dimensions of further reﬁned compartmentalization
+for FreeBSD’s fetch/libfetch, a command-line HTTP/FTP
+ﬁle retrieval tool and supporting library: data-centered com-
+partmentalization, in which diﬀerent instances of data, pro-
+cessed by the same code, will be isolated from another;
+and code-centered compartmentalization, in which diﬀerent
+code components are isolated from one another. Combined,
+these may be viewed as object-oriented compartmentaliza-
+tion, which provides a more granular decomposition. For
+fetch, data-centered compartmentalization might process
+the contents of diﬀerent sites, or even diﬀerent URLs, in
+their own sandbox, preventing cross-contamination with re-
+spect to conﬁdentiality, integrity, and availability. Code-
+centered compartmentalization also oﬀers beneﬁts: by iso-
+lating diﬀerent phases of TLS, vulnerabilities granting ac-
+cess to a TLS session key need not, for example, provide the
+attacker access to a client-side certiﬁcate.
+
+Diﬀerent points in an application’s compartmentalization
+space oﬀer markedly diﬀerent correctness, complexity, se-
+curity, and performance. Correctness is particularly im-
+pacted by distributed-system problems: data replicated be-
+tween compartments may fall out of sync, leading to bugs.
+Greater compartmentalization often implies greater com-
+plexity, due to the need to select suitable rights to delegate
+to each compartment, but also because compartments may
+not naturally align with an application’s class structure. Se-
+curity is a key concern: vulnerabilities are mitigated only
+if rights assigned to compartments are limited. Predicting
+the location of future vulnerabilities is an art rather than
+a science, but notions of risky code (e.g., string parsing in
+C), and also the history of past vulnerabilities in code, often
+motivate software components in sandboxes. For example,
+it is common to place compression and video CODECs in
+sandboxes. Finally, performance is also critical: selecting
+“unnatural” cuts within applications may lead to substan-
+tial performance overheads resulting from frequent domain
+crossings or the need to copy (rather than delegate a right
+to) data. The latter may be due to mismatches between API
+design and rights delegated between compartments.
+
+The eﬀort required to compartmentalize a program means
+that adopting a particular point in the design space is a sub-
+stantial commitment. Once a point is implemented, some
+
+further points become more accessible – e.g., further sub-
+division of existing compartments, or those that introduce
+greater data-centered granularity – but most will now re-
+quire greater application refactoring.
+3. THE SOAAP ANALYSIS TOOL
+
+functions or a portion of a function.
+
+together with the types of accesses allowed.
+
+Application compartmentalization is a powerful vulner-
+ability mitigation technique, but it can require substantial
+program refactoring and careful reasoning about interactions
+with the underlying isolation and communication substrates.
+To help developers explore the implications of current or
+planned compartmentalization more easily, we have devel-
+oped Security-Oriented Analysis of Application Programs
+(SOAAP), a tool implemented using LLVM [22]. Figure 2
+illustrates the SOAAP workﬂow. SOAAP accepts, as in-
+put, C/++ source code annotated with compartmentaliza-
+tion hypotheses. The annotations may originate with the
+code author or, commonly, a third party retroﬁtting code
+with compartmentalization after vulnerabilities are discov-
+ered. They may include:
+• Code that should run in a sandbox. This may be entire
+• Global state that should be accessible to sandboxes
+• File descriptors that sandboxes can access and what
+• System calls that sandboxes can perform.
+• Call gates available to sandboxes for performing priv-
+• Information-ﬂow restrictions – for example, that cer-
+tain data should not leak out of, or into, a sandbox.
+• Information-ﬂow relaxations for declassiﬁcation and
+explicitly-permitted ﬂows, e.g., transmitting a pass-
+word hash for authentication.
+• Performance overhead goals.
+• Past-vulnerability information.
+SOAAP also takes descriptions of sandboxing platforms
+that capture the protection provided – e.g., which system
+calls are allowed within a sandbox, at what granularity ﬁle
+accesses can be restricted, and whether sandboxes are com-
+pletely isolated from one another or inter-sandbox communi-
+cation might be permitted. These descriptions allow trade-
+oﬀs to be compared across diﬀerent sandboxing technologies.
+
+operations are allowed on them.
+
+ileged operations.
+
+HTTP GETsandbox5. fetchURL-speciﬁc sandboxURL-speciﬁc sandboxTLSsandboxHTTPSsandboxnetworksandboxCode-centered compartmentalizationData-centered compartmentalization1. fetchmain loophttptlsftpURL-speciﬁc sandboxmain loophttptlsftpFTPsandbox2. fetchmain loophttptlsftpHTTPsandbox3. fetchmain loophttptlsFTPsandboxftpTLSsandboxHTTP authsandbox4. fetchmain loophttp authtlsFTPsandboxftphttp getObject-orientedcompartmentalization1019Figure 2: SOAAP engages the developer in an iterative cycle of hypothesis development and testing.
+
+SOAAP uses LLVM’s Clang front end to compile the an-
+notated program into LLVM’s intermediate representation
+(IR). Source ﬁles are compiled to individual IR ﬁles before
+being statically linked together into a single application IR
+ﬁle for analysis. SOAAP assumes a closed world, meaning
+that all dependencies whose behavior should be analyzed
+must be statically linked with the main program’s IR. Most
+of SOAAP’s analysis is static, to check whole-program be-
+havior. We model the structure and behavior of the program
+by building a compartmentalization control- and data-ﬂow
+graph. This captures the distributed nature and diﬀerent se-
+curity domains that would be present in the proposed com-
+partmentalization. SOAAP performs dynamic analysis to
+evaluate performance prior to implementation by simulat-
+ing sandbox management and cross-domain communication
+costs to measure execution overhead. If this overhead ex-
+ceeds annotated performance goals, a warning is given. Un-
+like static analysis, the results of performance simulation will
+typically be sensitive to input parameters; representative re-
+sults require multiple runs with representative workloads.
+
+The SOAAP workﬂow engages the programmer in an it-
+erative dialog as the compartmentalization approach is re-
+ﬁned: programmers may initially annotate sandbox bound-
+aries and then add or remove these and other annotations as
+they learn more about the compartmentalization. This cycle
+is comparable to the regular iteration of a developer correct-
+ing warnings through successive compiler passes. SOAAP
+can also be used in a continuous integration environment
+to validate that changes in program structure and compart-
+mentalization do not introduce regressions over the longer-
+term application life cycle. SOAAP may not identify all
+possible shortcomings in a proposed approach, and it can-
+not make design decisions, but it can help developers express
+compartmentalization choices and understand their impacts.
+3.1 SOAAP workﬂow example
+
+Specifying sandbox boundaries
+
+To demonstrate SOAAP’s workﬂow, we annotate and an-
+alyze a simple program that decrypts and decompresses ﬁles
+(see Listing 1). Passing -l lists only archive contents.
+3.1.1
+Developers begin by annotating code that should run
+within a sandboxed compartment, the kind of sandbox, and
+when it should be created. For our example, both decryp-
+tion and decompression are known to be frequent sources
+of security vulnerabilities. One possible compartmentaliza-
+
+int l_flag = 0; // list file contents
+
+int main ( int argc , char ** argv ) {
+
+l_flag = read_arg ( " l " ) ;
+char * in , out ;
+while (( in = p r o c e s s _ n e x t _ f i l e () ) ) {
+
+out = i n _ t o_ o u t ( in ) ;
+int ifd = open ( in , O_RDONLY ) ;
+int ofd = open ( out , O_WRONLY ) ;
+dec2 ( ifd , ofd ) ;
+
+}
+return 0;
+
+}
+
+void dec2 ( int ifd , int ofd ) {
+
+// decrypt input to tmp file
+char key [256];
+r e a d _ s t d i n ( " Password : " , key ) ;
+// ...
+char * tmp = tmp_file () ;
+int tfd = open ( tmp , O_RDWR ) ;
+// ...
+read ( ifd , buffer , b u f f e r _ s i z e ) ;
+// ...
+if ( l_flag ) {
+
+// list contents
+
+// ...
+} else {
+
+// d e c o m p r e s s tmp to output file
+// ...
+
+}
+
+}
+
+Listing 1: Example program that decrypts and decompresses
+ﬁles. Passing -l allows only listing the archive contents.
+
+tion isolates the dec2() function, which would prevent an
+attacker from gaining access to the global ﬁlesystem names-
+pace. We annotate a persistent sandbox, i.e., a reusable
+global sandbox, with the name dec2:
+
+_ _ s o a a p _ s a n d b o x _ p e r s i s t e n t ( " dec2 " )
+void dec2 ( int ifd , int ofd ) ;
+
+We also annotate that this sandboxed compartment will be
+created at the start of main(), which allows SOAAP to un-
+derstand the implications of sandboxes created via fork().
+The subsequent sections present some of SOAAP’s output.
+
+3.1.2 Finding data dependencies
+An initial run of SOAAP identiﬁes that a global variable
+
+is read by the dec2 sandbox:
+
+* S a nd b o x e d method " dec2 "
+
+Past vulnerability analysisInformation flow analysisSandbox characterizationCall graph analysisAppauthorSecuritydeveloperOS vendorSOAAP toolchainSOAAP outputsSOAAP inputsPerformance analysisstatic dynamicClangannotation processingPerform. simulationLLVMLink-time taint, vuln., callgraph analysisCallgraph analysisApplication and library source codeCompartmentalizationhypotheses as source code annotationsApplicationchangeandhypothesisrefinementrecommendations1020* [ dec2 ] read global variable " l_flag "
+* but has not been granted the right to
++ Line 70 of file dec2 . c
+
+* " open " but it is not allowed to , based
+* on the current s a n d b o x i n g r e s t r i c t i o n s .
++ Line 35 of file dec2 . c
+
+The programmer must determine whether such accesses are
+intended. If not, then the sandbox scope may need to be
+reassessed or code refactored.
+In this case, the access is
+intended, so we inform SOAAP through an annotation:
+
+* Sandbox " dec2 " performs system call
+* " read " but is not allowed to for the
+* given fd arg .
++ Line 45 of file dec2 . c
+
+_ _ s o a a p _ v a r _ r e a d ( " dec2 " )
+int l_flag = 0; // list file contents
+
+Running SOAAP again now identiﬁes a potential data-
+consistency bug that arises because l_flag is initialized to a
+command-line argument after the compartment is created:
+
+* Write to shared variable " l_flag " in
+* method " main " may not be seen by the
+* s a n db o x e s : [ dec2 ]
++ Line 4 of dec2 . c
+
+If the compartment were realized as a UNIX process, a bug
+would result: fork() copies global variables from the parent
+to the child, and modiﬁcations to globals after the fork will
+not be seen in the compartment. The developer must thus
+ensure, when implementing this compartmentalization, that
+the sandbox receives the correct value of l_flag. Otherwise,
+the archive will be decompressed even when the user just
+wants to list the contents! This error is similar in nature to
+that we discovered during the original Capsicum-based com-
+partmentalization of gzip, in which gzip performed faster
+with sandboxing than without. This unlikely result was due
+to the compression level not being propagated to the sand-
+boxed child, leading to lower (hence faster) compression be-
+ing applied [42].
+3.1.3 Finding information leaks
+The dec2 sandbox handles sensitive keying material. An
+important security goal might be to ensure that it cannot
+leak out of the sandbox, which we can express as:
+
+char key [256] _ _ s o a a p _ p r i v a t e ;
+
+SOAAP informs us that our key could leak through several
+extern library functions whose behavior we know nothing
+about.
+If we are certain these functions are safe, we can
+annotate them as such. SOAAP also identiﬁes that reuse of
+the sandbox could leak an earlier key, as the key buﬀer is
+not scrubbed. One solution would be to zero out the buﬀer
+before returning from the sandbox; another might be to use
+an ephemeral sandbox instead. The former prevents against
+accidental leakage, but could be bypassed by an attacker
+able to compromise the sandbox. The latter approach pro-
+vides more security, but at the cost of having to create and
+destroy sandboxes more frequently.
+3.1.4 Finding required privileges
+SOAAP uses platform descriptions to reason about sand-
+box restrictions, allowing the programmer to understand
+what can be executed by each sandbox. For example,
+chroot() sandboxes are allowed to perform any system call,
+whereas seccomp permits only read(), write(), sigreturn()
+and exit(). Capsicum may require explicit capabilities on
+ﬁle descriptors to be able to perform operations on their
+corresponding ﬁles. We tell SOAAP to model Capsicum be-
+havior with our example, and it reports:
+
+* Sandbox " dec2 " performs system call
+
+The ﬁrst warning is speciﬁc to the Capsicum model: open-
+ing the temporary ﬁle will not work in a Capsicum sandbox.
+The second is more general, indicating that read() will fail
+on the ﬁle descriptor passed into the sandbox as an integer,
+because the parent and child process will have diﬀerent ﬁle-
+descriptor tables. We can declare that we will delegate the
+read capability by annotating the input ﬁle descriptor with
+__soaap_fd_permit(read).
+3.1.5 Past vulnerabilities and supply-chain attacks
+The number of mitigated past vulnerabilities is a useful
+measure for how eﬀective a proposed compartmentalization
+might be. Annotating past vulnerabilities is not only worth-
+while documentation but SOAAP can use these annotations
+to inform which are mitigated. SOAAP is able to enumer-
+ate the rights an attacker would gain if another vulnerability
+were to be exploited there. We annotate a ﬁctitious CVE in
+the decryption portion of our example:
+
+// decrypt input to tmp file
+// ...
+_ _ s o a a p _ v u l n _ p t ( " CVE - XXXX - YYYY " )
+
+SOAAP is now able to report on the eﬀects of compartmen-
+talization directly, showing the leaked rights:
+
+*** S a n d b o xe d function " dec2 " [ dec2 ]
+*** has past - v u l n e r a b i l i t y a n n o t a t i o n s for
+*** [ CVE - XXXX - YYYY ]. Another v u l n e r a b i l i t y
+*** here would not grant ambient a u t ho r i t y
+*** to the attacker but would leak the
+*** f o l l o w in g r e s t r i c t e d rights :
++++ Call [ read ] on file d e s c r i p t o r " ifd "
++++ Call [ write ] on file d e s c r i p t o r " ofd "
+...
+
+Relevant vulnerabilities are not limited to just the applica-
+tion being annotated but also its dependencies, as exploiting
+them would also give the attacker control of the application.
+SOAAP allows hypothesizing the occurrence of vulnerabil-
+ities in speciﬁc libraries or a particular vendor’s code (so-
+called supply-chain trojans):
+
+$ soaap -- vulnerable - libs = libc ...
+$ soaap -- vulnerable - vendors = b ad v e n d o r ...
+
+SOAAP will again provide feedback on rights that might be
+leaked by the application. We provide details about this in
+our technical report [14].
+3.2 SOAAP’s analysis
+
+Sandbox-platform descriptions
+
+3.2.1
+An important SOAAP design goal is to aid in the de-
+velopment of portable compartmentalized applications. As
+discussed in Section 2, diﬀerent OSes provide markedly dif-
+ferent isolation primitives with diﬀerent security proper-
+ties that can impact the semantics of compartmentaliza-
+tion. SOAAP’s platform descriptions identify the function-
+ality and protection properties provided by platforms such
+
+1021as Capsicum and seccomp. The descriptions, implemented
+as C++ classes passed to the SOAAP analysis, also include
+performance and communication models.
+
+3.2.2 Data-ﬂow analysis
+SOAAP implements a data-ﬂow framework that can per-
+form both may and must as well as ﬂow sensitive and ﬂow-
+insensitive analysis, depending upon the type of analysis and
+precision required. It uses the control-ﬂow and call graphs
+computed by LLVM. For information ﬂow analyses, such as
+for tracking sensitive data or ﬁle descriptors, SOAAP tracks
+explicit ﬂows along deﬁne-use chains. Analyses are sandbox
+sensitive, meaning that data-ﬂow propagation within one
+sandbox is distinct from that of another, even if they con-
+tain overlapping code. This enables us to model the diﬀerent
+security domains of proposed compartmentalizations.
+
+One of the challenges in analyzing C/C++ programs is
+that function pointers and polymorphism mean that the
+targets of a function call can be unclear. For static anal-
+ysis to be safe, it must approximate all possible behaviors of
+the program, which means knowing which functions will be
+called. One approach is to assume that any plausible func-
+tion could be invoked (i.e., a function pointer could refer
+to any function that has its address taken, or any instance
+method in the case of C++ – both assuming type compat-
+ibility). However, this can be overly conservative, and lead
+to imprecise analysis results.
+
+SOAAP infers function-pointer targets by tracking assign-
+ments, and also allows the programmer to explicitly anno-
+tate callees. For C++, it builds a static class hierarchy
+using static type information obtained from Clang’s AST
+and vtable metadata present in the LLVM IR. SOAAP then
+performs Class Hierarchy Analysis (CHA) [10] to calculate
+the set of potential targets of a virtual method call, i.e., by
+ﬁnding all method deﬁnitions in the class hierarchy rooted
+at the receiver object’s static type.
+
+3.2.3 Performance simulation
+SOAAP instruments an application at relevant points
+based on the hypothesis. For a persistent sandbox, we fork a
+single process when the __soaap_create_persistent_sandbox
+annotation is reached. For ephemeral sandboxes, we fork
+and terminate a process at the start and end of the entry
+point function. There are other models that could be used,
+such as a zygote process, but we leave these for future work.
+SOAAP emulates communication between compartments
+by sending RPC messages (implemented as synchronous
+messages sent via a UNIX pipe). Overhead is measured
+using clock_gettime. The performance simulation is an esti-
+mate: it will necessarily contain errors.
+
+One source of error relates to overhead. SOAAP cur-
+rently models sandbox creation as a constant cost, but true
+compartmentalization costs are non-linear in the number of
+sandboxes as contention triggers TLB and cache misses.
+
+A second source of error is the varying cost of IPC.
+SOAAP simulates IPC cost by sending a simulated payload
+through a real IPC channel and measuring the round-trip
+time. This measures the cost of data transmission, but may
+not accurately capture scheduler interaction. When a pro-
+cess sends a synchronous message to another, an ideal sched-
+uler would immediately switch to the receiving process and
+then switch back on reply. This policy was explicit in the
+Spring [15] microkernel’s Doors mechanism, which was later
+
+ported to Solaris, but is not guaranteed by most UNIX IPC
+mechanisms; latency will increase considerably if other pro-
+cesses are scheduled between IPC send and reply.
+
+The performance emulation in SOAAP is intended as a
+prototyping tool, giving a rough overview of whether a par-
+ticular compartmentalization strategy will incur huge over-
+heads, rather than as a modeling tool to determine exactly
+what the overheads will be on a speciﬁc system.
+
+4. EVALUATION
+
+The purpose of SOAAP is to allow developers to reason
+about (and evaluate) current and potential future compart-
+mentalizations of software. We demonstrate three aspects of
+SOAAP: that a diverse array of practical compartmentaliza-
+tions (and compartmentalization technologies) map into the
+SOAAP model; that a relatively sparse and maintainable
+set of annotations produce immediately useful results when
+a SOAAP analysis is applied; and that SOAAP performs
+and scales suﬃciently well so as to be a practical addition to
+a contemporary software development environment, whether
+as part of live builds or a continuous integration setup. We
+therefore consider a series of practical compartmentalization
+case studies that explore both fresh compartmentalizations
+(of fetch and KDE’s Okular), as well as existing compart-
+mentalizations (of OpenSSH and Chromium).
+
+We ran our benchmarks on a server with a 4-core Intel
+Xeon E5-1620 3.6GHz CPU, 64GB of RAM, and a 500GB
+SSD running FreeBSD/amd64 10.1-RELEASE-p5 [26]. We
+disabled hyper-threading and used four cores (passing -j4
+to make and ninja) when building.
+4.1 Fetch: design-space exploration
+
+FreeBSD’s fetch application is an ideal candidate for
+compartmentalization.
+It performs risky operations such
+as URL/HTTP header parsing and implements TLS via
+OpenSSL. It also runs with full user privileges, often the
+system superuser. Finally, fetch may hold sensitive data,
+such as credentials for ﬁle servers and proxy servers. With
+many potential vulnerabilities and mutually untrusting par-
+ties, fetch encapsulates much of the design-space tradeoﬀ of
+monolithic applications such as mail readers, web browsers,
+and oﬃce suites. We use SOAAP to explore two points in the
+design space space: compartmentalizing URL parsing and
+executing all network code in a single compartment. Using
+SOAAP, we validated our hypotheses and simulated perfor-
+mance, then implemented the actual compartmentalizations
+and compared their behavior with SOAAP’s predictions.
+4.1.1 URL parsing
+URL parsing is a small fraction of fetch’s code, but it
+is a well-known source of vulnerabilities (e.g., CVE-2010-
+1663, CVE-2010-2179 and CVE-2012-0641). This makes it
+an excellent target for incremental, greedy compartmental-
+ization. We expressed this hypothesis by annotating the
+function fetchParseURL() with __soaap_sandbox_persistent
+and the url struct’s password ﬁeld with __soaap_classify.
+
+An initial run of SOAAP warns us about global vari-
+able accesses. Checking and annotating these global vari-
+ables as being accessible to the URL parser, SOAAP sug-
+gests we should propagate the value of the global variable
+fetchLastErrCode back to the privileged parent, as well as
+the value of fetchDebug to the sandbox. SOAAP also warns
+about sharing sensitive state between sandbox invocations:
+
+1022* Variable " u " ( fetch . c :345) contains
+* s e n si t i v e information , but is not
+* erased before leaving the sandbox .
+* Reusing the sandbox could allow
+* another request to access
+
+this data .
+
+This compartmentalization is fairly straightforward, as the
+sandbox does not require any rights to execute. We must
+only ensure that state is propagated between the sandbox
+and privileged parent, and to scrub sensitive data before
+leaving the sandbox. An implementer would also have to add
+cross-domain interactions, including marshalling the URL
+string and unmarshalling the returned struct.
+
+We simulate performance and compare it with actual com-
+
+partmentalized performance in Section 4.1.3.
+4.1.2 Networking
+We also explored the threat model of a malicious server ex-
+ploiting HTTP header parsing or OpenSSL to gain elevated
+privileges. This can be mitigated by executing network code
+in a persistent sandbox. Again, we wish to ensure that sen-
+sitive data cannot leak out of the sandbox.
+
+In addition to data dependencies, SOAAP warns us about
+system calls that are performed within the sandbox but
+which would not be allowed under Capsicum by default:
+
+* Sandbox " net " performs system call
+* " connect " but it is not allowed to based
+* on current s a n d b o x i n g r e s t r i c t i o n s
+
+Capsicum does not allow a sandbox to call connect(), nor
+can it be delegated as a capability right. The programmer
+must proxy such calls to the privileged parent or else recon-
+sider sandbox boundaries.
+If we rerun SOAAP specifying
+chroot as the sandboxing technique, this warning is not pro-
+duced. This reﬂects a tension between security and code
+complexity: a less invasive change also gives less security.
+
+SOAAP also warns of potential private data leaks through
+extern functions. The ﬁrst of these leaks is unintentional and
+the second is intentional:
+
+* S a n db o x e d method " f e t c h P a r s e U R L "
+* e x e cu t i n g in s a n d bo x e s : [ net ] may leak
+* private data through the extern function
+* " fprintf "
+
+* S a n db o x e d method " f e t c h _ w r i t e v "
+* e x e cu t i n g in s a n d bo x e s : [ net ] may leak
+* private data through the extern function
+* " S S L _ w ri t e "
+
+The ﬁrst is an illustration of a common but infrequently-
+considered source of leaks [29]. The second warning can be
+silenced by annotating the intentional ﬂow of data with a
+declassify-data annotation (__soaap_declassify).
+4.1.3 Evaluating performance simulation
+We evaluate SOAAP’s performance simulation by com-
+paring it with actual compartmentalized performance. Fig-
+ure 3 shows a graph with this comparison.
+
+We manually compartmentalized fetch according to our
+hypotheses, using Capsicum as the sandboxing platform.
+We fork a persistent sandbox at the start of main() and use
+UNIX IPC to send data between the privileged parent and
+the sandboxes. For the net sandbox, we proxy the privi-
+leged calls identiﬁed by SOAAP: connect(), fopen(), stat(),
+utimes(), mkstemps(), rename(), symlink() and unlink().
+
+)
+s
+
+m
+
+(
+
+e
+m
+T
+
+i
+
+vanilla
+
+c-net
+
+c-parse
+
+s-net
+
+s-parse
+
+6
+
+4
+
+2
+
+0
+
+16
+
+64
+
+256
+
+1024
+
+2048
+
+File Size (KB)
+
+Figure 3: Overhead of compartmentalization vs. ﬁle size.
+
+We tested our compartmentalization by using the ktrace
+tool to check for benign attempts at violating the sandbox
+policy. To our surprise, we saw violations that were not
+detected by an early version of SOAAP:
+
+CALL open (0 x801c29100 ,0 < O_RDONLY > ,...)
+CAP
+RET
+
+r e s t r i c t e d VFS lookup
+open -1 errno 94 Not p e r m it t e d in
+
+c a p a b i l i t y mode
+
+These violations result from calls to getservbyname(), a func-
+tion that returns a service entry for a given name and pro-
+tocol, and timegm(), a function that converts a time value to
+UTC. The implementation of these functions on FreeBSD
+read the network services ﬁle and UTC time zone ﬁle re-
+spectively on ﬁrst call. This is a subtle failure, as any call
+before sandbox creation to functions that rely on network
+services or the time zone will cause libc to cache copies of
+them, making subsequent calls safe even after sandbox entry.
+Other implementations of libc make timegm() safe to call
+at any time. For example, Solaris libc implements locale
+support via shared libraries, with the default C locale and
+UTC time zone information compiled into libc by default.
+To address this issue, we extended the platform description
+with information about sandbox-safe functions.
+
+In Figure 3, compartmentalized versions have the preﬁx
+c- and SOAAP simulations are preﬁxed with s-. The graph
+shows that SOAAP’s simulations are 0.4–0.6 ms less than
+the actual performance. This could be due to not simulating
+the compartmentalized code in a separate process and thus
+incurring less context-switching overhead. One surprising
+result is that the c-net compartmentalization is faster than
+c-parse when downloading ﬁles of size 2048 KB, despite per-
+forming signiﬁcantly more IPC. Using manual source code
+instrumentation as well as FreeBSD’s dtrace, we have been
+able to determine that this performance anomaly is disk-
+IO–related and not associated with either the sandboxing
+mechanism or the decomposition strategies implemented.
+SOAAP’s simulation, executed on the same system, repli-
+cated this anomaly. This unexpected outcome shows that
+performance emulation, rather than static model-based pre-
+diction, is able to capture non-deterministic performance ef-
+fects caused by hardware or the OS.
+4.2 Okular: complex compartmentalization
+
+The fetch case study demonstrated the SOAAP tool in
+a simple application. We now investigate using SOAAP to
+add compartmentalization to something much larger: Oku-
+lar, the document viewer of the KDE desktop environment.
+Okular is around 80KLOC (plus 4MLOC from external li-
+braries that were also analyzed).
+
+1023within the sandbox. These issues demonstrate that lazy ini-
+tialization is a real anti-pattern when compartmentalizing
+applications as it must be ensured that all the initialization
+code has run before the sandbox is entered.
+
+By moving libpoppler into a sandbox we have not only
+removed code with a history of vulnerabilities from the TCB
+but also reduced the total amount of code that runs at full
+privileges by over 180,000 lines – which is more than the
+whole Okular source tree with 80,000 lines.
+
+We have now submitted our changes, created with the
+beneﬁt of SOAAP, to the upstream Okular project for re-
+view. The changes amount to fewer than 2,500 lines. Of
+these 2,500 lines, 1,800 are adding new classes required
+for proxying the calls to Okular::Generator functions to the
+sandbox running in a separate process. Almost all other
+changes are related to moving classes from .cpp ﬁles to .h
+ﬁles so that the serialization code can access the required
+ﬁelds. The only changes to the existing source were 30 lines
+to enable loading of sandboxed renderers and 100 lines to the
+PDFGenerator class. Figure 4 provides a visualization of the
+implemented compartmentalization. Green indicates code
+within a sandboxed compartment and grey is ambient code.
+Compared to the ad-hoc nature of the OpenSSH privilege
+separation which introduced changes across many ﬁles, the
+use of object oriented interfaces makes it possible to have
+almost all code related to compartmentalization in one lo-
+cation (in this case the proxy class that implements the re-
+quired interface). This makes it much easier to reason about
+the correctness of the compartmentalization than in a large
+C program without a modular design.
+
+4.3 OpenSSH: long-term maintenance
+
+OpenSSH [36] has had privilege separation since 2002,
+with gradual reﬁnements over time, making it an excellent
+case study for long-term compartmentalization maintenance
+using SOAAP. Of particular concern is the risk of silent se-
+curity regression: previously mitigated vulnerabilities might
+become unmitigated, conﬁdentiality goals might no longer
+be met, or performance overhead might become intolerable.
+A recent example [2] is a bug discovered in NetBSD’s pkgsrc
+patch for sshd that mistakenly disabled privilege separation
+on all platforms except Interix. The intention was the op-
+posite but this error was only detected nine years later!
+
+OpenSSH uses a two-stage sandboxing strategy: a com-
+pletely unprivileged process prior to authentication called
+preauth followed by a process running with the rights of the
+authenticated user, called postauth [36]. Table 5a shows
+several releases of OpenSSH, from the latest version (6.8)
+back to the ﬁrst privilege-separated version (3.2.2). For each
+version, we annotated the sandboxing boundaries, past vul-
+nerabilities, conﬁdentiality requirements, cross-domain com-
+munication, assertions of functions that should only run
+privileged and those that should only run sandboxed.
+
+We observed that OpenSSH’s compartmentalization has
+not changed signiﬁcantly over time, supporting our supposi-
+tion that such maintenance is diﬃcult in practice. We also
+discovered functionality that had silently regressed due to
+compartmentalization. For example, by applying SOAAP
+to OpenSSH v3.2.2 we discovered that the preauth sand-
+box was performing multiple stat() calls on rhosts ﬁles in-
+side auth_rhosts2_raw(). As this sandbox runs in a chroot
+environment, these accesses would always fail, breaking
+RhostsAuthentication when compartmentalization was en-
+
+Figure 4: Okular compartmentalization: grey code executes
+with ambient authority; green code is sandboxed.
+
+Okular has a modular structure with rendering plugins
+(“renderers”) for each supported document format. We de-
+cided to use this plugin interface to draw the compart-
+mentalization boundary, which allows us to support both
+sandboxed and unsandboxed plugins. Okular currently has
+16 diﬀerent renderers and we do not wish to have to add
+sandboxing support to all of them simultaneously. This
+highlights one of the key requirements for a tool such as
+SOAAP: aiding incremental compartmentalization. For this
+case study we focused on the commonly-used PDF renderer.
+This renderer is implemented using the libpoppler library,
+which has had 38 known vulnerabilities [35] in the last 10
+years. Of these, 19 are code execution vulnerabilities.
+
+In the case of fetch, we were able to annotate a single
+function as the sandbox entry point. This was not possi-
+ble here because Okular dynamically loads renderer plugins
+at run time – which equates to creating a single C++ ob-
+ject that implements the Okular::Generator interface. Our
+proposed sandbox scope would be to include every member
+function of that class and the base classes. As this was not
+easily expressible with the existing SOAAP annotations, we
+introduced a new __soaap_sandboxed_class(name) annotation
+to annotate the PDFGenerator class.
+
+One interesting issue found by SOAAP was that the KDE
+translation system may lazily load a shared library when
+translating messages into certain languages. The dlopen()
+call will fail when in the sandbox, however as the library
+is not required for most languages, this error is unlikely to
+be observed when using dynamic analysis or testing. This
+problem of lazy initialization was also encountered when
+compartmentalizing fetch (see Section 4.1.3) for the calls
+to getservbyname() and timegm().
+
+These ﬁndings, as well as the broken rhosts support in
+OpenSSH (see Section 4.3), show that static analysis with
+SOAAP can ﬁnd compartmentalization errors that other-
+wise might go unnoticed for years. However, being able to
+ﬁnd compartmentalization bugs caused by lazy initialization
+can come at the cost of an increase in false positives. When
+analyzing Okular, SOAAP showed 9 false positives due to
+lazy initialization that performs I/O but which had already
+been executed before entering the sandbox. There was also
+one such ﬁnding that was a legitimate issue. The PDF ren-
+derer would lazily attempt to load a conﬁguration ﬁle from
+
+1024Ver. Year LOC Functions
+P/S/P&S
+
+Annotations
+
+CDC Assert Vuln. All
+
+3.2.2
+3.5
+3.7
+5.3
+6.0
+6.5
+6.8
+
+2002
+2002
+2003
+2009
+2012
+2014
+2015
+
+43.6K 197/454/84
+45.4K 200/454/83
+48.7K 212/463/90
+63.8K 367/667/182
+73.9K 433/691/196
+82.6K 578/764/251
+96.7K 617/880/276
+
+80
+88
+113
+117
+117
+117
+117
+
+64
+67
+73
+75
+76
+76
+74
+
+23
+34
+34
+58
+65
+68
+65
+
+192
+211
+247
+287
+298
+308
+300
+
+(a)
+
+s
+g
+n
+n
+r
+a
+
+i
+
+W
+
+60
+
+40
+
+20
+
+0
+
+Unmitigated vulnerabilities
+Sandboxed Func warnings
+
+Syscall warnings
+Privileged Func warnings
+
+3.2.2
+
+3.5
+
+3.7
+
+5.3
+
+6.0
+
+6.5
+
+6.8
+
+OpenSSH Version
+
+(b)
+
+Figure 5: (a) Table showing OpenSSH code changes between versions. P: privileged; S: sandboxed; CDC: cross-domain
+communication. (b) Graph showing the number and types of SOAAP warnings across OpenSSH versions.
+
+abled. This was never ﬁxed, but rhosts-based authentication
+was already a vestigial feature by the time OpenSSH came
+into widespread use and it was removed in v3.7.
+
+We were able to carry our the initial annotations forward
+with only trivial merge conﬂicts. However, shown in Ta-
+ble 5a, SOAAP reports that the ratio between total code
+and code executing in sandboxes has decreased from 69%
+to 59% — the TCB has been getting larger. One major
+change is the use of multiple sandboxing platforms such as
+seccomp-bpf (added in 6.0) and Capsicum (added in 6.5).
+
+We also examined the change in SOAAP’s warnings across
+OpenSSH versions, shown in Figure 5b. We looked at un-
+mitigated vulnerabilities, system call warnings and functions
+that execute outside their intended domains. System call
+warnings tell us which system calls are not permitted by a
+given sandboxing platform. SOAAP correctly warned about
+stat() calls, and these warnings disappeared when rhosts
+support was removed in 3.7. We also see the warnings drop
+when Capsicum support was added in 6.5. Along with the
+rise in privileged code, SOAAP shows us that there is a cor-
+responding rise in the number of unmitigated vulnerabilities.
+SOAAP also gave insights into how the execution of code
+annotated as being privileged or sandbox-only has changed
+over time. Sandbox-only code (likely to be riskier) executes
+almost only in sandboxes whereas privileged code is increas-
+ingly being executed in sandboxes.
+If the security policy
+for the sandbox is not correctly deﬁned, the sandbox could
+perform operations it is not supposed to. Conversely, if the
+policy is correct then privileged operations will fail.
+4.4 Chromium: analysis scalability
+
+We tested SOAAP’s scalability by applying it to the
+Chromium web browser [37], a large, complex, compartmen-
+talized application with a history of security vulnerabilities
+and a variety of vulnerability mitigation techniques. We
+used SOAAP’s risk annotation and data-ﬂow analysis ca-
+pabilities to investigate the separation of “risky” code and
+data from each other. We were able to observe at least one
+instance in which risky code could be exposed to risky data,
+potentially leading to critical security vulnerabilities as have
+been previously reported in released versions of Chromium.
+
+4.4.1 Risky code
+The Chromium web browser, which is the open source
+variant of Google Chrome, has complex security require-
+ments and incorporates code from many sources. In addi-
+tion to core browser code written by Google and community
+developers, Chromium incorporates code from vendors and
+
+open-source libraries with varying security track records.
+For instance, the WebKit rendering framework has suﬀered
+over 200 publicly-reported security vulnerabilities since it
+was spun oﬀ from the KHTML framework [1], and through
+a dedicated fuzzing eﬀort, Google security developers found
+over one thousand security vulnerabilities in the FFmpeg
+media libraries in the span of a year [17]. Code that has
+previously suﬀered from multiple vulnerabilities often deals
+with the interpretation of complex data and is therefore an
+excellent candidate to be compartmentalized and isolated
+from privilege and ambient authority (see Section 2.3).
+
+SOAAP facilitates reasoning about the exposure of
+risky code by allowing developers to annotate previously-
+vulnerable code. We identiﬁed risky code in Chromium by
+searching Chromium’s historical bug database for security
+vulnerabilities in extant code. Due to constant code churn,
+many historic vulnerabilities applied to code that no longer
+exists. However, we did ﬁnd 21 historic Chromium vulnera-
+bilities that have been patched and made public but applied
+to extant code in the WebKit rendering engine, Skia graphics
+library, FFmpeg media transcoder, v8 JavaScript engine and
+internal HTTP or URL handling code. From these vulner-
+ability descriptions, we annotated ten previously-vulnerable
+functions (__soaap_vuln_fn) and 18 locations within other
+functions that were previously vulnerable (__soaap_vuln_pt).
+These annotations are a machine-readable formalization of
+a common practice in the Chromium code base: referencing
+bug IDs from comments in source code. We found 1,803 in-
+stances of such references within C++ comments, some of
+which we were able to formalize with SOAAP annotations:
+
+_ _ s o a a p _ v u l n _ p t ( " Cr issue #425035 " ) ;
+CHECK ( H a s B e e n S e t U p () ) ; // crbug . com /425035
+
+Annotating the locations of previous vulnerabilities allows
+SOAAP to statically enumerate the call graphs of risky code.
+Chromium is designed to execute risky code inside compart-
+ments, using platform-speciﬁc compartmentalization tech-
+nologies. To analyze the eﬀectiveness of Chromium’s sand-
+boxing, we needed to expose the details of the compart-
+mentalization scheme to SOAAP. We re-implemented the
+sandboxing model using Capsicum [42] and found it to
+be an excellent ﬁt for the compartmentalization models of
+both SOAAP and Chromium: the Linux compartmental-
+ization requires 13,821 lines of code and Windows requires
+28,239, but the Capsicum model requires only 406 lines of
+source code and two sets of SOAAP annotations. The ﬁrst
+was a pair of annotations (__soaap_sandboxed_region_start
+and __soaap_sandboxed_region_end) within RendererMain to
+expose the extent of the sandbox.
+The second was
+
+1025Figure 6: Simpliﬁed SOAAP-generated call graphs of unmitigated (red) and mitigated (yellow) vulnerabilities in Chromium.
+
+We then enabled SOAAP’s information ﬂow tracking to
+determine all of the locations where this network-originated
+data was accessed outside of a sandbox. SOAAP detected
+1.88 M such accesses, a number too large to manually sift for
+false positives. We are able to cope with this scale of problem
+in two ways. First, our SOAAP graph manipulation tools
+are able to compute useful operations on combined call/data
+ﬂow graphs, such as intersections to a certain depth and
+leaf node ﬁltering. For example, we can trace back a ﬁxed
+number of calls or data ﬂows from a vulnerability or private
+data access to compute a set of ancestor nodes, then only
+include that node in the new intersection graph if it shares
+at least one ancestor with the ancestors of another graph.
+This allows us to reduce the graph of all private accesses to
+the graph of private accesses (risky data) that occur in some
+proximity to a previously-vulnerable function (risky code).
+The result of intersecting the vulnerability and private-
+access graphs is still too large for manual exploration. Such
+exploration was important when iteratively investigating lo-
+cations for network data annotation (net::HttpStreamParser,
+net::HttpNetworkTransaction, net::URLRequest, etc.). There-
+fore, for initial data exploration, SOAAP is able to treat
+private accesses probabilistically. We found that randomly
+selecting 0.01% of private access allowed us to perform ex-
+ploratory data analysis and rapidly identify suspicious data
+ﬂows. We then ﬁltered large graphs by leaf nodes (vulner-
+abilities or private accesses) to produce the simple call and
+data-ﬂow graphs shown in Figures 8 and 10 (see Section A).
+Using SOAAP’s static call graphs of previously-vulnerable
+code, information ﬂow propagation analysis, sandbox an-
+notations, graph intersection and ﬁltering, we were able
+to identify network-tainted data (risky data) ﬂowing to
+previously-vulnerable functions (risky code). For example,
+Figure 8 depicts a highly elided call and data ﬂow graph that
+shows resources loaded by URL and presented to MIME type
+detection code that has suﬀered security vulnerabilities in
+the past. This is precisely the type of interaction that appli-
+cation authors might prefer to occur within a least-privileged
+compartment; SOAAP makes it visible to the authors so
+they can take appropriate mitigation steps.
+
+After intersection and ﬁltering SOAAP graphs, we still en-
+countered many false positives caused by Chromium’s var-
+ied network use. For instance, Chromium’s HTTP and URL
+handling code is used both to retrieve data from the network
+and to manage transport between its privileged and unpriv-
+ileged components. We saw many data ﬂows from, e.g.,
+net::HttpStreamParser to code in the remoting::protocol
+namespace, and then on to previously-vulnerable WebKit
+code. We view this as a false-positive result: it is part of a
+
+Figure 7: A simpliﬁed call graph produced by SOAAP that
+demonstrates how a previously-vulnerable function can be
+called from main in an unsandboxed (i.e., privileged) context.
+
+a __soaap_limit_fd_syscall annotation to describe how
+Chromium limits a sandbox’s authority on particular ﬁle
+descriptors according to the Capsicum model.
+
+After annotating Chromium to describe both its risky
+code and its compartmentalization strategy, SOAAP was
+able to statically check which risky functions could be exe-
+cuted outside of a sandbox. The results, shown in Figure 6,
+are surprising at ﬁrst glance: almost all of the risky functions
+are executed in both the privileged browser process and the
+least-privileged renderer process. For example, debug trac-
+ing in the privileged browser process can call a previously-
+vulnerable image parsing function within Skia, as shown in
+Figure 7. However, this static call graph does not tell the
+whole story of code and data risk.
+
+A reliance on static call graphs can lead to large num-
+bers of false-positive results. Figure 7 does show that the
+previously-vulnerable function SkMask::computeImageSize()
+might execute outside of the sandboxed renderer process,
+but if it only computes the sizes of browser chrome images
+distributed by Google, there is a much lower risk than if it
+is exposed to content from arbitrary web pages.
+In order
+to better understand the real risk of running risky code, we
+added risky data annotations and combined the above static
+call graphs with SOAAP’s information ﬂow analysis.
+
+4.4.2 Risky data
+In addition to annotating risky (previously-vulnerable)
+code, we also annotated risky data: data that is obtained
+from the network and which may therefore be dictated by an
+attacker. We annotated Chromium’s net::URLRequest::Read
+method, telling SOAAP to treat the read buﬀer as private
+to the renderer sandbox:
+
+bool Read ( _ _ s o a a p _ p r i v a t e ( " renderer " )
+
+IOBuffer * buf ,
+int max_bytes , int * b y t e s _ r e a d ) ;
+
+rendererblink::canHaveChildrenForEditing( [...])[[Cr issue #51602]]<<renderer>>blink::FrameSelection::setSelection( [...])[[Cr issue #51602]]<<renderer>>app_modal::AppModalDialog::CompleteDialog( [...])[[Cr issue #137707]]<<renderer>>blink::ResourceLoader::cancel( [...])[[Cr issue #244021]]<<renderer>>blink::FrameView::performLayout( [...])<<renderer>>blink::RenderScrollbarPart::layout( [...])<<renderer>>FrameView.cpp:857 (libwebcore_remaining.a.bc)blink::LayoutSVGText::layout()<<renderer>>FrameView.cpp:857 (libwebcore_remaining.a.bc)net::SniffForOfficeDocs(char  [...])[[Cr issue #239580]]<<renderer>>blink::selectMisspelledWord(b [...])<<renderer>>blink::FrameSelection::setSelection( [...])[[Cr issue #51602]]<<renderer>>ContextMenuClientImpl.cpp:146 (libblink_web.a.bc)blink::WebLocalFrameImpl::selectWordAroundPosition( [...])<<renderer>>ContextMenuClientImpl.cpp:136 (libblink_web.a.bc)blink::ResourceFetcher::requestResource( [...])<<renderer>>blink::Resource::load(blink:: [...])[[Cr issue #244021]]<<renderer>>ResourceFetcher.cpp:804 (libwebcore_remaining.a.bc)blink::RenderBlockFlow::rebuildFloatsFromIntruding( [...])<<renderer>>blink::RenderBlockFlow::markAllDescendantsWithFloatsForLayout( [...])[[Cr issue #244036]]<<renderer>>RenderBlockFlow.cpp:908 (libwebcore_rendering.a.bc)blink::FrameView::performPostLayoutTasks( [...])[[Cr issue #236245]]<<renderer>>blink::LayoutObject::destroy()<<renderer>>blink::RenderText::removeAndDestroyTextBoxes( [...])<<renderer>>v8::internal::HOptimizedGraphBuilder::BuildFastLiteral( [...])<<renderer>>v8::internal::HOptimizedGraphBuilder::BuildEmitInObjectProperties( [...])[[Cr issue #240056]]<<renderer>>hydrogen.cc:11145 (libv8_base.a.bc)content::NotificationServiceImpl::Notify( [...])<<renderer>>CollectedCookiesViews::Observe( [...])<<renderer>>notification_service_impl.cc:108 (libcontent_browser.a.bc)NTPLoginHandler::Observe(int, [...])<<renderer>>notification_service_impl.cc:108 (libcontent_browser.a.bc)blink::FrameLoader::loadHistoryItem( [...])<<renderer>>blink::FrameLoader::restoreScrollPositionAndViewState( [...])<<renderer>>FrameLoader.cpp:1359 (libwebcore_remaining.a.bc)blink::FrameLoader::loadInSameDocument( [...])<<renderer>>FrameLoader.cpp:1358 (libwebcore_remaining.a.bc)blink::FrameLoader::startLoad( [...])<<renderer>>FrameLoader.cpp:1363 (libwebcore_remaining.a.bc)blink::FrameLoader::shouldClose( [...])<<renderer>>blink::Document::dispatchBeforeUnloadEvent( [...])<<renderer>>FrameLoader.cpp:1176 (libwebcore_remaining.a.bc)content::RenderThreadImpl::Shutdown( [...])<<renderer>>blink::RenderText::deleteTextBoxes( [...])[[Cr issue #51602]]<<renderer>>blink::Node::defaultEventHandler( [...])[[Cr bug #60327]]<<renderer>>Document.cpp:2573 (libwebcore_dom.a.bc)content::RenderProcessImpl::~RenderProcessImpl( [...])<<renderer>>content::ChildProcess::~ChildProcess( [...])<<renderer>>content::RenderProcessHostImpl::ProcessDied( [...])<<renderer>>render_process_host_impl.cc:2067 (libcontent_browser.a.bc)content::ChildProcessHostImpl::OnMessageReceived( [...])<<renderer>>render_process_host_impl.cc:2085 (libcontent_browser.a.bc)blink::Document::implicitClose( [...])<<renderer>>blink::FrameView::layout()<<renderer>>Document.cpp:2537 (libwebcore_dom.a.bc)blink::RenderScrollbarPart::computeScrollbarWidth( [...])[[Cr issue #49729]]<<renderer>>child_process.cc:67 (libcontent_child.a.bc)content::PluginThread::Shutdown( [...])<<renderer>>child_process.cc:67 (libcontent_child.a.bc)FrameView.cpp:1015 (libwebcore_remaining.a.bc)blink::FrameView::performPreLayoutTasks( [...])<<renderer>>FrameView.cpp:923 (libwebcore_remaining.a.bc)blink::ContextMenuController::handleContextMenuEvent( [...])<<renderer>>Node.cpp:2135 (libwebcore_dom.a.bc)blink::EventHandler::defaultTextInputEventHandler( [...])<<renderer>>Node.cpp:2139 (libwebcore_dom.a.bc)blink::RenderBlockFlow::constructLine( [...])<<renderer>>blink::InlineFlowBox::addToLine( [...])[[Cr issue #51602]]<<renderer>>RenderBlockLineLayout.cpp:234 (libwebcore_rendering.a.bc)blink::Editor::handleTextEvent( [...])<<renderer>>blink::Editor::replaceSelectionWithText( [...])<<renderer>>Editor.cpp:168 (libwebcore_remaining.a.bc)blink::Editor::replaceSelectionWithFragment( [...])<<renderer>>Editor.cpp:166 (libwebcore_remaining.a.bc)blink::RenderScrollbarPart::computeScrollbarHeight( [...])[[Cr issue #49729]]<<renderer>>FrameView.cpp:812 (libwebcore_remaining.a.bc)blink::FrameView::updateScrollCorner( [...])<<renderer>>blink::DocumentLoader::cancelMainResourceLoad( [...])<<renderer>>DocumentLoader.cpp:723 (libwebcore_remaining.a.bc)net::SniffMimeType(char const [...])<<renderer>>RenderText.cpp:230 (libwebcore_rendering.a.bc)blink::FrameLoader::dispatchNavigationTransitionData( [...])<<renderer>>blink::StyledMarkupAccumulator::traverseNodesForSerialization( [...])<<renderer>>base::MessageLoop::Run()<<renderer>>app_modal::JavaScriptAppModalDialog::OnCancel( [...])<<renderer>>javascript_app_modal_dialog.cc:111 (libapp_modal.a.bc)EventHandler.cpp:3384 (libwebcore_remaining.a.bc)blink::DocumentLoader::startLoadingMainResource( [...])<<renderer>>blink::LayoutObject::setStyle( [...])<<renderer>>blink::RenderInline::splitFlow( [...])<<renderer>>blink::Range::startPosition() [...])<<renderer>>blink::dispatchEditableContentChangedEvents( [...])[[Cr issue #237429]]<<renderer>>blink::DocumentLoader::stopLoading( [...])<<renderer>>FrameLoader.cpp:592 (libwebcore_remaining.a.bc)blink::FrameLoader::checkCompleted( [...])<<renderer>>FrameLoader.cpp:617 (libwebcore_remaining.a.bc)blink::TextFieldInputType::spinButtonStepUp( [...])<<renderer>>blink::InputType::stepUpFromRenderer( [...])[[Cr issue #243991]]<<renderer>>TextFieldInputType.cpp:519 (libwebcore_html.a.bc)DocumentLoader.cpp:185 (libwebcore_remaining.a.bc)blink::Editor::appliedEditing( [...])<<renderer>>blink::RenderBlockFlow::layoutInlineChildren( [...])<<renderer>>SkEmbossMaskFilter::filterMask( [...])<<renderer>>SkMask::computeImageSize() co [...])[[Cr issue #10736]]<<renderer>>SkEmbossMaskFilter.cpp:98 (libskia_library.a.bc)markup.cpp:381 (libwebcore_remaining.a.bc)mime_sniffer.cc:945 (libnet.a.bc)blink::RangeBoundaryPoint::toPosition( [...])[[Cr issue #51602]]<<renderer>>FrameLoader.cpp:494 (libwebcore_remaining.a.bc)blink::Document::setReadyState( [...])<<renderer>>FrameLoader.cpp:492 (libwebcore_remaining.a.bc)blink::RenderBlockFlow::removeFloatingObjects( [...])[[Cr issue #245727]]<<renderer>>RenderInline.cpp:474 (libwebcore_rendering.a.bc)FrameView.cpp:2485 (libwebcore_remaining.a.bc)FrameView.cpp:2482 (libwebcore_remaining.a.bc)blink::FrameSelection::selectWordAroundPosition( [...])<<renderer>>WebLocalFrameImpl.cpp:1178 (libblink_web.a.bc)Editor.cpp:664 (libwebcore_remaining.a.bc)blink::RenderScrollbarPart::layoutHorizontalPart( [...])<<renderer>>RenderScrollbarPart.cpp:91 (libwebcore_rendering.a.bc)content::RendererMain(content [...])<<renderer>>renderer_main.cc:231 (libcontent_renderer.a.bc)renderer_main.cc:223 (libcontent_renderer.a.bc)Range.h:112 (libwebcore_dom.a.bc)RenderScrollbarPart.cpp:104 (libwebcore_rendering.a.bc)RenderScrollbarPart.cpp:102 (libwebcore_rendering.a.bc)FrameLoader.cpp:1240 (libwebcore_remaining.a.bc)FrameLoader.cpp:1236 (libwebcore_remaining.a.bc)FrameLoader.cpp:1276 (libwebcore_remaining.a.bc)FrameSelection.cpp:1907 (libwebcore_remaining.a.bc)LayoutSVGText.cpp:381 (libwebcore_svg.a.bc)LayoutSVGText.cpp:389 (libwebcore_svg.a.bc)content::RenderThreadImpl::Send( [...])blink::FrameLoader::loadHistoryItem( [...])blink::DocumentLoader::stopLoading( [...])blink::DocumentLoader::cancelMainResourceLoad( [...])DocumentLoader.cpp:185 (libwebcore_remaining.a.bc)blink::ResourceLoader::cancel( [...])[[Cr issue #244021]]DocumentLoader.cpp:723 (libwebcore_remaining.a.bc)blink::InlineFlowBox::addToLine( [...])[[Cr issue #51602]]blink::RenderScrollbarPart::computeScrollbarHeight( [...])[[Cr issue #49729]]blink::RenderBlockFlow::markAllDescendantsWithFloatsForLayout( [...])[[Cr issue #244036]]base::trace_event::TraceEvent::AppendPrettyPrinted( [...])content::DevToolsFrameTraceRecorderData::AppendAsTraceFormat( [...])trace_event_impl.cc:785 (libbase.a.bc)cc::TracedPicture::AppendAsTraceFormat( [...])trace_event_impl.cc:785 (libbase.a.bc)blink::RenderText::deleteTextBoxes( [...])[[Cr issue #51602]]app_modal::AppModalDialog::CompleteDialog( [...])[[Cr issue #137707]]v8::internal::HOptimizedGraphBuilder::BuildFastLiteral( [...])v8::internal::HOptimizedGraphBuilder::BuildEmitInObjectProperties( [...])[[Cr issue #240056]]hydrogen.cc:11145 (libv8_base.a.bc)blink::FrameLoader::restoreScrollPositionAndViewState( [...])blink::FrameView::updateScrollCorner( [...])blink::FrameLoader::checkCompleted( [...])blink::Document::implicitClose( [...])FrameLoader.cpp:494 (libwebcore_remaining.a.bc)blink::Document::setReadyState( [...])FrameLoader.cpp:492 (libwebcore_remaining.a.bc)blink::FrameView::performPostLayoutTasks( [...])[[Cr issue #236245]]blink::LayoutObject::setStyle( [...])FrameView.cpp:2482 (libwebcore_remaining.a.bc)blink::LayoutObject::destroy()FrameView.cpp:2485 (libwebcore_remaining.a.bc)content::ThreadSafeSender::Send( [...])FrameLoader.cpp:1359 (libwebcore_remaining.a.bc)blink::FrameLoader::loadInSameDocument( [...])FrameLoader.cpp:1358 (libwebcore_remaining.a.bc)blink::FrameLoader::startLoad( [...])FrameLoader.cpp:1363 (libwebcore_remaining.a.bc)blink::FrameView::performLayout( [...])blink::LayoutSVGText::layout()FrameView.cpp:857 (libwebcore_remaining.a.bc)blink::RenderScrollbarPart::layout( [...])FrameView.cpp:857 (libwebcore_remaining.a.bc)blink::Editor::replaceSelectionWithText( [...])blink::Range::startPosition() [...])blink::FrameView::performPreLayoutTasks( [...])FrameView.cpp:812 (libwebcore_remaining.a.bc)thread_safe_sender.cc:24 (libcontent_child.a.bc)content::ChildThreadImpl::Send( [...])thread_safe_sender.cc:24 (libcontent_child.a.bc)blink::Resource::load(blink:: [...])[[Cr issue #244021]]blink::FrameSelection::selectWordAroundPosition( [...])blink::FrameSelection::setSelection( [...])[[Cr issue #51602]]FrameSelection.cpp:1907 (libwebcore_remaining.a.bc)net::SniffMimeType(char const [...])net::SniffForOfficeDocs(char  [...])[[Cr issue #239580]]mime_sniffer.cc:945 (libnet.a.bc)SkMask::computeImageSize() co [...])[[Cr issue #10736]]blink::FrameView::layout()Document.cpp:2537 (libwebcore_dom.a.bc)blink::RenderBlockFlow::rebuildFloatsFromIntruding( [...])LayoutSVGText.cpp:381 (libwebcore_svg.a.bc)blink::RenderBlockFlow::layoutInlineChildren( [...])LayoutSVGText.cpp:389 (libwebcore_svg.a.bc)blink::RenderBlockFlow::constructLine( [...])RenderBlockLineLayout.cpp:234 (libwebcore_rendering.a.bc)blink::ResourceFetcher::requestResource( [...])ResourceFetcher.cpp:804 (libwebcore_remaining.a.bc)blink::RenderInline::splitFlow( [...])blink::RenderBlockFlow::removeFloatingObjects( [...])[[Cr issue #245727]]RenderInline.cpp:474 (libwebcore_rendering.a.bc)blink::ContextMenuController::handleContextMenuEvent( [...])blink::selectMisspelledWord(b [...])SkDraw::DrawToMask(SkPath con [...])SkDraw.cpp:2260 (libskia_library.a.bc)blink::Editor::handleTextEvent( [...])Editor.cpp:168 (libwebcore_remaining.a.bc)blink::Editor::replaceSelectionWithFragment( [...])Editor.cpp:166 (libwebcore_remaining.a.bc)IPC::ChannelProxy::Context::OnDispatchMessage( [...])content::ChildProcessHostImpl::OnMessageReceived( [...])ipc_channel_proxy.cc:282 (libipc.a.bc)IPC::ChannelProxy::Context::OnDispatchConnected( [...])ipc_channel_proxy.cc:270 (libipc.a.bc)content::RenderFrameHostImpl::OnMessageReceived( [...])ipc_channel_proxy.cc:282 (libipc.a.bc)blink::Node::defaultEventHandler( [...])[[Cr bug #60327]]Node.cpp:2135 (libwebcore_dom.a.bc)blink::EventHandler::defaultTextInputEventHandler( [...])Node.cpp:2139 (libwebcore_dom.a.bc)blink::WebLocalFrameImpl::selectWordAroundPosition( [...])WebLocalFrameImpl.cpp:1178 (libblink_web.a.bc)mainblink::TextFieldInputType::spinButtonStepUp( [...])blink::RangeBoundaryPoint::toPosition( [...])[[Cr issue #51602]]blink::RenderText::removeAndDestroyTextBoxes( [...])blink::RenderScrollbarPart::layoutHorizontalPart( [...])RenderScrollbarPart.cpp:91 (libwebcore_rendering.a.bc)RenderBlockFlow.cpp:908 (libwebcore_rendering.a.bc)FrameLoader.cpp:592 (libwebcore_remaining.a.bc)FrameLoader.cpp:617 (libwebcore_remaining.a.bc)blink::canHaveChildrenForEditing( [...])[[Cr issue #51602]]RenderText.cpp:230 (libwebcore_rendering.a.bc)RenderScrollbarPart.cpp:102 (libwebcore_rendering.a.bc)blink::RenderScrollbarPart::computeScrollbarWidth( [...])[[Cr issue #49729]]RenderScrollbarPart.cpp:104 (libwebcore_rendering.a.bc)blink::FrameLoader::shouldClose( [...])FrameLoader.cpp:1240 (libwebcore_remaining.a.bc)blink::FrameLoader::dispatchNavigationTransitionData( [...])FrameLoader.cpp:1236 (libwebcore_remaining.a.bc)blink::DocumentLoader::startLoadingMainResource( [...])FrameLoader.cpp:1276 (libwebcore_remaining.a.bc)blink::Document::dispatchBeforeUnloadEvent( [...])FrameLoader.cpp:1176 (libwebcore_remaining.a.bc)ContextMenuClientImpl.cpp:136 (libblink_web.a.bc)blink::FrameSelection::setSelection( [...])[[Cr issue #51602]]ContextMenuClientImpl.cpp:146 (libblink_web.a.bc)EventHandler.cpp:3384 (libwebcore_remaining.a.bc)blink::Editor::appliedEditing( [...])app_modal::JavaScriptAppModalDialog::OnCancel( [...])javascript_app_modal_dialog.cc:111 (libapp_modal.a.bc)Range.h:112 (libwebcore_dom.a.bc)blink::StyledMarkupAccumulator::traverseNodesForSerialization( [...])Document.cpp:2573 (libwebcore_dom.a.bc)FrameView.cpp:1015 (libwebcore_remaining.a.bc)FrameView.cpp:923 (libwebcore_remaining.a.bc)markup.cpp:381 (libwebcore_remaining.a.bc)blink::dispatchEditableContentChangedEvents( [...])[[Cr issue #237429]]Editor.cpp:664 (libwebcore_remaining.a.bc)blink::InputType::stepUpFromRenderer( [...])[[Cr issue #243991]]TextFieldInputType.cpp:519 (libwebcore_html.a.bc)base::trace_event::TraceEvent::AppendPrettyPrinted( [...])cc::TracedPicture::AppendAsTraceFormat( [...])trace_event_impl.cc:785 (libbase.a.bc)SkMask::computeImageSize() co [...])[[Cr issue #10736]]ChromeMainSkDraw::DrawToMask(SkPath con [...])SkDraw.cpp:2260 (libskia_library.a.bc)mainchrome_exe_main_aura.cc:17 (chrome.bc)1026[ ... detail elided ... ]
+
+Figure 8: An example of data ﬂowing from the network to code that has previously been vulnerable to exploitation.
+In
+this example, which has been cropped by 38 function calls and nine relevant data ﬂows, data ﬂows from a URLRequest to a
+BlobURLRequestJob to a BufferedResourceHandler, where it is inspected to determine its MIME type. net::SniffForOfficeDocs
+was annotated with __soaap_vuln_pt due to a previous critical security vulnerability (see http://crbug.com/239580).
+
+Link chrome
+
+llvm-link chrome.bc
+
+SOAAP: 28 accesses
+
+SOAAP: 1.8M acc.
+
+User
+
+System
+
+0
+
+100
+
+200
+
+300
+
+400
+
+500
+
+Run time [s]
+
+Figure 9: SOAAP’s run time is similar to that of linking the
+Chromium bitcode using llvm-link. With a restricted set of
+private-access annotations, leading to 28 detected private ac-
+cesses, it is 0.68 that of llvm-link. With the annotation used
+in Section 4.4.2, which causes 1.8 M private access warnings,
+the run time is 1.48 times that of llvm-link.
+
+carefully-managed interaction between browser components
+for the purpose of enabling compartmentalization.
+
+Such false positives could be managed by introducing
+more selective annotations, e.g., on content::ResourceLoader
+rather than the general-purpose net::URLRequest, but our
+goal in this work was to explore as many variations of data
+ﬂowing to risky code as possible. That is, we had very little
+tolerance for false negatives, so we erred on the side of false
+positives and developed tools to cope with them.
+
+4.4.3 Performance
+As a whole-program analysis, SOAAP’s run-time cost
+when targeting Chromium is comparable to other whole-
+program LLVM-based tasks. Figure 9 compares the run
+time of four whole-program compilation and analysis tasks:
+linking Chromium’s object ﬁles and static archives into an
+executable ELF binary, linking its individual LLVM IR ob-
+ject ﬁles into a complete bitcode ﬁle with llvm-link, run-
+ning SOAAP with some private data accesses and running
+SOAAP with the annotations described in Section 4.4.1.
+
+The following measurements were performed on a sys-
+tem running FreeBSD 10.1-RELEASE-p16, with a ZFS ARC
+(adaptive replacement cache) of 20–60 GiB (out of a total of
+128 GiB of system RAM) and no memory pressure: the en-
+tire working set was able to ﬁt into the ARC rather than be
+retrieved from disk on-demand. Our system has dual Xeon
+E5-2667v3 CPUs with 32 logical processors, but SOAAP
+does not currently exploit their parallelism.
+
+Figure 9 shows, as we would expect,
+
+that linking
+Chromium as a 985 MiB LLVM bitcode ﬁle is slower than
+linking a 141 MiB ELF executable. LLVM IR is a higher-
+level representation with explicit types and other informa-
+tion that is not included in machine code. SOAAP’s run-
+time cost is either just over or just under this LLVM linking
+time, depending on the complexity of the data ﬂows that
+SOAAP must track. Loading this 985 MiB bitcode ﬁle into
+memory required over 10 GiB of memory, approximately the
+same amount of memory required by llvm-link. Processing
+the class hierarchy, ﬁnding sandboxes and adding informa-
+tion about previous vulnerabilities pushed memory usage
+to just over 12 GiB, and adding the details of 1.5 M pri-
+vate accesses increased memory usage to just over 14 GiB.
+The diﬀerence in run time between the two SOAAP cases in
+Figure 9 is due to the private accesses that were detected,
+according to the _soaap_private annotations that were ap-
+plied. The outcome of SOAAP’s analysis was a 978 MiB
+JSON ﬁle that we initially explored with jq [12] and ﬁnally
+processed with our SOAAP graph manipulation tools.
+
+Combining SOAAP’s sandbox, vulnerability and data ﬂow
+annotations allowed us to detect the interaction of risky code
+and risky data outside of least-privileged compartments, cre-
+ating risk for Chromium’s users. These complex analyses
+can be used to immediately inform application authors of
+potential risks and inform their decisions about where to in-
+vest compartmentalization eﬀort. Even on a large, complex
+
+ChromePluginServiceFilter::IsPluginAvailable( [...])content::ResourceLoader::CompleteRead( [...])content::BufferedResourceHandler::OnReadCompleted( [...])resource_loader.cc:770 (libcontent_browser.a.bc)content::BufferedResourceHandler::ReplayReadCompleted( [...])buffered_resource_handler.cc:435 (libcontent_browser.a.bc)content::ResourceLoader::OnReadCompleted( [...])url_request.cc:1137 (libnet.a.bc)content::BufferedResourceHandler::SelectNextHandler( [...])content::BufferedResourceHandler::HasSupportingPlugin( [...])buffered_resource_handler.cc:349 (libcontent_browser.a.bc)content::BufferedResourceHandler::DetermineMimeType( [...])buffered_resource_handler.cc:180 (libcontent_browser.a.bc)content::BufferedResourceHandler::ProcessResponse( [...])buffered_resource_handler.cc:184 (libcontent_browser.a.bc)content::PluginServiceImpl::GetPluginInfo( [...])plugin_service_impl.cc:536 (libcontent_browser.a.bc)net::SniffForOfficeDocs(char  [...])[[Cr issue #239580]]net::SniffMimeType(char const [...])buffered_resource_handler.cc:289 (libcontent_browser.a.bc)buffered_resource_handler.cc:484 (libcontent_browser.a.bc)buffered_resource_handler.cc:252 (libcontent_browser.a.bc)buffered_resource_handler.cc:235 (libcontent_browser.a.bc)resource_loader.cc:457 (libcontent_browser.a.bc)mime_sniffer.cc:945 (libnet.a.bc)mainchrome_exe_main_aura.cc:17 (chrome.bc)net::URLRequest::Read(net::IO [...])Legendpreviously_vulnerable[[CVE-1900-XXXXX]]vulnerability_mitigated[[CVE-1900-XXXXX]]<<sandbox>>sandboxed<<sandbox>>private_accessordinary_function1027Program Version
+
+LOC
+
+Running time (secs)
+
+IR
+
+Null Vuln. Correct
+
+Info
+
+All
+
+fetch
+
+r252375
+
+OpenSSH
+OpenSSH
+
+Okular
+
+Chromium
+
+3.2.2
+6.8
+
+e03e6f
+
+42
+
+1.17
+5K
+3.8
+44K
+96K
+8.7
+4.2 M 2970
+13.1 M 7300
+
+0.05
+0.3
+1.15
+14.28
+195
+
+0.05
+0.3
+1.15
+14.66
+261
+
+0.06
+0.3
+1.15
+14.73
+2156
+
+0.06
+0.3
+1.15
+14.74
+1028
+
+0.06
+0.3
+1.15
+15.37
+3048
+
+Table 2: The running times of various SOAAP modes of execution for each of our case studies.
+
+piece of software such as Chromium, SOAAP was able to
+produce these data in eight minutes, or approximately the
+time required to link Chromium as LLVM bitcode.
+4.5 SOAAP tool performance
+
+Table 2 shows the time taken to run SOAAP on each of
+the case studies in three diﬀerent modes. These modes are
+selected to correspond to diﬀerent stages in the development
+cycle for compartmentalized applications:
+
+Vulnerability analysis checks which of the annotated
+vulnerabilities would be mitigated within sandboxes. This
+mode is used for the ﬁrst cut at describing a sandbox, to
+check that dangerous code is not run with ambient authority.
+Sandbox correctness checks whether each of the sand-
+boxes tries to access resources (global variables, system calls,
+and so on) without being explicitly granted capabilities for
+them. This mode is used to check that all of the communica-
+tion between sandboxes is explicit. Once a program passes
+this mode, all points that need modifying are annotated.
+
+Information ﬂow analysis is the ﬁnal check, which en-
+sures that sensitive information is not leaked between sand-
+boxes. This is the ﬁnal step before implementing a chosen
+compartmentalization strategy, which checks that the secu-
+rity goals are met. This also includes the same checks as the
+vulnerability analysis and would be run as part of a contin-
+uous integration build to check for sandboxing regressions.
+We distinguish between the cost to compile to LLVM IR
+and the cost to perform the initial analysis setup of loading
+the IR and building a call graph. We represent these as the
+two modes IR Compilation and Null analysis.
+
+We also focus on the Chromium case study, as the one with
+the longest running time, to provide more detail on where
+the time is being spent. Table 2 shows a breakdown of the
+SOAAP run according to the time spent in diﬀerent phases
+of the analysis, generated from a proﬁling build of SOAAP.
+Note that there is some potential for optimization here, for
+example 10% of the total time is spent on formatting JSON
+output and 35% on reading in the LLVM IR. These can
+both be improved, for example by constructing the JSON
+concurrently with the main thread and by demand-loading
+the LLVM IR from separate ﬁles using some of the infras-
+tructure for more eﬃcient link-time optimization support in
+LLVM that is currently under development at Google [39].
+
+5. FUTURE WORK
+
+SOAAP has proven to be a useful tool for analyzing and
+compartmentalizing programs in our environment. A natu-
+ral next step would be to investigate fully automated com-
+partmentalization – which requires signiﬁcantly more work
+than a simple analysis tool: RPC stubs must be generated,
+and current false positives and negatives in analysis will be-
+come actual bugs in generated code. Another valuable ex-
+
+ploration would be wider deployment of SOAAP into the
+software development community; with increasing adoption
+of the Clang/LLVM suite in the FreeBSD community, and
+that community’s heavy use of the Clang static analyzer as
+part of regular tinderboxing, it is easy to imagine a “tinder-
+sandbox” that regularly reviews sandboxing tradeoﬀs and
+checks that past and new vulnerabilities are properly miti-
+gated. This notion of integrating SOAAP into a continuous
+integration cycle, as is done with other types of static anal-
+ysis (e.g., Coverity Prevent) and testing seems promising.
+
+6. RELATED WORK
+
+The principle of least privilege and other security goals
+(such as protecting integrity, conﬁdentiality, and avail-
+ability) were enumerated in Saltzer and Schroeder’s 1975
+article, The Protection of Information in Computer Sys-
+tems. Karger’s 1987 article on Trojan horse mitigation [19]
+lays the conceptual groundwork for privilege separation,
+and later application compartmentalization, which became
+mainstream techniques applied to system-level applications
+in the early 2000s, with Provos’s work on OpenSSH [36],
+and Kilpatrick’s Privman [20]. Application compartmental-
+ization is applied to user-level applications by Gong et al. in
+Java [13], Reis et al. in the Chromium web browser [37],
+and by Watson et al. in Capsicum [42] – where the focus
+is on intra-application security concerns rather than system
+privileges. All of these projects have reported diﬃculty in
+applying compartmentalization to C-language applications;
+we draw particularly on our own experience in developing
+Capsicum. The interfaces between separated components
+have also been studied for their security implications – in
+particular, those of cryptographic security APIs [4], whose
+lessons are also applicable to general-purpose compartmen-
+talization. The analysis of Beurdouche et al. [6] suggests
+the need for further compartmentalization of the client and
+server sides of OpenSSL and JSSE to mitigate surprising
+compositional vulnerabilities.
+
+Brumley and Song’s Privtrans [9] and Bittau et al.’s
+Wedge [7] explore techniques for assisting programmers in
+identifying and exploiting compartmentalization opportuni-
+ties. Privtrans takes a code-oriented view, focusing on di-
+viding operation between privileged and unprivileged pro-
+cesses through program annotation, whereas Wedge relies
+on programmer-provided memory type information. Har-
+ris et al.’s secure programming by parity games [16] reasons
+about the defense characteristics of Capsicum compartmen-
+talization, representing policies as automata.
+
+SOAAP beneﬁts from the object-capability philosophy
+explored in HYDRA [23] and rigorously extended by
+Miller [28]. It is also comparable to Miller et al.’s or Met-
+tler et al.’s imposition of object-capability semantics on Java
+in DarpaBrowser [40] or Joe-E [27] – albeit in the uncon-
+
+1028strained execution environment of UNIX processes rather
+than a type-safe and already object-oriented language, and
+so requiring the imposition of an object-oriented structure.
+SOAAP incorporates decentralized information ﬂow-control
+techniques [34], past vulnerability information, and source-
+code risk analysis, allowing object-capability boundaries to
+align with critical security constructs in the application and
+its libraries. Rather than implementing separation policies,
+SOAAP is an exploration tool for programmers who may
+not fully understand the code that they are separating, rec-
+ognizing the complexity of large-scale applications.
+
+Software decomposition for robustness (and sometimes se-
+curity) has a long history, seeing early exploration in mi-
+crokernel designs [24], but performance concerns have dis-
+couraged widespread use. Growing compartmentalization
+reﬂects two changes: improvement in hardware performance,
+and a pressing need for vulnerability mitigation. Klein et
+al.’s SeL4 microkernel [21] oﬀers a contemporary take on
+microkernel design, achieving both performance and high as-
+surance as a compartmentalization substrate. Hardware vir-
+tualization extensions can support more eﬃcient separation
+via hypervisors [33], and extensions to the process model
+such as Belay et al.’s Dune [5]. Research architectures such
+as CHERI [43] may support vastly more scalable compart-
+mentalization in the future. SOAAP’s model and analy-
+sis spans a broad range of compartmentalization substrates,
+and can assist developers in making safe and eﬀective use of
+new facilities as they become mainstream.
+
+7. CONCLUSION
+
+Application compartmentalization is a key vulnerabil-
+ity mitigation technique that addresses a broad range of
+known (and unknown) attack vectors. Despite increasingly
+widespread deployment, it is also an approach that is rife
+with subtlety: we have demonstrated that developers are
+challenged by the need to develop and maintain compart-
+mentalizations that adequately trade oﬀ correctness, secu-
+rity, complexity, and performance. SOAAP’s conceptual
+framework, and practical tools, have assisted us in analyzing
+current compartmentalizations, and develop new ones, with
+greater understanding and conﬁdence. SOAAP is scalable
+to multi-million LoC code bases, and we are hopeful that
+this approach will facilitate greater deployment of compart-
+mentalization as a strong mitigation feature.
+
+8. AVAILABILITY
+
+For further details, refer to an extended version of this
+
+paper [14]. Our prototype is available as open source:
+
+https://www.cl.cam.ac.uk/research/security/ctsrd/soaap/
+
+9. ACKNOWLEDGMENTS
+
+We thank Ross Anderson, David Drysdale, ´Ulfar Er-
+lingsson, Somesh Jha, Steve Hand, William Harris, Ange-
+los Keromytis, Bob Laddaga, Anil Madhavapeddy, Simon
+Moore, Steven Murdoch, Robert Norton, Thomas Reps,
+Hassen Saidi, Howie Shrobe, Arun Thomas, Munraj Vadera,
+Sam Weber, and Jonathan Woodruﬀ, as well as our anony-
+mous reviewers, for their feedback and assistance. We grate-
+fully acknowledge Google, Inc., for its support via a Fo-
+cused Research Award. This work is also part of the CT-
+SRD, MRC2, and CADETS projects sponsored by the De-
+fense Advanced Research Projects Agency (DARPA) and
+
+the Air Force Research Laboratory (AFRL), under con-
+tracts FA8750-10-C-0237, FA8750-11-C-0249, and FA8650-
+15-C-7558. The views, opinions, and/or ﬁndings contained
+in this paper are those of the authors and should not
+be interpreted as representing the oﬃcial views or poli-
+cies, either expressed or implied, of the Department of De-
+fense or the U.S. Government. We also acknowledge the
+Isaac Newton Trust, the EPSRC REMS Programme Grant
+[EP/K008528/1], NSERC Discovery Grant RGPIN/06048-
+2015, and Thales E-Security.
+
+10. REFERENCES
+[1] Apple WebKit Vulnerability Statistics. http://www.
+
+cvedetails.com/product/10007/Apple-Webkit.html.
+
+[2] CVS commit: pkgsrc/security/openssh, Aug. 2015.
+http://mail-index.netbsd.org/pkgsrc-changes/
+2015/08/14/msg128305.html.
+
+[3] Anderson, J. Computer security technology planning
+
+study. Tech. Rep. ESD-TR-73-51, U.S. Air Force
+Electronic Systems Division, October 1972.
+
+[4] Anderson, R., Bond, M., Clulow, J., and
+
+Skorobogatov, S. Cryptographic processors-a
+survey. Proceedings of the IEEE 94, 2 (Feb 2006),
+357–369.
+
+[5] Belay, A., Bittau, A., Mashtizadeh, A., Terei,
+D., Mazi`eres, D., and Kozyrakis, C. Dune: safe
+user-level access to privileged CPU features. In
+Proceedings of the 10th Conference on Operating
+Systems Design and Implementation (2012), USENIX.
+
+[6] Beurdouche, B., Bhargavan, K.,
+
+Delignat-Lavaud, A., Fournet, C., Kohlweiss,
+M., Pironti, A., Strub, P.-Y., and Zinzindohoue,
+J. K. A Messy State of the Union: Taming the
+Composite State Machines of TLS. In Proceedings of
+the IEEE Symposium on Security and Privacy (2015).
+
+[7] Bittau, A., Marchenko, P., Handley, M., and
+
+Karp, B. Wedge: Splitting Applications into
+Reduced-Privilege Compartments. In Proceedings of
+the 5th USENIX Symposium on Networked Systems
+Design and Implementation (2008), USENIX.
+
+[8] Boebert, W., and Kain, R. A practical alternative
+to hierarchical integrity policies. In Proceedings of the
+Eighth DoD/NBS Computer Security Initiative
+Conference (1985).
+
+[9] Brumley, D., and Song, D. Privtrans:
+
+automatically partitioning programs for privilege
+separation. In Proceedings of the 13th USENIX
+Security Symposium (2004), USENIX.
+
+[10] Dean, J., Grove, D., and Chambers, C.
+
+Optimization of object-oriented programs using static
+class hierarchy analysis. In Proceedings of the 9th
+European Conference on Object-Oriented
+Programming (1995), ECOOP ’95, Springer-Verlag.
+
+[11] Dennis, J. B., and Van Horn, E. C. Programming
+
+semantics for multiprogrammed computations.
+Commun. ACM 9, 3 (1966), 143–155.
+
+[12] Dolan, S., Williams, N., Tolnay, D., Lapresta,
+
+S., Langford, W., and Gordan, A. jq: a
+lightweight and ﬂexible command-line JSON
+processor. http://stedolan.github.io/jq/.
+
+[13] Gong, L., Mueller, M., Prafullchandra, H.,
+and Schemers, R. Going beyond the sandbox: An
+
+1029overview of the new security architecture in the Java
+Development Kit 1.2. In Proceedings of the Symposium
+on Internet Technologies and Systems (1997),
+USENIX.
+
+[14] Gudka, K., Watson, R. N. M., Anderson, J.,
+
+Chisnall, D., Davis, B., Laurie, B.,
+Madhavapeddy, A., Marinos, I., Murdoch, S. J.,
+Neumann, P. G., and Richardson, A. Clean
+Application Compartmentalization with SOAAP
+(extended version). Tech. Rep. UCAM-CL-TR-873,
+University of Cambridge Computer Laboratory, Sept.
+2015.
+
+[15] Hamilton, G., and Kougiouris, P. The Spring
+
+Nucleus: A microkernel for objects. In Proceedings of
+the 1993 Summer Usenix Conference (1993), USENIX.
+[16] Harris, W. R., Farley, B., Jha, S., and Reps, T.
+
+Secure Programming as a Parity Game. Tech. Rep.
+1694, University of Wisconsin Madison, July 2011.
+[17] Jurczyk, M., and Coldwind, G. FFmpeg and a
+
+thousand ﬁxes. Google Online Security Blog, January
+2014. http://googleonlinesecurity.blogspot.com/
+2014/01/ffmpeg-and-thousand-fixes.html.
+
+[18] Kamp, P., and Watson, R. N. M. Jails: Conﬁning
+
+the omnipotent root. In Proceedings of the 2nd
+International SANE Conference (2000).
+
+[19] Karger, P. A. Limiting the damage potential of
+
+discretionary trojan horses. In Proceedings of the IEEE
+Symposium on Security and Privacy (1987), IEEE.
+
+[20] Kilpatrick, D. Privman: A Library for Partitioning
+
+Applications. In Proceedings of USENIX Annual
+Technical Conference (2003), USENIX.
+
+[21] Klein, G., Andronick, J., Elphinstone, K.,
+
+Heiser, G., Cock, D., Derrin, P., Elkaduwe, D.,
+Engelhardt, K., Kolanski, R., Norrish, M.,
+Sewell, T., Tuch, H., and Winwood, S. seL4:
+Formal veriﬁcation of an operating-system kernel.
+Commun. ACM 53 (June 2009), 107–115.
+
+[22] Lattner, C., and Adve, V. LLVM: A compilation
+
+framework for lifelong program analysis &
+transformation. In Proceedings of the International
+Symposium on Code Generation and Optimization
+(2004), CGO ’04, IEEE.
+
+[23] Levin, R., Cohen, E., Corwin, W., Pollack, F.,
+
+and Wulf, W. Policy/mechanism separation in
+Hydra. In SOSP ’75: Proceedings of the ﬁfth ACM
+Symposium on Operating Systems Principles (1975).
+
+[24] Lipner, S. B., Wulf, W. A., Schell, R. R.,
+
+Popek, G. J., Neumann, P. G., Weissman, C.,
+and Linden, T. A. Security kernels. In AFIPS ’74:
+Proceedings of the May 6-10, 1974, National
+Computer Conference and Exposition (1974), ACM.
+
+[25] Loscocco, P., and Smalley, S. Integrating ﬂexible
+
+support for security policies into the linux operating
+system. In Proceedings of the USENIX Annual
+Technical Conference (2001), USENIX.
+
+[26] McKusick, M. K., Neville-Neil, G. V., and
+
+Watson, R. N. M. The Design and Implementation
+of the FreeBSD Operating System. Pearson, 2014.
+
+[27] Mettler, A., Wagner, D., and Close, T. Joe-E:
+A Security-Oriented Subset of Java. In Proceedings of
+the Network and Distributed System Security
+Symposium (2010), NDSS’10.
+
+[28] Miller, M. S. Robust composition: towards a uniﬁed
+
+approach to access control and concurrency control.
+PhD thesis, Johns Hopkins University, Baltimore,
+MD, USA, 2006.
+
+[29] MITRE. CVE-2012-0652.
+[30] MITRE. CVE-2014-0160.
+[31] MITRE. CVE-2014-4877.
+[32] MITRE. CVE-2014-6271.
+[33] Murray, D. G., and Hand, S. Privilege separation
+made easy: trusting small libraries not big processes.
+In Proceedings of the 1st European Workshop on
+System Security (2008), EUROSEC ’08, ACM.
+
+[34] Myers, A. C., and Liskov, B. A decentralized
+
+model for information ﬂow control. SIGOPS Oper.
+Syst. Rev. 31 (October 1997), 129–142.
+
+[35] NIST. libpoppler CVEs. https://web.nvd.nist.gov/
+
+view/vuln/search-results?cpe_vendor=cpe:/:
+freedesktop&cpe_product=cpe:/::poppler.
+
+[36] Provos, N., Friedl, M., and Honeyman, P.
+
+Preventing privilege escalation. In Proceedings of the
+12th USENIX Security Symposium (2003), USENIX.
+
+[37] Reis, C., and Gribble, S. D. Isolating web
+
+programs in modern browser architectures. In EuroSys
+’09: Proceedings of the 4th ACM European Conference
+on Computer Systems (2009), ACM.
+
+[38] Saltzer, J. H., and Schroeder, M. D. The
+protection of information in computer systems.
+Proceedings of the IEEE 63, 9 (September 1975),
+1278–1308.
+
+[39] Teresa Johnson, X. D. L. ThinLTO: A
+
+Fine-Grained Demand-Driven Infrastructure. In
+EuroLLVM (2015).
+
+[40] Wagner, D., and Tribble, D. A security analysis of
+
+the combex darpabrowser architecture, March 2002.
+
+[41] Watson, R. N. M. A decade of OS access-control
+
+extensibility. Commun. ACM 56, 2 (Feb. 2013).
+
+[42] Watson, R. N. M., Anderson, J., Laurie, B., and
+
+Kennaway, K. Capsicum: Practical capabilities for
+UNIX. In Proceedings of the 19th USENIX Security
+Symposium (2010), USENIX.
+
+[43] Watson, R. N. M., Woodruff, J., Neumann,
+
+P. G., Moore, S. W., Anderson, J., Chisnall, D.,
+Dave, N., Davis, B., Gudka, K., Laurie, B.,
+Murdoch, S. J., Norton, R., Roe, M., Son, S.,
+and Vadera, M. CHERI: A Hybrid
+Capability-System Architecture for Scalable Software
+Compartmentalization. In Proceedings of the 36th
+IEEE Symposium on Security and Privacy (2015).
+
+APPENDIX
+A. ADDITIONAL GRAPH DETAIL
+
+Figure 10 provides a larger example of a call and data
+ﬂow graph emitted by SOAAP tools than could be included
+in Section 4.4. This particular graph is an example of a
+false-positive result that was obtained by annotating a low-
+level networking method that is used by several Chromium
+subsystems, not just communication with remote hosts.
+
+1030[ ... detail elided ... ]
+
+Figure 10: An example of a false positive result (cropped to ﬁt: we have elided nine calls and eight ﬂows). Here, data ﬂows from
+URLRequest::Read towards previously vulnerable code, which we deem to be “risky” code. However, these data ﬂows go through
+IPC interfaces that are used for communicating between the browser and renderer processes. Rather than exposing privileged
+code to arbitrary data, this data ﬂow passes highly constrained data for the purpose of enabling compartmentalization.
+
+blink::RenderBlockFlow::createLineBoxesFromBidiRuns( [...])blink::RenderBlockFlow::computeInlineDirectionPositionsForLine( [...])RenderBlockLineLayout.cpp:698 (libwebcore_rendering.a.bc)RenderBlockLineLayout.cpp:698 (libwebcore_rendering.a.bc)blink::RenderBlockFlow::constructLine( [...])RenderBlockLineLayout.cpp:685 (libwebcore_rendering.a.bc)blink::FrameLoader::loadInSameDocument( [...])blink::FrameLoader::checkCompleted( [...])FrameLoader.cpp:617 (libwebcore_remaining.a.bc)blink::XMLHttpRequest::didFail( [...])blink::XMLHttpRequest::handleDidCancel( [...])XMLHttpRequest.cpp:1425 (libwebcore_remaining.a.bc)content::ThreadSafeSender::Send( [...])content::RenderThreadImpl::Send( [...])thread_safe_sender.cc:24 (libcontent_child.a.bc)blink::LayoutSVGText::layout()blink::RenderBlockFlow::layoutInlineChildren( [...])LayoutSVGText.cpp:389 (libwebcore_svg.a.bc)LayoutSVGText.cpp:389 (libwebcore_svg.a.bc)blink::WorkerScriptLoader::cancel( [...])blink::DocumentThreadableLoader::cancel( [...])WorkerScriptLoader.cpp:183 (libwebcore_remaining.a.bc)blink::InlineFlowBox::addToLine( [...])[[Cr issue #51602]]content::ChildDiscardableSharedMemoryManager::AllocateLockedDiscardableMemory( [...])content::ChildDiscardableSharedMemoryManager::AllocateLockedDiscardableSharedMemory( [...])child_discardable_shared_memory_manager.cc:97 (libcontent_child.a.bc)SkPixelRef::lockPixels(SkPixe [...])blink::Document::implicitClose( [...])FrameLoader.cpp:494 (libwebcore_remaining.a.bc)blink::RenderBlockFlow::computeInlineDirectionPositionsForSegment( [...])blink::InlineFlowBox::getFlowSpacingLogicalWidth( [...])RenderBlockLineLayout.cpp:582 (libwebcore_rendering.a.bc)RenderBlockLineLayout.cpp:582 (libwebcore_rendering.a.bc)SkDiscardableMemoryChrome::lock( [...])base::internal::DiscardableMemoryShmem::Lock( [...])SkDiscardableMemory_chrome.cc:10 (libskia_chrome.a.bc)SkDiscardableMemory_chrome.cc:10 (libskia_chrome.a.bc)blink::DocumentParser::stopParsing( [...])blink::XMLHttpRequest::notifyParserStopped( [...])DocumentParser.cpp:90 (libwebcore_dom.a.bc)blink::FrameLoader::setDefersLoading( [...])blink::FrameLoader::loadHistoryItem( [...])FrameLoader.cpp:177 (libwebcore_remaining.a.bc)RenderBlockLineLayout.cpp:570 (libwebcore_rendering.a.bc)RenderBlockLineLayout.cpp:570 (libwebcore_rendering.a.bc)discardable_memory_shmem.cc:34 (libbase.a.bc)discardable_memory_shmem.cc:34 (libbase.a.bc)IPC::internal::MessagePipeReader::OnPipeError( [...])IPC::ChannelMojo::OnPipeError( [...])ipc_message_pipe_reader.cc:100 (libipc_mojo.a.bc)RenderBlockLineLayout.cpp:234 (libwebcore_rendering.a.bc)blink::DocumentThreadableLoader::cancelWithError( [...])DocumentThreadableLoader.cpp:244 (libwebcore_remaining.a.bc)blink::WebView::willEnterModalLoop( [...])blink::ScopedPageLoadDeferrer::ScopedPageLoadDeferrer( [...])WebViewImpl.cpp:317 (libblink_web.a.bc)child_discardable_shared_memory_manager.cc:187 (libcontent_child.a.bc)render_thread_impl.cc:828 (libcontent_renderer.a.bc)blink::WebSharedWorkerImpl::stopWorkerThread( [...])blink::WebSharedWorkerImpl::Loader::cancel( [...])WebSharedWorkerImpl.cpp:186 (libblink_web.a.bc)WebSharedWorkerImpl.cpp:116 (libblink_web.a.bc)content::EmbeddedSharedWorkerStub::OnChannelError( [...])content::EmbeddedSharedWorkerStub::OnTerminateWorkerContext( [...])embedded_shared_worker_stub.cc:160 (libcontent_renderer.a.bc)blink::FrameView::layout()blink::FrameView::performLayout( [...])FrameView.cpp:1015 (libwebcore_remaining.a.bc)FrameView.cpp:1015 (libwebcore_remaining.a.bc)blink::WebSharedWorkerImpl::terminateWorkerContext( [...])WebSharedWorkerImpl.cpp:433 (libblink_web.a.bc)SkDiscardablePixelRef::onNewLockPixels( [...])SkPixelRef.cpp:157 (libskia_library.a.bc)SkPixelRef.cpp:157 (libskia_library.a.bc)FrameLoader.cpp:1358 (libwebcore_remaining.a.bc)Document.cpp:2537 (libwebcore_dom.a.bc)Document.cpp:2537 (libwebcore_dom.a.bc)FrameView.cpp:857 (libwebcore_remaining.a.bc)FrameView.cpp:857 (libwebcore_remaining.a.bc)DocumentThreadableLoader.cpp:229 (libwebcore_remaining.a.bc)blink::Page::setDefersLoading( [...])Page.cpp:316 (libwebcore_remaining.a.bc)blink::XMLHttpRequest::internalAbort( [...])XMLHttpRequest.cpp:1219 (libwebcore_remaining.a.bc)embedded_shared_worker_stub.cc:294 (libcontent_renderer.a.bc)blink::RenderBlockFlow::layoutRunsAndFloats( [...])blink::RenderBlockFlow::layoutRunsAndFloatsInRange( [...])RenderBlockLineLayout.cpp:770 (libwebcore_rendering.a.bc)RenderBlockLineLayout.cpp:770 (libwebcore_rendering.a.bc)XMLHttpRequest.cpp:1105 (libwebcore_remaining.a.bc)RenderBlockLineLayout.cpp:1590 (libwebcore_rendering.a.bc)RenderBlockLineLayout.cpp:1590 (libwebcore_rendering.a.bc)RenderBlockLineLayout.cpp:860 (libwebcore_rendering.a.bc)RenderBlockLineLayout.cpp:860 (libwebcore_rendering.a.bc)SkDiscardablePixelRef.cpp:41 (libskia_library.a.bc)SkDiscardablePixelRef.cpp:41 (libskia_library.a.bc)ScopedPageLoadDeferrer.cpp:51 (libwebcore_remaining.a.bc)ipc_channel_mojo.cc:312 (libipc_mojo.a.bc)XMLHttpRequest.cpp:1557 (libwebcore_remaining.a.bc)ChromeMainmainchrome_exe_main_aura.cc:17 (chrome.bc)net::URLRequest::Read(net::IO [...])url_request.cc:744 (libnet.a.bc)Legendpreviously_vulnerable[[CVE-1900-XXXXX]]vulnerability_mitigated[[CVE-1900-XXXXX]]<<sandbox>>sandboxed<<sandbox>>private_accessordinary_function1031

@@ -1,0 +1,3221 @@
+2014 IEEE Symposium on Security and Privacy
+
+Using Frankencerts for Automated Adversarial
+
+Testing of Certiﬁcate Validation
+in SSL/TLS Implementations
+
+Chad Brubaker ∗ †
+
+Suman Jana†
+
+Sarfraz Khurshid†
+
+Vitaly Shmatikov†
+
+Baishakhi Ray‡
+∗Google
+
+†The University of Texas at Austin
+‡University of California, Davis
+
+Abstract—Modern network security rests on the Secure Sock-
+ets Layer (SSL) and Transport Layer Security (TLS) protocols.
+Distributed systems, mobile and desktop applications, embedded
+devices, and all of secure Web rely on SSL/TLS for protection
+against network attacks. This protection critically depends on
+whether SSL/TLS clients correctly validate X.509 certiﬁcates
+presented by servers during the SSL/TLS handshake protocol.
+
+We design, implement, and apply the ﬁrst methodology for
+large-scale testing of certiﬁcate validation logic in SSL/TLS
+implementations. Our ﬁrst ingredient is “frankencerts,” synthetic
+certiﬁcates that are randomly mutated from parts of real cer-
+tiﬁcates and thus include unusual combinations of extensions
+and constraints. Our second ingredient is differential testing: if
+one SSL/TLS implementation accepts a certiﬁcate while another
+rejects the same certiﬁcate, we use the discrepancy as an oracle
+for ﬁnding ﬂaws in individual implementations.
+
+Differential testing with frankencerts uncovered 208 dis-
+crepancies between popular SSL/TLS implementations such as
+OpenSSL, NSS, CyaSSL, GnuTLS, PolarSSL, MatrixSSL, etc.
+Many of them are caused by serious security vulnerabilities. For
+example, any server with a valid X.509 version 1 certiﬁcate can act
+as a rogue certiﬁcate authority and issue fake certiﬁcates for any
+domain, enabling man-in-the-middle attacks against MatrixSSL
+and GnuTLS. Several
+implementations also accept certiﬁcate
+authorities created by unauthorized issuers, as well as certiﬁcates
+not intended for server authentication.
+
+We also found serious vulnerabilities in how users are warned
+about certiﬁcate validation errors. When presented with an
+expired, self-signed certiﬁcate, NSS, Safari, and Chrome (on
+Linux) report that the certiﬁcate has expired—a low-risk, often
+ignored error—but not that the connection is insecure against a
+man-in-the-middle attack.
+
+These results demonstrate that automated adversarial testing
+with frankencerts is a powerful methodology for discovering
+security ﬂaws in SSL/TLS implementations.
+
+I.
+
+INTRODUCTION
+
+Secure Sockets Layer (SSL) and its descendant Transport
+Layer Security (TLS) protocols are the cornerstone of Internet
+security. They are the basis of HTTPS and are pervasively
+used by Web, mobile, enterprise, and embedded software to
+provide end-to-end conﬁdentiality, integrity, and authentication
+for communication over insecure networks.
+
+SSL/TLS is a big, complex protocol, described semi-
+formally in dozens of RFCs. Implementing it correctly is
+a daunting task for an application programmer. Fortunately,
+
+© 2014, Chad Brubaker. Under license to IEEE.
+DOI 10.1109/SP.2014.15
+
+114
+
+many open-source implementations of SSL/TLS are available
+for developers who need to incorporate SSL/TLS into their
+software: OpenSSL, NSS, GnuTLS, CyaSSL, PolarSSL, Ma-
+trixSSL, cryptlib, and several others. Several Web browsers
+include their own, proprietary implementations.
+
+In this paper, we focus on server authentication, which
+is the only protection against man-in-the-middle and other
+server impersonation attacks, and thus essential for HTTPS
+and virtually any other application of SSL/TLS. Server authen-
+tication in SSL/TLS depends entirely on a single step in the
+handshake protocol. As part of its “Server Hello” message,
+the server presents an X.509 certiﬁcate with its public key.
+The client must validate this certiﬁcate. Certiﬁcate validation
+involves verifying the chain of trust consisting of one or
+more certiﬁcate authorities, checking whether the certiﬁcate is
+valid for establishing SSL/TLS keys, certiﬁcate validity dates,
+various extensions, and many other checks.
+
+Systematically testing correctness of the certiﬁcate val-
+idation logic in SSL/TLS implementations is a formidable
+challenge. We explain the two main hurdles below.
+
+First problem: generating test inputs. The test inputs, i.e.,
+X.509 certiﬁcates, are structurally complex data with intricate
+semantic and syntactic constraints. The underlying input space
+is huge with only a tiny fraction of the space consisting of
+actual certiﬁcates. A simple automated technique, such as
+random fuzzing, is unlikely to produce more than a handful of
+useful inputs since a random string is overwhelmingly unlikely
+to even be parsable as a certiﬁcate.
+
+Some test certiﬁcates can be created manually, but writing
+just a small suite of such complex inputs requires considerable
+effort; manually creating a high-quality suite is simply infea-
+sible. Furthermore, the testing must include “corner cases”:
+certiﬁcates with unusual combinations of features and exten-
+sions that do not occur in any currently existing certiﬁcate but
+may be crafted by an attacker.
+
+Second problem: interpreting the results of testing. Given a
+test certiﬁcate and an SSL/TLS implementation, we can record
+whether the certiﬁcate has been accepted or rejected, but that
+does not answer the main question: is the implementation
+correct,
+if the
+certiﬁcate is rejected, is the reason given for rejection correct?
+Manually characterizing test certiﬁcates as valid or invalid
+
+is the accepted certiﬁcate valid? And,
+
+i.e.,
+
+and writing the corresponding assertions for analyzing the
+outputs observed during testing does not scale. A naive ap-
+proach to automate this characterization essentially requires
+re-implementing certiﬁcate validation, which is impractical and
+has high potential for bugs of its own. Interpreting the results
+of large-scale testing requires an oracle for certiﬁcate validity.
+
+Our contributions. We design, implement, and evaluate the
+ﬁrst approach for systematically testing certiﬁcate validation
+logic in SSL/TLS implementations. It solves both challenges:
+(1) automatically generating test certiﬁcates, and (2) automat-
+ically detecting when some of the implementations do not
+validate these certiﬁcates correctly.
+
+The ﬁrst step of our approach is adversarial input gen-
+eration. By design, our generator synthesizes test certiﬁcates
+that are syntactically well-formed but may violate many of the
+complex constraints and internal dependencies that a valid cer-
+tiﬁcate must satisfy. This enables us to test whether SSL/TLS
+implementations check these constraints and dependencies.
+
+To “seed” the generator, we built a corpus of 243,246
+real SSL/TLS certiﬁcates by scanning the Internet. Our gen-
+erator broke them down into parts, then generated over 8
+million frankencerts by mutating random combinations of
+these parts and artiﬁcial parts synthesized using the ASN.1
+grammar for X.509. By construction, frankencerts are parsable
+as certiﬁcates, yet may violate X.509 semantics. They include
+unusual combinations of critical and non-critical extensions,
+rare extension values, strange key usage constraints, odd
+certiﬁcate authorities, etc. Testing SSL/TLS implementations
+with frankencerts exercises code paths that rarely get executed
+when validating normal certiﬁcates and helps elicit behaviors
+that do not manifest during conventional testing.
+
+Our second insight is that multiple, independent imple-
+mentations of X.509 certiﬁcate validation—the very same
+implementations that we are testing—can be used as an oracle
+to detect ﬂaws in validation logic. For each frankencert, we
+compare the answers produced by OpenSSL, NSS, GnuTLS,
+CyaSSL, PolarSSL, MatrixSSL, OpenJDK, and Bouncy Castle.
+These SSL/TLS libraries are supposed to implement the same
+certiﬁcate validation algorithm and, therefore, should agree
+on every certiﬁcate. Differences in the implementations of
+functionality left unspeciﬁed by the X.509 standard may cause
+a “benign” discrepancy, but most discrepancies mean that some
+of the disagreeing SSL/TLS implementations are incorrect.
+
+Our differential mutation testing of SSL/TLS implementa-
+tions on 8,127,600 frankencerts uncovered 208 discrepancies
+between the implementations, many of which are caused by
+serious ﬂaws. For example, MatrixSSL silently accepts X.509
+version 1 certiﬁcates, making all MatrixSSL-based applications
+vulnerable to man-in-the-middle attacks: anyone with a valid
+version 1 certiﬁcate can pretend to be an intermediate certiﬁ-
+cate authority (CA), issue a fake certiﬁcate for any Internet
+domain, and that certiﬁcate will be accepted by MatrixSSL.
+
+In GnuTLS, our testing discovered a subtle bug in the
+handling of X.509 version 1 certiﬁcates. Due to a mismatch
+between two ﬂags, the code that intends to accept only locally
+trusted version 1 root certiﬁcates is actually accepting any
+version 1 CA certiﬁcate,
+including fake ones from mali-
+cious servers. This bug could not have been found without
+
+frankencerts because it is not triggered by any real certiﬁcate
+from our corpus (but, of course, a man-in-the-middle attacker
+could craft a malicious certiﬁcate to exploit this vulnerability).
+Many vulnerabilities are caused by incorrect or missing
+checks on the restrictions that root CAs impose on lower-level
+CAs. MatrixSSL does not check path length constraints. If
+a restricted CA (e.g., a corporate CA whose authority only
+extends to a particular enterprise) creates a new intermediate
+CA, who then issues certiﬁcates for any Internet domain,
+these certiﬁcates will be accepted by MatrixSSL. GnuTLS,
+CyaSSL, and PolarSSL do not check key usage constraints. As
+a consequence, an attacker who compromises the code signing
+key of some company can use it to spoof that company’s
+servers in TLS connections. Most of these ﬂaws could not
+have been discovered without frankencerts because incorrect
+validation logic is only triggered by certiﬁcates of a certain
+form, not by “normal” certiﬁcates.
+
+Even if an SSL/TLS implementation correctly rejects a
+certiﬁcate,
+the reason given to the user is very important
+because Web browsers and other interactive applications often
+allow the user to override the warning. For example, if the
+warning is that
+this may
+indicate a lazy system administrator but does not imply that
+the connection is insecure. Because the risk is low, the user
+may click through the warning. If, on the other hand, the
+certiﬁcate is not issued by a legitimate certiﬁcate authority,
+this means that the server could have been impersonated and
+the connection may be insecure.
+
+the certiﬁcate expired yesterday,
+
+Our differential testing uncovered serious vulnerabilities in
+how SSL/TLS implementations report errors. When presented
+with an expired, self-signed certiﬁcate, NSS reports that the
+certiﬁcate has expired but not that the issuer is invalid. This
+vulnerability found its way into Web browsers such as Chrome
+on Linux and Safari. Since users tend to click through expired-
+certiﬁcate warnings—and are advised to do so [1]—this ﬂaw
+gives attackers an easily exploitable vector for man-in-the-
+middle attacks against all users of these Web browsers.
+
+In summary, adversarial test input generation and differen-
+tial mutation testing on millions of “frankencerts” synthesized
+from parts of real certiﬁcates is a powerful new technique
+for uncovering deep semantic errors in the implementations
+of SSL/TLS, the most important network security protocol.
+
+II. RELATED WORK
+
+A. Security of SSL/TLS implementations
+
+We are not aware of any prior work on systematic, auto-
+mated discovery of certiﬁcate validation vulnerabilities in the
+implementations of SSL/TLS clients.
+
+Moxie Marlinspike demonstrated several ﬂaws in the im-
+plementations of SSL/TLS certiﬁcate validation [55, 56, 57],
+including the lack of CA bit checking in Microsoft’s Cryp-
+toAPI as of 2002 [54]. More recently, the same vulnerability
+was discovered in the SSL implementation on Apple iOS [40].
+Georgiev et al. carried out a study of certiﬁcate validation
+vulnerabilities caused by the incorrect use of SSL/TLS APIs,
+as opposed to ﬂaws in the implementations of these APIs [31].
+Georgiev et al. focus primarily on the incorrect validation
+
+115
+
+of hostnames in server certiﬁcates at a different level in the
+software stack—in applications, transport libraries, and Web-
+services middleware. Fahl et al. analyzed incorrect usage of
+SSL in Android apps [29]. The class of certiﬁcate validation
+vulnerabilities analyzed in this paper is complementary to and
+has little overlap with the vulnerabilities discovered in [29, 31].
+Unlike [29, 31], we developed an automated technique for
+discovering certiﬁcate validation vulnerabilities.
+
+A survey of security issues in SSL/TLS can be found
+in [16]. Cryptographic ﬂaws in SSL/TLS implementations
+and the protocol itself—including compression, initialization,
+padding of cipher modes and message authentication codes,
+etc.—can be exploited to attack conﬁdentiality, especially
+when the protocol is used for HTTPS (HTTP over SSL) [3,
+24, 72]. By contrast, this paper is about authentication ﬂaws.
+Flaws in SSL server implementations can be exploited
+for chosen-ciphertext attacks, resulting in private key compro-
+mise [8, 9]. Flaws in pseudo-random number generation can
+produce SSL/TLS keys that are easy to compromise [38, 50].
+Hash collisions [77] and certiﬁcate parsing discrepancies
+between certiﬁcate authorities (CAs) and Web browsers [44]
+can trick a CA into issuing a valid leaf certiﬁcate with the
+wrong subject name, or even a rogue intermediate CA cer-
+tiﬁcate. By contrast, we focus on verifying whether SSL/TLS
+implementations correctly handle invalid certiﬁcates.
+
+Large-scale surveys of SSL certiﬁcates “in the wild” can be
+found in [19, 25, 27, 78]. Because their objective is to collect
+and analyze certiﬁcates, not to ﬁnd certiﬁcate validation errors
+in SSL/TLS implementations, they are complementary to this
+paper: for example, their certiﬁcate corpi can be used to “seed”
+frankencert generation (Section VII). Delignat-Lavaud et al.
+note that GnuTLS ignores unsupported critical extensions [19],
+matching what we found with automated testing.
+
+Akhawe et al. surveyed SSL warnings in Web browsers [1].
+One of their recommendations is to accept recently expired
+certiﬁcates. As we show in Section IX, several Web browsers
+show just the “Expired certiﬁcate” warning even if the expired
+certiﬁcate is not issued by a trusted CA and the connection is
+thus insecure. Akhawe and Felt performed a large-scale user
+study of the effectiveness of browser security warnings [2].
+One of their ﬁndings is that users are less likely to click
+through an “Expired certiﬁcate” warning than through an
+“Untrusted issuer” warning, possibly because the former tend
+to occur at websites that previously did not produce any
+warnings. Amann et al. demonstrated that certain signs of man-
+in-the-middle attacks, such as certiﬁcates never seen before for
+a given domain or issued by an unusual CA, can be caused
+by benign changes in the CA infrastructure [4]. SSL security
+indicators in mobile Web browsers were studied in [5, 6].
+
+The focus of this paper is on server certiﬁcate authentica-
+tion, which is the most common usage pattern for SSL certiﬁ-
+cates. The other direction, i.e., client certiﬁcate authentication,
+was analyzed in [21, 60]. Our adversarial testing techniques for
+ﬁnding bugs in the client-side validation of server certiﬁcates
+can also be applied to the implementations of server-side
+validation of client certiﬁcates.
+
+Several recent high-proﬁle vulnerabilities highlighted the
+need for thorough security analysis of SSL/TLS implemen-
+
+tations. The implementation of the SSL/TLS handshake in
+Mac OS and iOS accidentally did not check whether the key
+used to sign the server’s key exchange messages matches the
+public key in the certiﬁcate presented by the server, leaving this
+implementation vulnerable to server impersonation [49] (this
+vulnerability is not caused by incorrect certiﬁcate validation).
+In GnuTLS, certain errors during certiﬁcate parsing were
+accidentally interpreted as successful validation, thus enabling
+server impersonation [33]. We discuss the latter vulnerability
+in more detail in Section VIII.
+
+B. Software testing
+
+Our work introduces a novel black-box testing ap-
+proach to address two foundational software testing prob-
+lems—generation of test inputs and validation of program
+outputs (aka the “oracle” problem)—in the context of ﬁnd-
+ing security bugs, speciﬁcally in SSL/TLS implementations.
+Researchers have extensively studied these two problems
+over the last few decades in a number of contexts and de-
+veloped various automated techniques to address them. For
+example, techniques using grammars [48, 52, 58, 75, 79],
+constraints [13, 53], dedicated generators [18], fuzzing [36],
+symbolic execution [12, 35, 45, 47, 74], and genetic algo-
+rithms [7] provide automated generation of inputs for black-
+box and white-box testing, while techniques using correctness
+speciﬁcations [15], differential testing [59], and metamorphic
+testing [14] provide automated validation of program outputs.
+Differential black-box testing has been successfully used to
+ﬁnd parsing discrepancies between antivirus tools that can help
+malware evade detection [42].
+
+The use of grammars in testing dates back to the
+1970s [62] and has provided the basis for randomized [52, 58,
+75, 79] and systematic [48] techniques for ﬁnding application
+bugs. The most closely related work to ours is Yang et
+al.’s Csmith framework, which used random grammar-based
+generation of C programs to discover many bugs in production
+C compilers [79]. The key difference between Csmith and our
+work is input generation. Csmith uses purely grammar-based
+generation without actual C programs and hence only produces
+input programs with language features that are explicitly
+supported by its generation algorithm. Moreover, the design
+goal of Csmith is to generate safe programs that have a unique
+meaning and no undeﬁned behaviors. This allows Csmith to
+use a straightforward test oracle that performs identity compar-
+ison on outputs for differential testing. By contrast, our goal is
+to explore behaviors of SSL/TLS implementations that are not
+exercised by valid certiﬁcates and thus more likely to contain
+security bugs. Hence, our test generator does not need to
+ensure that test outputs conform to a restricted form. To detect
+validation errors, we cluster certiﬁcates into “buckets” based
+on the outputs produced by each SSL/TLS implementation
+when presented with a given certiﬁcate, with each bucket
+representing a discrepancy between the implementations. As
+explained in Section IX, multiple discrepancies may be caused
+by the same underlying implementation error (in our testing,
+15 root causes led to 208 discrepancies).
+
+Clustering test executions is a well-explored area, e.g.,
+to diagnose the causes of failed executions by reducing the
+number of failures to inspect [32, 41, 43, 61] or to distinguish
+failing and passing executions in the context of a single
+
+116
+
+implementation [20]. We use clustering and differential testing
+in tandem to identify incorrect behavior in the context of
+multiple implementations tested together.
+
+Our test input generator combines parts of existing real
+certiﬁcates and also injects synthetic artiﬁcial parts using
+operations that resemble combination and mutation in genetic
+algorithms [39]. In principle, it may be possible to deﬁne
+a genetic algorithm for certiﬁcate generation by customizing
+genetic combination and mutation with respect to the SSL
+certiﬁcate grammar, ﬁelds, their values, extensions, etc. The
+main challenge for effective genetic search is how to deﬁne an
+appropriate ﬁtness function, which must measure the potential
+usefulness of a candidate input. Genetic search, as well as other
+heuristics for test input generation, can complement systematic
+exploration using guided sampling [7].
+
+The classic idea of symbolic execution [47] as well as
+its more recent variants, e.g., where concrete inputs guide
+symbolic execution [12, 35, 74], enable a form of white-box
+test input generation that has received much recent attention
+for ﬁnding security bugs [36, 37, 46, 73]. Godefroid et
+al.’s SAGE [36] introduced white-box fuzzing that executes
+a given suite of inputs, monitors their execution paths, and
+builds symbolic path condition constraints, which are sys-
+tematically negated to explore their neighboring paths. SAGE
+found several new bugs in Windows applications, including
+media players and image processors. Grammar-based whitebox
+fuzzing [34] uses a grammar to enumerate valid string inputs
+by solving constraints over symbolic grammar tokens. A
+security-focused application using a context-free fragment of
+the JavaScript grammar to test the code generation module of
+the Internet Explorer 7 JavaScript interpreter showed that the
+use of the grammar provides enhanced code coverage. Similar
+but independent work on CESE [51] uses symbolic grammars
+with symbolic execution to create higher-coverage suites for
+select UNIX tools, albeit in a non-security setting.
+
+Kiezun et al.’s Ardilla [46] uses concolic execution to
+generate test inputs that drive its dynamic taint analysis and
+mutates the inputs using a library of attack patterns to create
+SQL injection and cross-site scripting attacks. Halfond et
+al. [37] show how symbolic execution can more precisely
+identify parameter values that deﬁne the interfaces of Web
+applications, and facilitate ﬁnding vulnerabilities. Saxena et
+al.’s Kudzu [73] uses a symbolic execution framework based
+on a customized string constraint language and solver to ﬁnd
+code injection vulnerabilities in JavaScript clients.
+
+Brumley et al. [10] proposed a white-box symbolic analysis
+technique to guide differential
+testing [59]. Their analysis
+is driven by concrete executions in the spirit of dynamic
+symbolic (aka concolic) execution [12, 35, 74]. They use
+weakest preconditions [23] over select execution paths together
+with constraint solving to compute inputs that likely cause
+parsing discrepancies between different implementations of
+protocols such as HTTP and NTP.
+
+There are two basic differences between our methodology
+and that of [10]. First, our black-box approach does not require
+analyzing either the source, or the binary code. Second, the
+need to solve path constraints limits the scalability of the
+approach described in [10]. Generating even a single test
+certiﬁcate using their technique requires symbolic analysis of
+
+both the parsing code and the certiﬁcate validation code hidden
+deep inside the program. SSL certiﬁcates are structurally more
+complex than HTTP and NTP inputs, and, crucially, the certiﬁ-
+cate validation logic lies deeper in SSL/TLS implementations
+than the X.509 parsing code. For example, a MiniWeb server
+responding to a GET /index.html request (one of the case
+studies in [10]) executes 246,910 instructions. By contrast, the
+simplest of our test cases—an OpenSSL client processing a
+certiﬁcate chain of length 1 with zero extensions—executes
+27,901,961 instructions.
+
+An interesting avenue for future research is to explore
+whether the two approaches could be used in conjunction and,
+in particular, whether generation of test SSL certiﬁcates can
+beneﬁt from the fact that the technique of [10] performs a
+directed search for likely behavioral differences.
+
+More recent work by Ramos and Engler on UC-KLEE [63],
+which integrates KLEE [11] and lazy initialization [45], ap-
+plies more comprehensive symbolic execution over a bounded
+exhaustive execution space to check code equivalence; UC-
+KLEE has been effective in ﬁnding bugs in different tools,
+including itself. In principle, such goal-directed approaches
+are very powerful:
+they integrate the spirit of differential
+testing with symbolic analysis to create formulas that explic-
+itly capture behavioral differences of interest. However, the
+resulting formulas in the context of structurally complex data
+can be exceedingly complex since they represent destructive
+updates in imperative code using a stateless logic. Scaling such
+approaches to SSL/TLS implementations is an open problem.
+In summary, while approaches based on symbolic execu-
+tion have been successful in ﬁnding bugs in many applications,
+their central requirement—the need to solve constraints for
+each execution path explored in symbolic execution—is the
+basic bottleneck that limits their scalability and applicability
+for programs that operate on complex data types, such as
+the structurally complex SSL certiﬁcates, and have complex
+path conditions that can be impractical to solve. By contrast,
+our test generation algorithm is not sensitive to the
+implementation-level complexity of the programs being
+tested. Instead, it focuses on the systematic exploration of
+the space of likely useful inputs and thus reduces the overall
+problem complexity by de-coupling the complexity of the input
+space from that of the SSL/TLS implementations.
+
+Srivastava et al. [76] use static differential analysis, which
+to analyze
+does not perform test generation or execution,
+consistency between different
+implementations of the Java
+Class Library API and use the discrepancies as an oracle
+to ﬁnd ﬂaws in the implementations of access-control logic.
+While static analysis and dynamic analysis, such as testing,
+are well-known to have complementary strengths, they can also
+be applied in synergy [28]. For example, for testing SSL/TLS
+implementations, static dataﬂow analysis could potentially
+reduce the space of candidate inputs for the test generator by
+focusing it to exercise fewer values or fewer combinations of
+values for certain certiﬁcate extensions.
+
+III. OVERVIEW OF SSL/TLS
+
+A. SSL/TLS protocol
+
+The Secure Sockets Layers (SSL) Protocol Version 3.0 [70]
+and its descendants, Transport Layer Security (TLS) Protocol
+
+117
+
+Version 1.0 [64], Version 1.1 [67], and Version 1.2 [68], are the
+“de facto” standard for secure Internet communications. The
+primary goal of the SSL/TLS protocol is to provide privacy
+and data integrity between two communicating applications.
+In this paper, we focus on a particular security guarantee
+promised by SSL/TLS: server authentication. Server authen-
+tication is essential for security against network attackers. For
+example, when SSL/TLS is used to protect HTTP communi-
+cations (HTTPS), server authentication ensures that the client
+(e.g., Web browser) is not mistaken about the identity of the
+Web server it is connecting to. Without server authentication,
+SSL/TLS connections are insecure against man-in-the-middle
+attacks, which can be launched by malicious Wi-Fi access
+points, compromised routers, etc.
+
+The SSL/TLS protocol comprises the handshake protocol
+and the record protocol. Server authentication is performed
+entirely in the handshake protocol. As part of the hand-
+shake, the server presents an X.509 certiﬁcate with its public
+key [69]. The client must validate this certiﬁcate as described
+in Section IV. If the certiﬁcate is not validated correctly,
+authentication guarantees of SSL/TLS do not hold.
+
+Certiﬁcate validation in SSL/TLS critically depends on
+certiﬁcate authorities (CAs). Consequently, we analyze the
+correctness of SSL/TLS implementations under the assumption
+that the CAs trusted by the client correctly verify the identities
+of the servers to whom they issue certiﬁcates. If this assump-
+tion does not hold—e.g., a trusted CA has been compromised
+or tricked into issuing false certiﬁcates [17, 22]—SSL/TLS is
+not secure regardless of whether the client is correct or not.
+
+In summary, we aim to test if the implementations of
+SSL/TLS clients correctly authenticate SSL/TLS servers in the
+presence of a standard “network attacker,” who can control any
+part of the network and run his own servers, possibly with
+their own certiﬁcates, but does not control legitimate servers
+and cannot forge their certiﬁcates.
+
+B. SSL/TLS implementations
+
+In this paper, we focus primarily on testing open-source
+implementations of SSL/TLS. Our testing methodology can be
+successfully applied to closed-source implementations, too (as
+illustrated by our testing of Web browsers), but having access
+to the source code makes it easier to identify the root causes
+of the ﬂaws and vulnerabilities uncovered by our testing.
+
+We tested the following SSL/TLS implementations:
+OpenSSL, NSS, CyaSSL, GnuTLS, PolarSSL, MatrixSSL,
+cryptlib, OpenJDK, and Bouncy Castle. These implementa-
+tions are distributed as open-source software libraries so that
+they can be incorporated into applications that need SSL/TLS
+for secure network communications.
+
+Many vulnerabilities stem from the fact that applications
+use these libraries incorrectly [31], especially when some
+critical part of SSL/TLS functionality such as verifying the
+server’s hostname is delegated by the SSL/TLS library to the
+application. In this paper, however, we focus on ﬂaws within
+the libraries, not in the applications that use them, with one
+exception—Web browsers.
+
+HTTPS, the protocol for protecting Web sessions from
+network attackers, is perhaps the most important application of
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+	
+
+
+
+
+
+
+
+
+		
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+	
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+	
+
+
+
+
+
+
+
+		
+
+
+
+		
+
+
+
+	
+
+
+
+	
+
+
+
+
+	
+
+
+
+	
+
+	
+
+	
+
+Fig. 1: A sample X509 certiﬁcate chain.
+
+SSL/TLS. Therefore, we extend our testing to Web browsers,
+all of which must support HTTPS: Firefox, Chrome, Internet
+Explorer, Safari, Opera, and WebKit (the latter is a browser
+“engine” rather than a standalone browser). Web browsers
+typically contain proprietary implementations of SSL/TLS,
+some of which are derived from the libraries listed above.
+For example, Firefox and Chrome use a version of NSS, while
+WebKit has a GnuTLS-based HTTPS back end, among others.
+
+IV. CERTIFICATE VALIDATION IN SSL/TLS
+
+The only mechanism for server authentication in SSL/TLS
+is the client’s validation of the server’s X.509 public-key
+certiﬁcate presented during the handshake protocol. Client
+authentication is less common (in a typical HTTPS browsing
+session, only the server is authenticated). It involves symmetric
+steps on the server side to validate the client’s certiﬁcate.
+
+X.509 certiﬁcate validation is an extremely complex pro-
+cedure, described in several semi-formal RFCs [64, 65, 66, 67,
+68, 69, 70, 71]. Below, we give a very brief, partial overview
+of some of the key steps.
+
+Chain of trust veriﬁcation. Each SSL/TLS client trusts a
+number of certiﬁcate authorities (CAs), whose X.509 certiﬁ-
+cates are stored in the client’s local “root of trust.” We will
+refer to these trusted certiﬁcate authorities as root CAs, and
+to their certiﬁcates as root certiﬁcates. The list of root CAs
+varies from application to application and from OS to OS.
+For example, the Firefox Web browser ships with 144 root
+certiﬁcates pre-installed, while the Chrome Web browser on
+Linux and MacOS relies on the OS’s list of root certiﬁcates.
+Each X.509 certiﬁcate has an “issuer” ﬁeld that contains
+the name of the certiﬁcate authority (CA) that
+issued the
+certiﬁcate. The certiﬁcate presented by the server (we’ll call it
+the leaf certiﬁcate) should be accompanied by the certiﬁcate
+of the issuing CA and, if the issuing CA is not a root CA, the
+certiﬁcates of higher-level CAs all the way to a root CA.
+
+118
+
+As part of certiﬁcate validation, the client must construct a
+valid chain of certiﬁcates starting from the leaf certiﬁcate and
+ending in a root certiﬁcate (see an example in Fig. 1). Below,
+we list some of the checks involved in validating the chain.
+These brief synopses are very informal and incomplete, please
+refer to RFC 5280 [69] for the full explanation.
+
+Each certiﬁcate in the chain must be signed by the CA
+immediately above it and the root (“anchor”) of the chain must
+be one of the client’s trusted root CAs.
+
+The current time must be later than the value of each
+certiﬁcate’s “not valid before” ﬁeld and earlier than the value
+of each certiﬁcate’s “not valid after” ﬁeld, in the time zone
+speciﬁed in these ﬁelds. If no time zone is speciﬁed, then
+Greenwich Mean Time (GMT) should be used.
+
+If a CA certiﬁcate in an X.509 version 1 or version 2
+certiﬁcate, then the client must either verify that it is indeed
+a CA certiﬁcate through out-of-band means or reject
+the
+certiﬁcate [69, 6.1.4(k)]. The following checks apply only to
+X.509 version 3 certiﬁcates.
+
+the basic constraints extension:
+
+For each CA certiﬁcate in the chain, the client must verify
+• The “CA bit” must be set. If the CA bit is not set, then
+the current certiﬁcate cannot act as a root or intermediate
+certiﬁcate in a certiﬁcate chain. The chain is not valid.
+• If the CA certiﬁcate contains a “path length” constraint,
+the number of intermediate CAs between the leaf certiﬁ-
+cate and the current certiﬁcate must be less than the path
+length. For example, if the CA certiﬁcate has path length
+of 0, it can be used only to issue leaf certiﬁcates.
+Every extension in a certiﬁcate is designated as critical
+or non-critical. A certiﬁcate with a critical extension that the
+client does not recognize or understand must be rejected.
+
+If a CA certiﬁcate in the chain contains a name constraints
+extension, then the subject name in the immediately following
+certiﬁcate in the chain must satisfy the listed name constraints.
+Name constraints are used to limit the subjects that a CA can
+issue certiﬁcates for, by listing permitted or excluded subjects.
+This extension is critical.
+
+If a certiﬁcate in the chain contains a key usage extension,
+the value of this extension must include the purpose that the
+certiﬁcate is being used for. For example, the key usage of
+an intermediate certiﬁcate must include keyCertSign (it
+must also have the CA bit set in the basic constraints, as
+described above). If a leaf certiﬁcate contains the server’s
+RSA public key that will be used to encrypt a session key,
+its key usage extension must include keyEncipherment.
+CAs should mark this extension as critical.
+
+Similar to key usage, if a certiﬁcate contains an extended
+key usage extension, the value of this extension must include
+the purpose that the certiﬁcate is being used for, e.g., server
+authentication in the case of a leaf certiﬁcate.
+
+If a certiﬁcate contains an Authority Key Identiﬁer (AKI)
+extension, then its value—containing the key identiﬁer and/or
+issuer and serial number—should be used to locate the public
+key for validating the certiﬁcate. This extension is used when
+the certiﬁcate issuer has multiple public keys.
+
+If a certiﬁcate contains a Certiﬁcate Revocation List (CRL)
+distribution points extension, the client should obtain CRL
+information as speciﬁed by this extension.
+
+The above list omits many important checks and subtleties
+of certiﬁcate validation. For example, CA certiﬁcates may
+contain policy constraints that limit their authority in various
+ways [69, 4.2.1.11]. Policy constraints extension should be
+marked as critical, although in practice few SSL/TLS imple-
+mentations understand policy constraints.
+
+Hostname veriﬁcation. After the chain of trust has been val-
+idated, the client must verify the server’s identity by checking
+if the fully qualiﬁed DNS name of the server it wants to talk to
+matches one of the names in the “SubjectAltNames” extension
+or the “Common Name” ﬁeld of the leaf certiﬁcate. Some SS-
+L/TLS implementations perform hostname veriﬁcation, while
+others delegate it to higher-level applications (see Table IX).
+
+V. CURRENT TESTING PRACTICES FOR SSL/TLS
+
+IMPLEMENTATIONS
+
+Most SSL/TLS implementations analyzed in this paper
+ship with several pre-generated X.509 certiﬁcates intended for
+testing (Table I). These certiﬁcates differ only in a few ﬁelds,
+such as hashing algorithms (SHA-1, MD5, etc.), algorithms
+for public-key cryptography (DSA, RSA, Difﬁe-Hellman, etc.),
+and the sizes of public keys (512 bits, 1024 bits, etc.).
+OpenSSL uses a total of 2 certiﬁcates to test client and server
+authentication, respectively; the rest are intended to test other
+functionalities such as certiﬁcate parsing.
+
+TABLE I: Number of SSL/TLS certiﬁcates used by different
+implementations for testing
+
+Implementation
+NSS
+GnuTLS
+OpenSSL
+PolarSSL
+CyaSSL
+MatrixSSL
+
+Certiﬁcate count
+64
+51
+44
+18
+9
+9
+
+Testing with a handful of valid certiﬁcates is unlikely to
+uncover vulnerabilities, omissions, and implementation ﬂaws
+in the certiﬁcate validation logic. For example, we found that
+GnuTLS mistakenly accepts all versions 1 certiﬁcates even
+though the default ﬂag is set to accept only locally trusted
+version 1 root certiﬁcates (see Section IX). This vulnerability
+would have never been discovered with their existing test suite
+because it only contains version 3 certiﬁcates.
+
+Automated adversarial testing is rarely, if ever, performed
+for SSL/TLS implementations. As we demonstrate in this
+paper, systematic testing with inputs that do not satisfy the
+protocol speciﬁcation signiﬁcantly improves the chances of
+uncovering subtle implementation ﬂaws.
+
+Several of the SSL/TLS implementations in our study, in-
+cluding OpenSSL, NSS, and MatrixSSL, have been tested and
+certiﬁed according to FIPS 140-2 [30], the U.S. government
+computer security standard for cryptographic modules. As the
+results of our testing demonstrate, FIPS certiﬁcation does not
+mean that an implementation performs authentication correctly
+or is secure against man-in-the-middle attacks.
+
+119
+
+TABLE II: 20 most common issuers in our corpus
+
+Common Name (CN)
+Cybertrust Public SureServer SV CA
+Go Daddy Secure Certiﬁcation Authority
+localhost.localdomain
+GeoTrust SSL CA
+COMODO SSL CA
+RapidSSL CA
+COMODO SSL CA 2
+BMS
+DigiCert High Assurance CA-3
+Hitron Technologies Cable Modem Root Certiﬁcate Authority
+VeriSign Class 3 Secure Server CA - G3
+COMODO High-Assurance Secure Server CA
+PositiveSSL CA 2
+Entrust Certiﬁcation Authority - L1C
+Daniel
+Vodafone (Secure Networks)
+192.168.168.168
+GeoTrust DV SSL CA
+localhost
+Parallels Panel
+
+Occurrences
+30066
+13300
+7179
+7171
+7114
+6358
+5326
+4878
+4341
+4013
+3837
+3681
+2724
+2719
+2639
+2634
+2417
+2174
+2142
+2084
+
+VI. COLLECTING CERTIFICATES
+
+We used ZMap [26] to scan the Internet and attempt an
+SSL connection to every host listening on port 443. If the
+connection was successful, the certiﬁcate presented by the
+server was saved along with the IP of the host.
+
+This scan yielded a corpus of 243,246 unique certiﬁcates.
+23.5% of the collected certiﬁcates were already expired at the
+time they were presented by their servers, and 0.02% were not
+yet valid. The certiﬁcates in our corpus were issued by 33,837
+unique issuers, identiﬁed by the value of their CN (“Common
+Name”) ﬁeld. Table II shows the 20 most common issuers.
+
+23,698 of the certiﬁcates are X.509 version 1 (v1) cer-
+tiﬁcates, 4,974 of which are expired. This is important be-
+cause—as our testing has uncovered—any v1 certiﬁcate issued
+by a trusted CA can be used for man-in-the-middle attacks
+against several SSL/TLS implementations (see Section IX).
+
+20,391 v1 certiﬁcates are self-signed. Table III shows
+the 10 most common issuers of the other 3,307 certiﬁcates.
+localhost,
+localdomain, and 192.168.1.1 are all self-issued
+certiﬁcate chains, but many v1 certiﬁcates have been issued by
+trusted issuers, especially manufacturers of embedded devices.
+For example, Remotewd.com is used for remote control of
+Western Digital Smart TVs, while UBNT and ZTE make
+networking equipment. As we show in Section IX, SSL/TLS
+implementations that speciﬁcally target embedded devices han-
+dle v1 certiﬁcates incorrectly and are thus vulnerable to man-
+in-the-middle attacks using these certiﬁcates.
+
+437 certiﬁcates in our corpus have version 4, even though
+there is no X.509 version 4. 434 of them are self-signed, the
+other 3 are issued by Cyberoam, a manufacturer of hardware
+“security appliances.” We conjecture that the cause is an off-
+by-one bug in the certiﬁcate issuance software: the version ﬁeld
+in the certiﬁcate is zero-indexed, and if set to 3 by the issuer,
+it is interpreted as version 4 by SSL/TLS implementations.
+
+Table IV shows the number of times various extensions
+show up in our corpus and how many unique values we
+observed for each extension. Extensions are labeled by short
+names if known, otherwise by their object identiﬁers (OID).
+
+120
+
+TABLE III: 10 most common issuers of X.509 version 1
+certiﬁcates
+
+Common Name (CN)
+BMS
+Parallels Panel
+localhost
+brutus.neuronio.pt
+plesk
+remotewd.com
+UBNT
+localdomain
+192.168.1.1
+ZTE Corporation
+
+Occurrences
+4877
+2003
+1668
+1196
+1163
+1120
+1094
+986
+507
+501
+
+TABLE IV: Extensions observed in our corpus
+
+Name or OID
+basicConstraints
+authorityKeyIdentiﬁer
+subjectKeyIdentiﬁer
+keyUsage
+extendedKeyUsage
+crlDistributionPoints
+subjectAltName
+authorityInfoAccess
+certiﬁcatePolicies
+nsCertType
+nsComment
+1.3.6.1.4.1.311.20.2
+issuerAltName
+1.3.6.1.5.5.7.1.12
+SMIME-CAPS
+1.3.6.1.4.1.311.21.10
+1.3.6.1.4.1.311.21.7
+privateKeyUsagePeriod
+2.5.29.1
+nsRevocationUrl
+nsCaRevocationUrl
+nsCaPolicyUrl
+nsSslServerName
+nsBaseUrl
+1.2.840.113533.7.65.0
+2.16.840.1.113719.1.9.4.1
+nsRenewalUrl
+2.5.29.80
+qcStatements
+2.5.29.7
+2.16.840.1.113733.1.6.15
+2.5.29.10
+1.3.6.1.4.1.3401.8.1.1
+freshestCRL
+subjectDirectoryAttributes
+1.3.6.1.4.1.311.10.11.11
+2.5.29.3
+2.16.840.1.113733.1.6.7
+1.3.6.1.4.4324.33
+1.3.6.1.4.4324.36
+1.3.6.1.4.4324.34
+1.3.6.1.4.4324.35
+1.2.40.0.10.1.1.1
+1.3.6.1.4.1.311.21.1
+1.3.6.1.4.1.7650.1
+1.3.6.1.4.1.311.10.11.87
+1.3.6.1.4.1.311.10.11.26
+1.3.6.1.4.1.8173.2.3.6
+1.2.40.0.10.1.1.2
+2.5.29.4
+1.2.250.1.71.1.2.5
+1.3.6.1.4.1.6334.2.2
+
+Occurrences
+161723
+161572
+151823
+132970
+131453
+126579
+101622
+89005
+81264
+63913
+5870
+2897
+1519
+1474
+915
+875
+873
+871
+175
+112
+104
+74
+73
+63
+59
+54
+33
+10
+8
+7
+6
+5
+4
+4
+4
+3
+2
+2
+2
+2
+2
+2
+2
+2
+1
+1
+1
+1
+1
+1
+1
+1
+
+Unique values
+13
+21990
+72496
+54
+83
+4851
+59767
+3864
+418
+21
+185
+11
+115
+2
+4
+16
+312
+798
+133
+39
+52
+32
+17
+31
+6
+26
+7
+10
+2
+7
+6
+1
+4
+3
+2
+3
+1
+2
+2
+2
+2
+1
+2
+1
+1
+1
+1
+1
+1
+1
+1
+1
+
+VII. GENERATING FRANKENCERTS
+
+The key challenge in generating test inputs for SSL/TLS
+implementations is how to create strings that (1) are parsed
+as X.509 certiﬁcates by the implementations, but (2) exercise
+parts of their functionality that are rarely or never executed
+when processing normal certiﬁcates.
+
+We use our corpus of real certiﬁcates (see Section VI) as
+the source of syntactically valid certiﬁcate parts. Our algorithm
+them assembles these parts into random combinations we
+call
+frankencerts. One limitation of the certiﬁcates in our
+corpus is that they all conform to the X.509 speciﬁcation. To
+test how SSL/TLS implementations behave when faced with
+syntactically valid certiﬁcates that do not conform to X.509,
+we also synthesize artiﬁcial certiﬁcate parts and add them to
+the inputs of the frankencerts generator (see Section VII-B).
+
+A. Generating frankencerts
+Algorithm 1 describes
+
+a
+
+the generation of
+
+single
+frankencert. Our prototype implementation of Frankencert
+is based on OpenSSL. It uses parts randomly selected from
+the corpus, with two exceptions: it generates a new RSA key
+and changes the issuer so that it can create chains where the
+generated frankencert acts as an intermediate certiﬁcate. The
+issuer ﬁeld of each frankencert must be equal to the subject of
+the certiﬁcate one level higher in the chain, or else all tested
+implementations fail to follow the chain and do not attempt
+to validate any other part of the certiﬁcate. For every other
+ﬁeld, the generator picks the value from a randomly chosen
+certiﬁcate in the corpus (a different certiﬁcate for each ﬁeld).
+Extensions are set as follows. The generator chooses a
+random number of extensions from among all extensions
+observed in the corpus (Table IV). For each extension,
+it
+randomly chooses a value from the set of all observed values
+for that extension. Each value, no matter how common or rare,
+has an equal probability of appearing in a frankencert.
+
+We use two CAs as roots of trust, with an X.509 version 1
+certiﬁcate and an X.509 version 3 certiﬁcate, respectively. For
+the purposes of testing, both root CAs are installed in the local
+root of trust and thus trusted by all tested SSL/TLS clients.
+
+Each frankencert is a well-formed X.509 certiﬁcate signed
+by a locally trusted CA, but it may be invalid for a number of
+reasons. By design, the frankencert generator does not respect
+the constraints on X.509 extensions. It also randomly desig-
+nates extensions as critical or non-critical in each generated
+frankencert, violating the requirement that certain extensions
+must be critical (Section IV). This allows us to test whether
+SSL/TLS implementations reject certiﬁcates with unknown
+critical extensions, as required by the X.509 RFC [69].
+
+For certiﬁcate chains, we use between 0 and 3 frankencerts.
+Each intermediate certiﬁcate uses the previous certiﬁcate’s
+(randomly chosen) subject as its issuer and is signed by the
+previous certiﬁcate, creating a chain that SSL/TLS implemen-
+tations can follow. These chains are well-formed, but may
+still be invalid because of the contents of random frankencerts
+acting as intermediate certiﬁcates. For example, the key us-
+age extension of an intermediate certiﬁcate may not include
+keyCertSign, as required by the X.509 RFC [69], or an
+
+121
+
+intermediate certiﬁcate may violate a name constraint which
+limits the set of subjects it is allowed to certify.
+
+else
+
+end if
+
+if f ield =“key” then
+
+new cert ← Create a blank cert
+for all f ield ∈ new cert do
+
+new cert.key ← Create a random key
+else if f ield =“issuer” then
+new cert.issuer ← issuer
+random cert ← CHOICE(certs)
+new cert.f ield ← random cert.f ield
+
+Algorithm 1 Generating a single frankencert
+1: procedure FRANKENCERT(certs, exts, issuer)
+2:
+3:
+4:
+5:
+6:
+7:
+8:
+9:
+10:
+11:
+12:
+13:
+14:
+15:
+16:
+17:
+18:
+19:
+20:
+21:
+22:
+23:
+24:
+25: end procedure
+
+random id ←CHOICE(exts)
+random val ←CHOICE(exts[random id])
+new cert.extensions[i].id ← random id
+new cert.extensions[i].val ← random val
+if RANDOM < 0.05 then
+FLIP( new cert.extensions[i].critical)
+
+end for
+num exts ←RANDOM(0, 10)
+for i ∈ 1..num exts do
+
+end for
+SIGN(new cert, issuer.key)
+return new cert
+
+end if
+
+issuer ← ca
+chain ← ∅
+exts ←GETEXTENSIONS(certs)
+for i ∈ 1..length do
+chain[i] ←FRANKENCERT(certs, exts, issuer)
+issuer ← chain[i]
+
+Algorithm 2 Generating a chain of frankencerts
+1: procedure FRANKENCHAIN(certs, ca, length)
+2:
+3:
+4:
+5:
+6:
+7:
+8:
+9:
+10: end procedure
+
+end for
+return chain
+
+B. Generating synthetic mutations
+
+as
+
+in the
+
+frankencert
+
+The purpose of synthetic certiﬁcate parts is to test how
+SSL/TLS implementations react to extension values that follow
+the ASN.1 grammar for X.509 but do not conform to the X.509
+speciﬁcation.
+Taking a
+
+input, we ﬁrst parse
+all
+certiﬁcate using OpenSSL.
+extensions present
+The critical bit and the rest of
+the extension value
+are extracted using X509 EXTENSION get critical() and
+X509 EXTENSION get data(), respectively. Then, for each
+of these extensions, the extension value is replaced with a
+randomly generated ASN.1 string and a null character (0)
+is probabilistically injected into this string. Because most of
+the SSL/TLS implementations in our testing are written in
+C, and C strings are terminated by a null character, this step
+helps verify whether implementations parse extension values
+
+uniq exts ← ∅
+for all cert ∈ certs do
+
+for all ext ∈ cert.extensions do
+
+Algorithm 3 Extracting unique extensions from a corpus of
+certiﬁcates
+1: procedure GETEXTENSIONS(certs)
+2:
+3:
+4:
+5:
+6:
+7:
+8:
+9:
+10:
+11:
+12:
+13:
+14:
+15:
+16: end procedure
+
+id ← ext.id
+val ← ext.val
+if id /∈ uniq exts then
+uniq exts[id] ← ∅
+end if
+if val /∈ uniq exts[id] then
+end if
+
+uniq exts[id] ← uniq exts[id] ∪ val
+
+end for
+
+end for
+return uniq exts
+
+correctly. Finally, the extension is randomly marked as critical
+or non-critical.
+
+VIII. TESTING SSL/TLS IMPLEMENTATIONS
+
+We tested open-source SSL/TLS libraries and several Web
+browsers. The tested libraries are OpenSSL 1.0.1e, PolarSSL
+1.2.8, GnuTLS 3.1.9.1, CyaSSL 2.7.0, MatrixSSL 3.4.2, NSS
+3.15.2, cryptlib 3.4.0-r1, OpenJDK 1.7.0 09-b30, and Bouncy
+Castle 1.49. The tested browsers are Firefox 20.0, Chrome
+30.0.1599.114 p1, WebKitGTK 1.10.2-r300, Opera 12.0, Sa-
+fari 7.0, and IE 10.0.
+
+Testing was done in parallel on 3 machines: an Ubuntu
+Linux machine with two Intel Xeon E5420 (2.5Ghz) CPUs
+and 16 GB of RAM, an Ubuntu Linux machine with an Intel
+i7-2600K (4.0Ghz) CPU and 16GB of RAM, and a Gentoo
+Linux machine with an Intel i5-3360M (2.8Ghz) CPU with
+8GB of RAM. Each machine generated and tested frankencerts
+independently, with the results merged later. The average speed
+of generating a frankencert chain with 3 certiﬁcates is 11.7ms.
+
+SSL/TLS clients. We implemented a simple client for each
+SSL/TLS library. Each client takes three arguments (host, port,
+path to the ﬁle with trusted root certiﬁcates) and makes an
+SSL 3.0 connection to the host/port. The server presents a
+frankencert. The client records the answer reported by the
+library, including error codes if any. When implementing these
+clients, we used the documentation provided by the libraries
+and followed the sample code in the documentation as closely
+as possible. We expect that most application developers using
+the library would follow the same procedure.
+
+For testing Web browsers, we created scripts with the
+same input/output format as our clients for the libraries, al-
+lowing straightforward integration of browsers into our testing
+framework. For Firefox, we used Xulrunner to make an SSL
+connection and print the output without bringing up a Firefox
+window. For Chrome, we could not ﬁnd an easy way to avoid
+launching the window. Therefore, we used a JavaScript ﬁle to
+make the connection and record the results.
+
+Each execution of a library client takes between 0.04 and
+0.10 seconds, with OpenSSL being the fastest and PolarSSL
+
+122
+
+the slowest. The browser scripts are much slower: 0.6-1.0
+seconds for Firefox and 1.1-1.4 seconds for Chrome.
+
+Differential testing. For differential testing of multiple SS-
+L/TLS implementations, we implemented a Python script that
+generates frankencerts and executes all clients against each
+frankencert. The entire script is 367 lines of code, including
+102 lines for certiﬁcate generation and 163 lines for parallel
+execution of clients. Certiﬁcates are generated in batches of
+200; executing all clients on a single batch takes 25 seconds.
+If a certiﬁcate causes disagreement between the clients (i.e.,
+the clients produce different error codes when presented with
+this certiﬁcate), the certiﬁcate is indexed by its SHA-1 hash
+and stored into the appropriate bucket. Buckets are deﬁned by
+the tuples of error codes returned by each client. For example,
+if client A accepts the certiﬁcate, client B rejects it with error
+code 34, and client C rejects it with error code 1, the certiﬁcate
+is stored into the 0-34-1 bucket. The size of each bucket is
+capped at 512 certiﬁcates.
+
+In total, we tested our clients on 8,127,600 frankencerts.
+It
+is not computationally feasible to exhaustively generate
+certiﬁcates with all possible combinations of extension values
+from Table IV, but every value of every extension appeared in
+at least one of the frankencerts used in the testing.
+
+Our
+
+testing yielded 208 distinct discrepancies be-
+tween SSL/TLS implementations, with a total of 62,022
+frankencerts triggering these discrepancies.
+
+Analysis of the results. All SSL/TLS implementations we
+tested are supposed to implement the same protocol and, in par-
+ticular, exactly the same certiﬁcate validation logic. Whenever
+one implementation accepts a certiﬁcate and another rejects the
+same certiﬁcate, their implementations of the X.509 standard
+must be semantically different. In other words, differential
+testing has no false positives. This is very important when
+testing on over 8 million inputs, because any non-negligible
+false-positive rate would have resulted in an overwhelming
+number of false positives.
+
+While all discrepancies found by differential testing indi-
+cate genuine differences between implementations, not every
+difference implies a security vulnerability. For each discrep-
+ancy, we manually analyzed the source code of the disagreeing
+implementations to identify the root cause of the disagreement
+and ﬁnd the ﬂaw (if any) in the certiﬁcate validation logic of
+one or more implementations. Because some parts of the X.509
+standard are left to the discretion of the implementation, a few
+of the discrepancies turned out to be benign. For example,
+the differing treatments of the Authority Key Identiﬁer (AKI)
+extension (Section IX-E) fall into this category.
+
+Differential testing with frankencerts suffers from false
+negatives and can miss security ﬂaws. SSL/TLS implemen-
+tations may contain code paths that are not exercised by a
+given set of frankencerts. An example of this is the recently
+discovered certiﬁcate validation bug in GnuTLS [33], which is
+only triggered by syntactically malformed certiﬁcates. It was
+not found by our testing because all frankencerts we generated
+comply with the X.509 grammar. Similarly, frankencerts will
+not trigger ﬂaws on the code paths responsible for processing
+extensions that do not occur in the certiﬁcate corpus from
+
+which these frankencerts are constructed, or the paths executed
+only for certain versions and modes of SSL/TLS, etc.
+
+Further, if all implementations make the same mistake, it
+will not manifest as a discrepancy. Finally, an implementation
+may reject an invalid certiﬁcate for the wrong reason(s). To
+reduce false negatives in the latter case, we also analyzed the
+discrepancies between the reported validation errors.
+
+Analysis of error reporting. Proper error reporting is critical
+for SSL/TLS implementations because a trivial, low-risk warn-
+ing (e.g., expired certiﬁcate) may accidentally hide or mask a
+severe problem (e.g., invalid certiﬁcate issuer).
+
+Not every SSL/TLS implementation produces ﬁne-grained
+error codes
+that are easy to translate into a human-
+understandable reason for rejection. Many simply reject the
+certiﬁcate and return a generic error. If the certiﬁcate is invalid
+for multiple reasons, all libraries except GnuTLS return only
+one error value, but some allow the application to extract more
+error codes through additional function calls. This is fraught
+with peril because the application may forget to make these
+additional calls and thus allow a less severe error to mask a
+serious problem with the certiﬁcate.
+
+Therefore, we limited our differential
+
+testing of error
+reporting to Web browsers, OpenSSL, NSS, GnuTLS, and
+OpenJDK. For this testing, each output was mapped to one of
+the following reasons: “Accepted,” “Invalid issuer,” “Expired,”
+“Not yet valid,” and “Unknown or invalid critical extension.”
+For Web browsers, we also included “Hostname in the certiﬁ-
+cate does not match the server.”
+
+IX. RESULTS
+
+Depending on the
+
+combination of mutations
+
+in a
+frankencert, the same ﬂaw in a given implementation of X.509
+certiﬁcate validation can produce different results. We analyzed
+208 discrepancies between the implementations found by our
+testing and attributed them to 15 distinct root causes.
+
+Table V summarizes the results. As the second column
+shows, most of the issues could not have been discovered
+without frankencerts because the certiﬁcates triggering these
+issues do not exist in our corpus (but, of course, can be crafted
+by the adversary to exploit the corresponding ﬂaw).
+
+A. Incorrect checking of basic constraints
+
+Basic constraints, described in Section IV, are an essential
+part of CA certiﬁcates. Every X.509 version 3 CA certiﬁcate
+must have the CA bit set, otherwise any domain with a
+valid leaf certiﬁcate could act as a rogue CA and issue fake
+certiﬁcates for other domains.
+
+Untrusted version 1 intermediate certiﬁcate. Before version
+3, X.509 certiﬁcates did not have basic constraints, making it
+impossible to check whether a certiﬁcate in the chain belongs
+to a valid CA except via out-of-band means. If an SSL/TLS
+implementation encounters a version 1 (v1) CA certiﬁcate that
+cannot be validated out of band, it must reject it [69, 6.1.4(k)].
+Both MatrixSSL and GnuTLS accept chains containing
+v1 certiﬁcates. As we explain below,
+this can make any
+application based on MatrixSSL or GnuTLS vulnerable to
+
+man-in-the-middle attacks. In MatrixSSL, the following code
+silently skips the basic constraints check for any certiﬁcate
+whose version ﬁeld is 0 or 1 (encoding X.509 version 1 or 2,
+respectively, because the version ﬁeld is zero-indexed):
+
+/* Certificate authority constraint only available in
+
+version 3 certs */
+
+if ((ic->version > 1) && (ic->extensions.bc.ca<= 0)) {
+
+psTraceCrypto("Issuer does not have basicConstraint
+
+CA permissions\n");
+
+sc->authStatus = PS_CERT_AUTH_FAIL_BC;
+return PS_CERT_AUTH_FAIL_BC;
+
+}
+
+GnuTLS, on the other hand, contains a very subtle error.
+This error could not have been uncovered without frankencerts
+because none of the real certiﬁcate chains in our corpus contain
+v1 intermediate certiﬁcates.
+
+GnuTLS has three ﬂags that an application can set
+to customize the library’s
+treatment of v1 CA certiﬁ-
+cates: GNUTLS_VERIFY_ALLOW_X509_V1_CA_CRT (only accept v1
+root certiﬁcates), GNUTLS_VERIFY_ALLOW_ANY_X509_V1_CA_CRT (ac-
+cept v1 certiﬁcates for root and intermediate CAs), and
+GNUTLS_VERIFY_DO_NOT_ALLOW_X509_V1_CA_CRT (reject all v1 CA
+certiﬁcates). Only GNUTLS_VERIFY_ALLOW_X509_V1_CA_CRT is set by
+default. The intention is good: the application may locally trust
+a v1 root CA, but, to prevent other customers of that root CA
+from acting as CAs themselves, no v1 intermediate certiﬁcates
+should be accepted.
+
+The relevant part of GnuTLS certiﬁcate validation code
+is shown below (adapted from lib/x509/verify.c). After a
+root v1 certiﬁcate has been accepted, GnuTLS needs to
+prevent any further v1 certiﬁcates from being accepted. To
+this end, it clears the GNUTLS_VERIFY_ALLOW_X509_V1_CA_CRT ﬂag
+on line 12 before calling _gnutls_verify_certificate2. The
+latter function accepts v1 certiﬁcates unless a different ﬂag,
+GNUTLS_VERIFY_DO_NOT_ALLOW_X509_V1_CA_CRT is set (line 25).
+
+unsigned int _gnutls_x509_verify_certificate(...)
+{
+
+...
+
+/* verify the certificate path (chain) */
+for (i = clist_size - 1; i > 0; i--)
+{
+
+/* note that here we disable this V1 CA flag. So
+
+that no version 1
+
+* certificates can exist in a supplied chain.
+*/
+if (!(flags &
+
+GNUTLS_VERIFY_ALLOW_ANY_X509_V1_CA_CRT))
+
+flags &= ˜(GNUTLS_VERIFY_ALLOW_X509_V1_CA_CRT);
+
+if ((ret = _gnutls_verify_certificate2 (...)) ==
+
+0)
+
+/* return error */
+
+{
+
+}
+
+}
+...
+
+}
+
+int _gnutls_verify_certificate2(...)
+{
+
+...
+if (!(flags & GNUTLS_VERIFY_DISABLE_CA_SIGN) &&
+
+((flags &
+
+GNUTLS_VERIFY_DO_NOT_ALLOW_X509_V1_CA_CRT)
+
+|| issuer_version != 1))
+
+{
+
+if (check_if_ca (cert, issuer, flags) == 0)
+
+{
+
+/*return error*/
+...
+
+1
+2
+3
+4
+5
+6
+7
+8
+
+9
+10
+11
+
+12
+13
+
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+
+26
+27
+28
+29
+30
+31
+
+123
+
+TABLE V: Semantic discrepancies in certiﬁcate validation (incorrect answers in bold)
+
+Problem
+
+Untrusted version 1 intermediate CA
+certiﬁcate
+Untrusted version 2 intermediate CA
+certiﬁcate
+
+Version 1 certiﬁcate with valid basic
+constraints
+Intermediate CA not authorized to is-
+sue further intermediate CA certiﬁ-
+cates, but followed in the chain by an
+intermediate CA certiﬁcate
+. . . followed by a leaf CA certiﬁcate
+Intermediate CA not authorized to is-
+sue certiﬁcates for server’s hostname
+Certiﬁcate not yet valid
+Certiﬁcate expired in its timezone
+CA certiﬁcate not authorized for sign-
+ing other certiﬁcates
+Server certiﬁcate not authorized for
+use in SSL/TLS handshake
+Server certiﬁcate not authorized for
+server authentication
+Certiﬁcate with unknown critical ex-
+tension
+Certiﬁcate with malformed extension
+value
+Certiﬁcate with the same issuer and
+subject and a valid chain of trust
+Issuer name does not match AKI
+Issuer serial number does not match
+AKI
+
+Certiﬁcates
+triggering
+the problem
+occur
+in
+the original
+corpus
+No
+
+No
+
+No
+
+No
+
+No
+No
+
+Yes
+Yes
+No
+
+Yes
+
+Yes
+
+No
+
+No
+
+No
+
+No
+No
+
+OpenSSL
+
+PolarSSL
+
+GnuTLS
+
+CyaSSL MatrixSSL
+
+NSS
+
+OpenJDK,
+Bouncy
+Castle
+
+Browsers
+
+reject
+
+reject
+
+accept
+
+reject
+
+reject
+reject
+
+reject
+reject
+reject
+
+reject
+
+reject
+
+reject
+
+accept
+
+reject
+
+reject
+reject
+
+reject
+
+reject
+
+reject
+
+reject
+
+reject
+reject
+
+accept
+accept
+reject
+
+accept
+
+accept
+
+reject
+
+reject
+
+reject
+
+accept
+accept
+
+accept
+
+reject
+
+reject
+
+reject
+
+accept
+
+accept
+
+reject
+
+reject
+
+accept
+accept
+
+reject
+reject
+accept
+
+accept
+
+accept
+
+accept
+
+accept
+
+accept
+
+accept
+reject
+
+reject
+accept
+
+reject
+reject
+accept
+
+accept
+
+accept
+
+accept
+
+accept
+
+reject
+
+accept
+accept
+
+accept
+
+accept
+
+accept
+
+accept
+
+accept
+accept
+
+reject
+accept
+accept
+
+accept
+
+accept
+
+accept
+
+accept
+
+accept
+
+accept
+accept
+
+reject
+
+reject
+
+reject
+
+reject
+
+reject
+reject
+
+reject
+reject
+reject
+
+reject
+
+reject
+
+reject
+
+reject
+
+reject
+
+reject
+reject
+
+reject
+
+reject
+
+reject
+
+reject
+
+reject
+reject
+
+reject
+reject
+reject
+
+reject
+
+reject
+
+reject
+
+reject
+
+reject
+
+reject
+reject
+
+reject
+
+reject
+
+Firefox: reject
+Opera, Chrome: accept
+
+reject
+
+reject
+reject
+
+reject
+reject
+reject
+
+reject
+
+reject
+
+reject
+
+reject
+
+reject
+
+reject
+reject
+
+32
+33
+34
+35
+36
+
+}
+
+}
+
+}
+/*perform other checks*/
+...
+
+There is an interesting dependency between the two
+ﬂags. To prevent intermediate v1 certiﬁcates from being ac-
+cepted, GNUTLS_VERIFY_ALLOW_X509_V1_CA_CRT must be false and
+GNUTLS_VERIFY_DO_NOT_ALLOW_X509_V1_CA_CRT must be true. The
+calling function sets the former, but not the latter. Therefore,
+although by default GnuTLS is only intended to accept root
+v1 certiﬁcates, in reality it accepts any v1 certiﬁcate.
+
+The consequences of this bug are not subtle. If an ap-
+plication based on GnuTLS trusts a v1 root CA certiﬁcate,
+then any server certiﬁed by the same root can act as a
+rogue CA, issuing fake certiﬁcates for any Internet domain
+and launching man-in-the-middle attacks against this GnuTLS-
+based application. Unfortunately, trusting v1 root certiﬁcates is
+very common. For example, Gentoo Linux by default has 13 v1
+root CA certiﬁcates, Mozilla has 9, and we observed thousands
+of CA-issued v1 leaf certiﬁcates “in the wild” (Section VI).
+
+Untrusted version 2 intermediate certiﬁcate. We never
+observed X.509 version 2 certiﬁcates “in the wild,” but, for
+the purposes of testing, did generate version 2 frankencerts.
+
+As explained above, MatrixSSL silently accepts all CA
+certiﬁcates whose version ﬁeld is less than 2 (i.e., version
+number less than 3). In GnuTLS, gnutls_x509_crt_get_version
+
+returns the actual version, not
+following check blocks version 2 certiﬁcates:
+
+the version ﬁeld, and the
+
+issuer_version = gnutls_x509_crt_get_version (issuer);
+// ...
+
+if (!(flags & GNUTLS_VERIFY_DISABLE_CA_SIGN) &&
+
+((flags &
+
+GNUTLS_VERIFY_DO_NOT_ALLOW_X509_V1_CA_CRT)
+
+|| issuer_version != 1))
+
+{
+
+}
+
+// ...
+
+Version 1 certiﬁcate with valid basic constraints. Basic
+constraints were added only in X.509 version 3, but several
+SSL/TLS implementations always verify basic constraints if
+present in the certiﬁcate regardless of its version ﬁeld.
+
+Some of our frankencert chains include version 1 interme-
+diate certiﬁcates with correct basic constraints (obviously, such
+certiﬁcates do not exist “in the wild”). OpenSSL, GnuTLS,
+MatrixSSL, CyaSSL, Opera, and Chrome accept them, Open-
+JDK and Bouncy Castle reject them, NSS and Firefox fail with
+a generic Security library failure error. Neither choice appears
+to lead to a security vulnerability.
+
+Intermediate CA not authorized to issue further intermediate
+CA certiﬁcates. When a higher-level CA certiﬁes a lower-
+level CA, it can impose various restrictions on the latter. For
+example, it can limit the number of intermediate certiﬁcates
+that may follow the lower-level CA’s certiﬁcate in a certiﬁcate
+
+124
+
+chain. This is done by setting the pathLenConstraint ﬁeld in the
+basic constraints extension of the lower-level CA’s certiﬁcate.
+For example, if path length is set to zero, then the lower-
+level CA is authorized to issue only leaf certiﬁcates, but not
+intermediate CA certiﬁcates. This is good security practice: a
+CA delegates its authority to a lower-level CA, but prevents
+the latter from delegating it any further. We observed 17 CA
+certiﬁcates with path length constraints in our corpus.
+
+MatrixSSL ignores path length constraints. This can be
+exploited by a malicious or compromised CA to evade restric-
+tions imposed by a higher-level CA. For example, suppose
+that a trusted root CA authorized a lower-level CA—call it
+EnterpriseCA—but prohibited it from creating other CAs (via
+path length constraints) and from issuing certiﬁcates for any
+domain other than enterprise.com (via name constraints—see
+Section IX-B). This provides a degree of protection if Enter-
+priseCA is compromised. If the attacker uses EnterpriseCA to
+issue a certiﬁcate for, say, google.com, this certiﬁcate should
+be rejected by any SSL/TLS implementation because it violates
+the constraints expressed in EnterpriseCA’s own certiﬁcate.
+
+This attack will succeed, however, against any application
+based on MatrixSSL. The impact of this vulnerability may be
+ampliﬁed by the fact that MatrixSSL targets embedded devices,
+whose manufacturers are the kind of organizations that are
+likely to obtain CA certiﬁcates with restricted authority.
+
+There is an interesting discrepancy in how the implemen-
+tations react when an intermediate CA whose path length is
+zero is followed by a leaf certiﬁcate that also happens to be a
+CA certiﬁcate. In our testing, only MatrixSSL and GnuTLS ac-
+cepted this chain. All other SSL/TLS implementations rejected
+it because they do not allow any CA certiﬁcate to follow an
+intermediate CA whose path length is zero. This interpretation
+is incorrect. The X.509 standard explicitly permits a leaf CA
+certiﬁcate to follow an intermediate CA whose path length is
+zero [69, Section 4.2.1.9], but only GnuTLS implements this
+part of the standard correctly.
+
+B. Incorrect checking of name constraints
+
+The higher-level CA may restrict the ability of a lower-
+level CA to issue certiﬁcates for arbitrary domains by including
+a name constraint in the lower-level’s CA’s certiﬁcate. For
+example, if the issuing CA wants to allow the lower-level CA
+to certify only the subdomains of foo.com, it can add a name
+constraint *.foo.com to the lower-level CA’s certiﬁcate.
+
+GnuTLS, MatrixSSL, and CyaSSL ignore name constraints
+and accept the server’s certiﬁcate even if it has been issued by
+a CA that is not authorized to issue certiﬁcates for that server.
+
+C. Incorrect checking of time
+
+Every X.509 certiﬁcate has the notBefore and notAfter
+timestamp ﬁelds. The SSL/TLS client must verify that the
+current date and time in GMT (or the time zone speciﬁed in
+these ﬁelds) is within the range of these timestamps.
+
+PolarSSL ignores the notBefore timestamp and thus accepts
+certiﬁcates that are not yet valid. When verifying the notAfter
+ﬁeld, it uses local time instead of GMT or the time zone
+speciﬁed in the ﬁeld.
+
+MatrixSSL does not perform any time checks of its own
+and delegates this responsibility to the applications. The sam-
+ple application code included with MatrixSSL checks the day,
+but not the hours and minutes of the notAfter ﬁeld, and uses
+local time, not GMT or the time zone speciﬁed in the ﬁeld.
+
+D. Incorrect checking of key usage
+
+SSL/TLS clients must check the key usage and, if present,
+extended key usage extensions to verify that the certiﬁcates
+are authorized for their purpose. Leaf certiﬁcates must be
+authorized for key encipherment or key agreement, while CA
+certiﬁcates must be authorized to sign other certiﬁcates.
+
+CA certiﬁcate not authorized for signing other certiﬁcates.
+All CA certiﬁcates in the chain must include keyCertSign
+in their key usage. GnuTLS, CyaSSL, and MatrixSSL do
+not check the key usage extension in CA certiﬁcates. An
+attacker who compromises any CA key, even a key that is
+not intended or used for certiﬁcate issuance, can use it to
+forge certiﬁcates and launch man-in-the-middle attacks against
+applications based on these libraries.
+
+Server certiﬁcate not authorized for use in SSL/TLS hand-
+shake. PolarSSL, GnuTLS, CyaSSL, and MatrixSSL do not
+check the key usage extension in leaf certiﬁcates. This is
+a serious security vulnerability. For example, if an attacker
+compromises some company’s code signing certiﬁcate, which
+is only intended for authenticating code, he will be able
+to impersonate that company’s network and Web servers to
+any application based on the above SSL/TLS libraries, vastly
+increasing the impact of the attack.
+
+Server certiﬁcate not authorized for server authentication.
+PolarSSL, gnuTLS, CyaSSL and MatrixSSL do not check the
+extended key usage extension. Given a certiﬁcate with key
+usage that allows all operations and extended key usage that
+only allows it to be used for TLS client authentication (or any
+purpose other than server authentication), these libraries accept
+the certiﬁcate for server authentication.
+
+E. Other discrepancies in extension checks
+
+Unknown critical extensions. If an SSL/TLS implementation
+does not recognize an extension that is marked as critical, it
+must reject the certiﬁcate. GnuTLS, CyaSSL, and MatrixSSL
+accept certiﬁcates with unknown critical extensions.
+
+Malformed extension values. Given a certiﬁcate with a known
+non-critical extension whose value is syntactically well-formed
+ASN.1 but not a valid value for that extension, OpenSSL,
+GnuTLS, CyaSSL, and MatrixSSL accept it, while the other
+libraries and all browsers reject it.
+
+Inconsistencies in the deﬁnition of self-signed. Self-issued
+certiﬁcates are CA certiﬁcates in which the issuer and subject
+are the same entity [69]. Nevertheless, given a (very odd)
+certiﬁcate whose subject is the same as issuer but that also
+has a valid chain of trust, GnuTLS and MatrixSSL accept it.
+
+Inconsistencies between the certiﬁcate’s Authority Key Iden-
+tiﬁer and its issuer. The Authority Key Identiﬁer (AKI)
+extension differentiates between multiple certiﬁcates of the
+
+125
+
+same issuer. When an AKI is present in a certiﬁcate issued
+by CA whose name is A, but the AKI points to a certiﬁcate
+whose subject name is B, some libraries reject, others accept.
+
+I is the most severe error. It implies that the connection is
+insecure and must be reported to the user. On the other hand,
+E is a common, relatively low-risk error.
+
+If the serial number ﬁeld is absent
+
+then
+GnuTLS accepts. But if this ﬁeld is present and does not match
+the issuer’s serial number, then GnuTLS rejects.
+
+in the AKI,
+
+F. “Users. . . don’t go for the commercial CA racket”
+
+We planned to include cryptlib in our testing, but then
+discovered that it does not verify certiﬁcate chains. We let the
+following code snippet, taken from session/ssl_cli.c, speak
+for itself (there is no code inside the if block):
+
+the
+
+/* If certificate verification hasn’t been disabled
+
+, make sure that
+
+server’s certificate verifies */
+
+if( !( verifyFlags & SSL_PFLAG_DISABLE_CERTVERIFY )
+
+)
+
+{
+/* This is still too risky to enable by default
+
+because most users outside of web browsing
+don’t go for the commercial CA racket */
+
+}
+
+return( CRYPT_OK );
+
+G. Security problems in error reporting
+
+Rejection of an invalid certiﬁcate is not the end of the
+story. Web browsers and other interactive applications generate
+a warning based on the reason for rejection, show this warning
+to the user, and, in many cases, allow the user to override the
+dialog and proceed.
+
+Different errors have different security implications. A re-
+cently expired, but otherwise valid certiﬁcate may be evidence
+of a sloppy system administrator who forgot to install a new
+certiﬁcate, but does not imply that the SSL/TLS connection
+will be insecure. “Expired certiﬁcate” warnings are sufﬁciently
+common that users have learned to ignore them and browser
+developers are even advised to suppress them [1].
+
+If, on the other hand, the certiﬁcate issuer is not valid, this
+means that the server cannot be authenticated and the con-
+nection is not secure against man-in-the-middle attacks. If the
+server’s hostname does not match the subject of the certiﬁcate,
+the user may inspect both names and decide whether to proceed
+or not. For example, if the hostname (e.g., bar.foo.com) is
+a subdomain of the common name in the certiﬁcate (e.g.,
+foo.com), the user may chalk the discrepancy up to a minor
+misconﬁguration and proceed.
+
+To test whether SSL/TLS implementations report certiﬁcate
+testing on leaf
+
+errors correctly, we performed differential
+certiﬁcates with all combinations of the following:
+
+timestamp in the certiﬁcate.
+
+• Expired (E): Current
+time is later than the notAfter
+• Bad issuer (I): There is no valid chain of trust from the
+• Bad name (N): Neither the common name, nor the sub-
+ject alternative name in the certiﬁcate match the server’s
+hostname.
+
+certiﬁcate’s issuer to a trusted root CA.
+
+126
+
+Table VI shows the results. For these tests, we extended
+our client suite with common Web browsers, since they are
+directly responsible for interpreting the reasons for certiﬁcate
+rejection and presenting error warnings to human users.
+
+Most SSL/TLS implementations and Web browsers return
+only one error code even if the certiﬁcate is invalid for multiple
+reasons. What is especially worrisome is that some browsers
+choose to report the less severe reason. In effect, they hide a
+severe security problem under a low-risk warning. These
+cases are highlighted in bold in Table VI.
+
+For example, if a network attacker—say, a malicious Wi-
+Fi access point—presents a self-signed, very recently expired
+certiﬁcate for gmail.com or any other important domain to
+a user of Safari 7 or Chrome 30 (on Linux), the only error
+warning the user will see is “Expired certiﬁcate.” 1 Many
+users will click through this low-risk warning—even though
+authentication has failed and the server has been spoofed!
+This vulnerability is generic in all NSS-based applications:
+if the certiﬁcate is expired, that’s the only reported error code
+regardless of any other problems with the certiﬁcate.
+
+A related problem (not reﬂected in Table VI) is caused
+by “Weak Key” warnings. When presented with a certiﬁcate
+containing a 512-bit RSA key, Firefox and Chrome accept it,
+while Opera warns that the key is weak. If the certiﬁcate is
+invalid, Opera still produces the same “Weak Key” warning,
+masking other problems with the certiﬁcate, e.g., invalid issuer.
+The other warnings are available in the details tab of the error
+dialog, assuming Opera users know to look there.
+
+Finally, if Firefox encounters two certs issued by the same
+it shows an error
+CA that have the same serial number,
+message describing the problem. This message masks all other
+warnings, but there is no way for the user to override it and
+proceed, so this behavior is safe.
+
+H. Other checks
+
+Weak cryptographic hash functions. Digital signatures on
+SSL/TLS certiﬁcates can use a variety of cryptographic hash
+(aka message digest) functions. As Table VII shows, only
+NSS, GnuTLS, and Chrome reject MD5 certiﬁcates, which
+are known to be vulnerable to preﬁx-collision attacks [77].
+
+Short keys. Table VIII shows that virtually all tested imple-
+mentations support short keys (512 bits for RSA) and unusual
+key sizes (1023 bits, chosen because it occurs 87 times in our
+certiﬁcate corpus).
+
+Additional checks. Table IX summarizes which SSL/TLS
+libraries perform additional checks, such as Certiﬁcation Re-
+vocation Lists (CRL), subject alternative name, and hostname.
+The latter check is critically important for security against
+man-in-the-middle attacks [31], but often delegated by libraries
+to higher-level applications.
+
+1As this paper was being prepared,
+
+the same bug was reported in
+
+http://news.netcraft.com/archives/2013/10/16/us-government-aiding-spying-
+against-itself.html
+
+TABLE VI: Error code(s) returned by Web browsers and SSL/TLS libraries for certiﬁcates with various combinations of Bad
+Issuer (I), Expired (E), and Bad Name (N). Security vulnerabilities are highlighted in bold.
+
+Certs
+
+Firefox 20
+
+E
+I
+IE
+IN
+IEN
+N
+NE
+
+E
+I
+IE
+IN
+IEN
+N
+NE
+
+Chrome 30
+
+(Linux)
+
+E
+I
+E
+I
+N
+N
+N
+
+Opera 12
+(Linux)
+
+E
+I
+I#
+I#
+I#
+N
+E#
+
+Opera 20
+
+(Mac)
+
+!E
+!I
+*
+!I
+*
++
+!E
+
+Safari 7
+
+!E
+!I
+!E
+!I
+!E
+!N
+!E
+
+Chrome 30
+
+(Mac)
+
+E
+I
+*
+I
+*
+N
+N
+
+IE 10
+
+OpenSSL
+
+PolarSSL
+
+GnuTLS
+
+CyaSSL MatrixSSL
+
+NSS
+
+E
+I
+*
+IN
+*
+N
+NE
+
+E
+I
+I
+I-
+I-
+-
+E-
+
+E
+I
+I
+I-
+IE-
+-
+**-
+
+E
+I
+IE
+I-
+**-
+-
+E-
+
+E
+I
+**
+I-
+**-
+-
+E-
+
+E
+**
+**
+*-
+**-
+-
+E-
+
+E
+I
+E-
+I-
+E-
+-
+E-
+
+* is a generic “invalid certiﬁcate” warning without a speciﬁc error message; the user cannot override this warning
++ is a generic “invalid certiﬁcate” warning without a speciﬁc error message; the user can override this warning
+** is a generic “invalid certiﬁcate” error code
+# all errors are shown after the user clicks the details tab
+! shows a generic error message ﬁrst; the reported error is shown after user clicks the details button
+- the hostname check was not enabled for any of the tested clients
+
+TABLE VII: Support for cryptographic hash algorithms in certiﬁcate signatures
+
+Algorithm
+SHA-1
+SHA-256
+SHA-512
+MD2
+MD4
+MD5
+
+OpenSSL
+
+accept
+accept
+accept
+reject
+reject
+accept
+
+PolarSSL
+
+accept
+accept
+accept
+reject
+reject
+accept
+
+GnuTLS
+accept
+accept
+accept
+reject
+reject
+
+reject (w)
+
+CyaSSL
+accept
+accept
+reject (u)
+
+reject
+reject
+accept
+
+reject (u) : reject because hash function is unknown
+reject (w) : reject because hash function is weak
+reject (d) : reject under default settings
+
+MatrixSSL
+
+accept
+reject (u)
+reject (u)
+
+reject
+reject
+accept
+
+NSS
+accept
+accept
+accept
+reject
+reject
+
+reject (w)
+
+OpenJDK
+
+accept
+accept
+accept
+reject
+
+reject (d)
+accept
+
+BouncyCastle
+
+accept
+accept
+accept
+reject
+reject
+accept
+
+Chrome
+accept
+accept
+accept
+reject
+reject
+
+reject (w)
+
+Firefox WebKit
+accept
+accept
+accept
+accept
+accept
+accept
+reject
+reject
+reject
+reject
+accept
+accept
+
+Opera
+accept
+accept
+accept
+reject
+reject
+accept
+
+TABLE VIII: Support for short keys and unusual key sizes
+
+Key size
+512-bit RSA
+1023-bit RSA
+
+OpenSSL
+
+accept
+accept
+
+PolarSSL
+
+accept
+accept
+
+GnuTLS
+accept
+accept
+
+CyaSSL MatrixSSL
+accept
+accept
+
+accept
+accept
+
+NSS
+accept
+accept
+
+OpenJDK
+
+accept
+accept
+
+BouncyCastle
+
+accept
+accept
+
+Chrome
+accept
+accept
+
+Firefox WebKit
+accept
+accept
+accept
+accept
+
+Opera
+warning
+accept
+
+TABLE IX: Veriﬁcation of extra certiﬁcate ﬁelds
+
+Library
+MatrixSSL
+PolarSSL
+CyaSSL
+GnuTLS
+NSS
+OpenSSL
+
+CRL
+
+*
+Yes
+*
+Yes
+Yes
+*
+
+subjectAltName
+
+No
+Yes
+Yes
+Yes
+Yes
+*
+
+Host name
+
+No
+Yes
+Yes
+Yes
+Yes
+*
+
+* not veriﬁed by default, application must explicitly enable
+
+X. DEVELOPER RESPONSES
+
+We notiﬁed the developers of all affected SSL/TLS imple-
+
+mentations about the issues discovered by our testing.
+
+GnuTLS has ﬁxed the bug involving version 1 intermediate
+CA certiﬁcates (starting from version 3.2.11) and also created
+a patch for older versions. A security advisory (CVE-2014-
+1959) has been issued for this bug. GnuTLS used to check the
+keyUsage ﬁeld in earlier versions, but removed these checks
+after getting bug reports from developers who were using
+certiﬁcates with incorrect keyUsage ﬁelds.2 This was necessary
+for compatibility with several other SSL/TLS implementations
+that do not check this ﬁeld. Delignat-Lavaud et al. [19]
+
+2http://www.gnutls.org/faq.html
+
+independently reported that GnuTLS does not reject certiﬁcates
+with unknown critical extensions. According to GnuTLS, re-
+jecting such certiﬁcates may allow certain corporations to lock
+out GnuTLS by issuing certiﬁcates with custom extensions
+and thus forcing developers to use the corporation’s own SSL
+library instead of GnuTLS.
+
+MatrixSSL plans to reject version 1 intermediate CAs and
+check path length constraints starting from the next release.
+In general, MatrixSSL only performs basic checks on the
+certiﬁcate and depends on the application-provided callbacks
+to check key usage, extended key usage, expiration timestamps,
+etc. To facilitate these checks, MatrixSSL will parse the critical
+ﬂags and the extended key usage extension. Since MatrixSSL
+primarily targets embedded devices, which do not always have
+the time zone information, in most cases the notBefore and
+notAfter timestamps in the certiﬁcate will have to be checked
+against the available local time.
+
+CyaSSL is ﬁxing all reported issues. The ﬁxes will be part
+
+of CyaSSL 3.0.0, expected to be released in April 2014.
+
+PolarSSL is currently working on the ﬁxes.
+
+cryptlib does not support certiﬁcate chain validation to
+avoid validation failures for the users who run their own CA
+
+127
+
+hierarchy or do not use certiﬁcates. The cryptlib manual3 rec-
+ommends other techniques for authenticating the server, such
+as matching key ﬁngerprints. In addition, it strongly recom-
+mends using the PSK cipher suites for mutual authentication
+of both the client and server. The manual also provides an
+outline for the application writers who want to use certiﬁcates
+on how to perform certiﬁcate validation on their own.
+
+NSS developers informed us that all Mozilla products use
+a glue layer called Personal Security Manager (PSM) over
+NSS instead of using NSS directly. The PSM certiﬁcate valida-
+tion routine, CERT_VerifyCertificate, takes an argument named
+CERTVerifyLog that, if not set to NULL, returns a list of all
+certiﬁcate validation errors. An example usage of the function
+can be found at http://mxr.mozilla.org/mozilla-central/source/
+security/manager/ssl/src/SSLServerCertVeriﬁcation.cpp#622
+
+As of this writing, we are still talking to Web-browser
+developers about user warnings generated by their browsers
+when certiﬁcate validation fails.
+
+XI. CONCLUSIONS
+
+We designed, implemented, and applied the ﬁrst automated
+method for large-scale adversarial testing of certiﬁcate vali-
+dation logic in SSL/TLS implementations. Our key technical
+innovation is “frankencerts,” synthetic certiﬁcates randomly
+mutated from parts of real certiﬁcates. Frankencerts are syn-
+tactically well-formed, but may violate the X.509 speciﬁcation
+and thus exercise rarely tested functionality in SSL/TLS im-
+plementations. Our testing uncovered multiple ﬂaws in popular
+SSL/TLS libraries and Web browsers, including security vul-
+nerabilities that break server authentication guarantees and can
+be exploited for stealthy man-in-the-middle attacks.
+
+Certiﬁcate validation is only one part of the SSL/TLS hand-
+shake. Bugs in other parts of the handshake—e.g., accidentally
+omitting to check that the server’s messages are signed with the
+key that matches the certiﬁcate [49]—and incorrect usage of
+SSL/TLS implementations by higher-level software [29, 31]
+can completely disable authentication and leave applications
+vulnerable to man-in-the-middle attacks. Development of auto-
+mated methods that can analyze the entire SSL/TLS software
+stack and prove that it has been implemented securely and
+correctly remains an open challenge.
+
+Acknowledgments. We are grateful to Rui Qiu for partic-
+ipating in the initial exploration of the ideas that
+led to
+this work, and to our Oakland shepherd Matthew Smith
+for helping smooth rufﬂed feathers. This work was partially
+supported by the NSF grants CNS-0746888, CCF-0845628,
+and CNS-1223396, a Google research award, NIH grant R01
+LM011028-01 from the National Library of Medicine, and
+Google PhD Fellowship to Suman Jana.
+
+REFERENCES
+
+[1] D. Akhawe, B. Amann, M. Vallentin, and R. Sommer. Here’s
+my cert, so trust me, maybe? Understanding TLS errors on the
+Web. In WWW, 2013.
+
+[2] D. Akhawe and A. Felt. Alice in Warningland: A large-
+scale ﬁeld study of browser security warning effectiveness. In
+USENIX Security, 2013.
+
+3http://www.cryptlib.com/downloads/manual.pdf, page 118
+
+128
+
+[3] N. AlFardan and K. Paterson. Lucky thirteen: Breaking the TLS
+
+and DTLS record protocols. In S&P, 2013.
+
+[4] B. Amann, R. Sommer, M. Vallentin, and S. Hall. No attack
+necessary: The surprising dynamics of SSL trust relationships.
+In ACSAC, 2013.
+
+[5] C. Amrutkar, K. Singh, A. Verma, and P. Traynor. Vulner-
+ableMe: Measuring systemic weaknesses in mobile browser
+security. In ICISS, 2012.
+
+[6] C. Amrutkar, P. Traynor, and P. van Oorschot. An empirical
+evaluation of security indicators in mobile Web browsers. IEEE
+Trans. Mobile Computing, 2013.
+
+[7] S. Anand, E. Burke, T. Chen, J. Clark, M. Cohen, W. Grieskamp,
+M. Harman, M. Harrold, and P. McMinn. An orchestrated survey
+of methodologies for automated software test case generation.
+Journal of Systems and Software, 86(8):1978–2001, 2013.
+
+[8] D. Bleichenbacher. Chosen ciphertext attacks against protocols
+based on the RSA encryption standard PKCS #1. In CRYPTO,
+1996.
+
+[9] D. Brumley and D. Boneh. Remote timing attacks are practical.
+
+In USENIX Security, 2003.
+
+[10] D. Brumley, J. Caballero, Z. Liang, J. Newsome, and D. Song.
+Towards automatic discovery of deviations in binary imple-
+mentations with applications to error detection and ﬁngerprint
+generation. In USENIX Security, 2007.
+
+[11] C. Cadar, D. Dunbar, and D. Engler. KLEE: Unassisted and
+automatic generation of high-coverage tests for complex systems
+programs. In OSDI, 2008.
+
+[12] C. Cadar and D. Engler. Execution generated test cases: How
+
+to make systems code crash itself. In SPIN, 2005.
+
+[13] B. Chandrasekhar, S. Khurshid, and D. Marinov. Korat: Auto-
+
+mated testing based on Java predicates. In ISSTA, 2002.
+
+[14] T. Chen, S. Cheung, and S. Yiu. Metamorphic testing: A
+new approach for generating next test cases. Technical Re-
+port HKUST-CS98-01, Department of Computer Science, Hong
+Kong University of Science and Technology, 1998.
+
+[15] Y. Cheon and G. Leavens. A simple and practical approach to
+
+unit testing: The JML and JUnit way. In ECOOP, 2002.
+
+[16] J. Clark and P. van Oorschot. SoK: SSL and HTTPS: Revisiting
+past challenges and evaluating certiﬁcate trust model enhance-
+ments. In S&P, 2013.
+
+[17] Comodo report of incident. http://www.comodo.com/Comodo-
+
+Fraud-Incident-2011-03-23.html, 2011.
+
+[18] B. Daniel, D. Dig, K. Garcia, and D. Marinov. Automated
+
+testing of refactoring engines. In FSE, 2007.
+
+[19] A. Delignat-Lavaud, M. Abadi, A. Birrell, I. Mironov, T. Wob-
+ber, and Y. Xie. Web PKI: Closing the gap between guidelines
+and practices. In NDSS, 2014.
+
+[20] W. Dickinson, D. Leon, and A. Podgurski. Finding failures by
+
+cluster analysis of execution proﬁles. In ICSE, 2001.
+
+[21] M. Dietz, A. Czeskis, D. Balfanz, and D. Wallach. Origin-bound
+certiﬁcates: A fresh approach to strong client authentication for
+the Web. In USENIX Security, 2012.
+
+[22] Diginotar issues dodgy SSL certiﬁcates for Google services
+http://www.theinquirer.net/inquirer/news/
+
+after
+2105321/diginotar-issues-dodgy-ssl-certiﬁcates-google-
+services-break, 2011.
+
+break-in.
+
+[23] E. Dijkstra. A Discipline of Programming. 1976.
+[24] T. Duong and J. Rizzo. Here come the ⊕ ninjas.
+
+http://
+nerdoholic.org/uploads/dergln/beast part2/ssl jun21.pdf, 2011.
+[25] Z. Durumeric, J. Kasten, M. Bailey, and A. Halderman. Analysis
+
+of the HTTPS certiﬁcate ecosystem. In IMC, 2013.
+
+[26] Z. Durumeric, E. Wustrow, and A. Halderman. ZMap: Fast
+Internet-wide scanning and its security applications. In USENIX
+Security, 2013.
+
+[27] P. Eckersley and J. Burns. An observatory for the SSLiverse.
+
+[28] M. Ernst. Static and dynamic analysis: Synergy and duality. In
+
+In DEFCON, 2010.
+
+WODA, 2003.
+
+[54] M. Marlinspike. IE SSL vulnerability. http://www.thoughtcrime.
+
+org/ie-ssl-chain.txt, 2002.
+
+[55] M. Marlinspike. More tricks for defeating SSL in practice.
+
+[56] M. Marlinspike. New tricks for defeating SSL in practice. Black
+
+DEFCON, 2009.
+
+Hat DC, 2009.
+
+cates.
+pdf, 2009.
+
+[57] M. Marlinspike. Null preﬁx attacks against SSL/TLS certiﬁ-
+http://www.thoughtcrime.org/papers/null-preﬁx-attacks.
+
+[58] P. Maurer. Generating test data with enhanced context-free
+
+grammars. IEEE Software, 7(4):50–55, 1990.
+
+[59] W. McKeeman. Differential
+
+testing for software. Digital
+
+Technical Journal, 10(1):100–107, 1998.
+
+[60] A. Parsovs. Practical issues with TLS client certiﬁcate authen-
+
+tication. In NDSS, 2014.
+
+[61] A. Podgurski, D. Leon, P. Francis, W. Masri, M. Minch, J. Sun,
+and B. Wang. Automated support for classifying software failure
+reports. In ICSE, 2003.
+
+[62] P. Purdom. A sentence generator for testing parsers. BIT
+
+Numerical Mathematics, 12:366–375, 1972.
+
+[63] D. Ramos and D. Engler. Practical, low-effort equivalence
+
+veriﬁcation of real code. In CAV, 2011.
+
+[64] The TLS protocol version 1.0. http://tools.ietf.org/html/rfc2246,
+
+1999.
+
+[65] Internet X.509 public key infrastructure certiﬁcate policy
+and certiﬁcation practices framework. http://www.ietf.org/rfc/
+rfc2527.txt, 1999.
+
+[66] HTTP over TLS. http://www.ietf.org/rfc/rfc2818.txt, 2000.
+[67] The Transport Layer Security (TLS) protocol version 1.1. http:
+
+[68] The Transport Layer Security (TLS) protocol version 1.2. http:
+
+//tools.ietf.org/html/rfc4346, 2006.
+
+//tools.ietf.org/html/rfc5246, 2008.
+
+[69] Internet X.509 public key infrastructure certiﬁcate and certiﬁcate
+revocation list (CRL) proﬁle. http://tools.ietf.org/html/rfc5280,
+2008.
+
+[70] The Secure Sockets Layer (SSL) protocol version 3.0. http:
+
+//tools.ietf.org/html/rfc6101, 2011.
+
+[71] Representation and veriﬁcation of domain-based application
+service identity within Internet public key infrastructure using
+X.509 (PKIX) certiﬁcates in the context of Transport Layer
+Security (TLS). http://tools.ietf.org/html/rfc6125, 2011.
+
+[72] J. Rizzo and T. Duong. The CRIME attack. In Ekoparty, 2012.
+[73] P. Saxena, D. Akhawe, S. Hanna, F. Mao, S. McCamant, and
+D. Song. A symbolic execution framework for JavaScript. In
+S&P, 2010.
+
+[74] K. Sen, D. Marinov, and G. Agha. CUTE: A concolic unit
+
+testing engine for C. In FSE, 2005.
+
+[75] E. Sirer and B. Bershad. Using production grammars in software
+testing. In Proc. 2nd Conference on Domain-speciﬁc Languages,
+1999.
+
+[76] V. Srivastava, M. Bond, K. McKinley, and V. Shmatikov. A
+security policy oracle: Detecting security holes using multiple
+API implementations. In PLDI, 2011.
+
+[77] M. Stevens, A. Sotirov, J. Appelbaum, A. Lenstra, D. Molnar,
+D. Osvik, and B. Weger. Short chosen-preﬁx collisions for MD5
+and the creation of a rogue CA certiﬁcate. In CRYPTO, 2009.
+[78] N. Vratonjic, J. Freudiger, V. Bindschaedler, and J.-P. Hubaux.
+The inconvenient truth about Web certiﬁcates. In WEIS, 2011.
+Finding and
+
+[79] X. Yang, Y. Chen, E. Eide, and J. Regehr.
+
+understanding bugs in C compilers. In PLDI, 2011.
+
+[29] S. Fahl, M. Harbach, T. Muders, and M. Smith. Why Eve
+and Mallory love Android: An analysis of SSl (in)security on
+Android. In CCS, 2012.
+
+[30] FIPS PUB 140-2: Security requirements for cryptographic mod-
+http://csrc.nist.gov/publications/ﬁps/ﬁps140-2/ﬁps1402.
+
+ules.
+pdf, 2001.
+
+[31] M. Georgiev, S. Iyengar, S. Jana, R. Anubhai, D. Boneh, and
+V. Shmatikov. The most dangerous code in the world: Validating
+SSL certiﬁcates in non-browser software. In CCS, 2012.
+
+[32] M. Gligoric, F. Behrang, Y. Li, J. Overbey, M. Haﬁz, and
+D. Marinov. Systematic testing of refactoring engines on real
+software projects. In ECOOP, 2013.
+
+[33] CVE-2014-0092. https://bugzilla.redhat.com/show bug.cgi?id=
+
+1069865, 2014.
+
+[34] P. Godefroid, A. Kiezun, and M. Levin. Grammar-based
+
+whitebox fuzzing. In PLDI, 2008.
+
+[35] P. Godefroid, N. Klarlund, and K. Sen. DART: Directed
+
+automated random testing. In PLDI, 2005.
+
+[36] P. Godefroid, M. Levin, and D. Molnar. Automated whitebox
+
+fuzz testing. In NDSS, 2008.
+
+[37] W. Halfond, S. Anand, and A. Orso. Precise interface identiﬁ-
+cation to improve testing and analysis of web applications. In
+ISSTA, 2009.
+
+[38] N. Heninger, Z. Durumeric, E. Wustrow, and A. Halderman.
+Mining your Ps and Qs: Detection of widespread weak keys in
+network devices. In USENIX Security, 2012.
+
+[39] J. H. Holland. Adaptation in Natural and Artiﬁcial Systems.
+
+University of Michigan Press, 1975. Second edition, 1992.
+
+[40] CVE-2011-0228.
+
+http://cve.mitre.org/cgi-bin/cvename.cgi?
+
+name=CVE-2011-0228, 2011.
+
+[41] V. Jagannath, Y. Lee, B. Daniel, and D. Marinov. Reducing the
+
+costs of bounded-exhaustive testing. In FASE, 2009.
+
+[42] S. Jana and V. Shmatikov. Abusing ﬁle processing in malware
+
+detectors for fun and proﬁt. In S&P, 2012.
+
+[43] J. Jones, J. Bowring, and M. Harrold. Debugging in parallel. In
+
+ISSTA, 2007.
+
+[44] D. Kaminsky, M. Patterson, and L. Sassaman. PKI layer cake:
+New collision attacks against the global X.509 infrastructure. In
+FC, 2010.
+
+[45] S. Khurshid, C. Pasareanu, and W. Visser. Generalized symbolic
+
+execution for model checking and testing. In TACAS, 2003.
+
+[46] A. Kiezun, P. Guo, K. Jayaraman, and M. Ernst. Automatic
+In
+
+creation of SQL injection and cross-site scripting attacks.
+ICSE, 2009.
+
+[47] J. King. Symbolic execution and program testing. Commun.
+
+ACM, 19(7), 1976.
+
+[48] R. Lammel and W. Schulte. Controllable combinatorial coverage
+in grammar-based testing. In Testing of Communicating Systems,
+Lecture Notes in Computer Science, pages 19–38. 2006.
+
+[49] A. Langley. Apple’s SSL/TLS bug. https://www.imperialviolet.
+
+org/2014/02/22/applebug.html, 2014.
+
+[50] A. Lenstra, J. Hughes, M. Augier, J. Bos, T. Kleinjung, and
+C. Wachter. Ron was wrong, Whit is right. http://eprint.iacr.
+org/2012/064, 2012.
+
+[51] R. Majumdar and R. Xu. Directed test generation using
+
+symbolic grammars. In ASE, 2007.
+
+[52] B. Malloy and J. Power. An interpretation of Purdom’s algorithm
+
+for automatic generation of test cases. In ICIS, 2001.
+
+[53] D. Marinov and S. Khurshid. TestEra: A novel framework for
+
+automated testing of Java programs. In ASE, 2001.
+
+129
+
+
